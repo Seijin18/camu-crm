@@ -143,6 +143,10 @@ class FakeDatabase:
         ]
         return max(alcancados, key=rank_estagio) if alcancados else None
 
+    def estagio_corrente(self, conversa_id: int) -> str | None:
+        eventos = [e for e in self.eventos if e["conversa_id"] == conversa_id]
+        return eventos[-1]["para"] if eventos else None
+
     def estagios_registrados(self, conversa_id: int) -> set[str]:
         return {e["para"] for e in self.eventos if e["conversa_id"] == conversa_id}
 

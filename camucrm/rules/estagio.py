@@ -20,6 +20,7 @@ from typing import Mapping
 from ..taxonomia import (
     B2B,
     B2C,
+    funil_do_estagio,
     DIAS_ATE_PERDIDO_B2C,
     ESTAGIO_TERMINAL_B2B,
     ESTAGIO_TERMINAL_B2C,
@@ -273,6 +274,58 @@ def _gatilhos_b2b(fatos: Mapping[str, bool], sinais: SinaisConversa) -> list[Der
     return marcos
 
 
+def mudar_funil(
+    estagio_atual: str,
+    fatos: Mapping[str, bool],
+    sinais: SinaisConversa,
+) -> Transicao | None:
+    """Reclassificação de funil: o único caso em que o estágio troca de escada.
+
+    `sinais.funil` já é o funil NOVO. A regra de não-regressão (§3) fala de
+    avanço dentro de um funil — `S2` e `P1` não são comparáveis, e recusar a
+    troca por rank deixaria a conversa presa numa escada que não é a dela.
+
+    O estágio novo é o que os mesmos fatos sustentam no funil de destino, e
+    normalmente é mais baixo: um petshop que "mandou a foto" (S2) não ganha
+    nada por isso no funil B2B, onde o que conta é ter autorizado o envio de
+    material. Isso não é perda de informação — os fatos continuam gravados e o
+    evento registra de onde veio, então o histórico segue reconstituível.
+
+    Devolve `None` quando o estágio derivado é igual ao atual, o que acontece
+    ao reclassificar uma conversa que ainda não avançou.
+    """
+    derivado = derive(fatos, sinais)
+    if derivado.estagio == estagio_atual:
+        return None
+    origem_funil = funil_do_estagio(estagio_atual)
+    return Transicao(
+        estagio_atual,
+        derivado.estagio,
+        f"reclassificado de {origem_funil.upper()} para {sinais.funil.upper()}",
+        ORIGEM_LIVE,
+    )
+
+
+# Fatos que só fazem sentido no funil B2B: quem responde "pode mandar" a uma
+# oferta de material, ou aceita uma visita presencial, está se comportando
+# como lojista, não como consumidor final. Ver `sugere_b2b`.
+FATOS_B2B = ("autorizou_envio_material", "visita_aceita")
+
+
+def sugere_b2b(funil: str, fatos: Mapping[str, bool]) -> bool:
+    """Se uma conversa classificada como B2C mostra comportamento de petshop.
+
+    É **sugestão para um humano**, nunca reclassificação automática — §1 tira
+    inferência de decisão de negócio, e classificar errado joga a conversa no
+    funil errado, onde ela sai da fila pela regra errada e ninguém descobre
+    por quê. O LLM extraiu um fato; quem decide o que ele significa é quem
+    conhece o cliente.
+    """
+    if funil == B2B:
+        return False
+    return any(fatos.get(chave) for chave in FATOS_B2B)
+
+
 def estagio_inicial(funil: str) -> str:
     """Estágio de entrada do funil."""
     return "P0" if funil == B2B else "S0"
@@ -287,7 +340,9 @@ __all__ = [
     "Transicao",
     "derive",
     "estagio_inicial",
+    "mudar_funil",
     "reabrir",
+    "sugere_b2b",
     "transicao",
     "trilha",
 ]

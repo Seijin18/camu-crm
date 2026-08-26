@@ -340,3 +340,39 @@ class TesteRascunhoNoFimDoCiclo(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TesteEstagioSeRendeAoHistorico(unittest.TestCase):
+    """`conversas.estagio` é cache; `eventos_estagio` é o que aconteceu.
+
+    Sem isso, um estágio inflado (fato removido por correção humana, dado de
+    teste apagado, extração revista) ficaria preso para sempre: a regra de
+    não-regressão protege qualquer valor que esteja no cache, inclusive um
+    errado para cima, e a conversa sairia da fila pela regra errada.
+    """
+
+    def test_cache_alto_demais_e_corrigido_pelo_historico(self):
+        db = FakeDatabase()
+        conversa = db.criar_conversa(nome="Ana")
+        db.registrar_mensagem(conversa.id, "in", "oi", AGORA - timedelta(hours=2))
+        db.gravar_evento_estagio(conversa.id, "S0", "S1", motivo="inbound")
+        # Cache inflado sem nenhum evento ou fato que o sustente.
+        conversa.estagio = "S4"
+
+        estado = recalcular(db, db.get_conversa(conversa.id), agora=AGORA)
+        self.assertEqual(estado.estagio, "S1")
+
+    def test_sem_historico_o_cache_e_o_ponto_de_partida(self):
+        """Conversa recém-criada ainda não tem evento nenhum."""
+        db = FakeDatabase()
+        conversa = db.criar_conversa(nome="Ana", estagio="S0")
+        estado = recalcular(db, conversa, agora=AGORA, persistir=False)
+        self.assertEqual(estado.estagio, "S0")
+
+    def test_avanco_legitimo_continua_valendo(self):
+        db = FakeDatabase()
+        conversa = db.criar_conversa(nome="Ana")
+        db.registrar_mensagem(conversa.id, "in", "aqui a foto", AGORA - timedelta(hours=2))
+        db.gravar_fatos(conversa.id, {"foto_pet_recebida": True}, {"foto_pet_recebida": "aqui a foto"})
+        estado = recalcular(db, db.get_conversa(conversa.id), agora=AGORA)
+        self.assertEqual(estado.estagio, "S2")

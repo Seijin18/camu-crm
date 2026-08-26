@@ -373,6 +373,23 @@ class Database:
                     "UPDATE contatos SET tipo = %s WHERE id = %s", (tipo, contato_id)
                 )
 
+    def set_funil_conversa(self, conversa_id: int, funil: str) -> None:
+        """Move a conversa aberta para o outro funil.
+
+        `conversas.funil` é copiado de `contatos.tipo` na criação e não
+        acompanha mudanças depois — a conversa é a unidade de análise, e
+        reescrever o funil de conversas encerradas mudaria retroativamente as
+        métricas de conversão já apuradas.
+        """
+        if funil not in (B2B, B2C):
+            raise ValueError(f"funil inválido: {funil!r}")
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE conversas SET funil = %s, atualizado_em = now() WHERE id = %s",
+                    (funil, conversa_id),
+                )
+
     # -- conversas --------------------------------------------------------
 
     _CONVERSA_SELECT = """
@@ -676,6 +693,32 @@ class Database:
                 )
                 estagios = [p for (p,) in cur.fetchall() if not is_terminal(p)]
         return max(estagios, key=rank_estagio) if estagios else None
+
+    def estagio_corrente(self, conversa_id: int) -> str | None:
+        """Estágio segundo o histórico de eventos — a fonte de verdade.
+
+        `conversas.estagio` é cache. Sem esta consulta ele não seria
+        recuperável: a regra de não-regressão (§3) protege qualquer valor que
+        esteja lá, inclusive um errado para cima, e nenhum recálculo
+        conseguiria baixá-lo. Um estágio inflado por um fato que depois foi
+        removido — correção humana, dado de teste apagado, extração revista —
+        ficaria preso para sempre, e a conversa sairia da fila pela regra
+        errada.
+
+        Ordenado por `id` e não por `em`: `em` é o momento que disparou a
+        transição (a mensagem, o marco), e transições gravadas na mesma
+        passada podem ter timestamps fora de ordem em relação à conclusão
+        lógica. A ordem de inserção é a ordem em que o sistema concluiu.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT para FROM eventos_estagio WHERE conversa_id = %s "
+                    "ORDER BY id DESC LIMIT 1",
+                    (conversa_id,),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
 
     def estagios_registrados(self, conversa_id: int) -> set[str]:
         """Estágios que já têm evento gravado — torna o backfill reexecutável."""

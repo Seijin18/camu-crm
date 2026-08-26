@@ -139,3 +139,66 @@ class TesteReabertura(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TesteMudancaDeFunil(unittest.TestCase):
+    """Reclassificar B2C -> B2B é o único caso em que o estágio troca de escada."""
+
+    def test_estagio_e_rederivado_no_funil_novo(self):
+        from camucrm.rules.estagio import mudar_funil
+
+        # Conversa que estava em S2 (mandou a foto) e vira petshop.
+        s = sinais([Mensagem("out", AGORA - timedelta(days=1)),
+                    Mensagem("in", AGORA - timedelta(hours=2))], funil="b2b")
+        t = mudar_funil("S2", {"foto_pet_recebida": True}, s)
+        self.assertEqual(t.de, "S2")
+        self.assertEqual(t.para, "P1")
+        self.assertIn("reclassificado", t.motivo)
+
+    def test_rank_menor_nao_bloqueia_a_troca(self):
+        """`S2` e `P1` não são comparáveis; recusar por rank prenderia a
+        conversa numa escada que não é a dela."""
+        from camucrm.rules.estagio import mudar_funil, rank_estagio
+
+        s = sinais([Mensagem("out", AGORA - timedelta(days=1))], funil="b2b")
+        t = mudar_funil("S4", {"preco_apresentado": True}, s)
+        self.assertIsNotNone(t)
+        self.assertLess(rank_estagio(t.para), rank_estagio("S4"))
+
+    def test_conversa_que_nao_avancou_nao_gera_evento(self):
+        from camucrm.rules.estagio import mudar_funil
+
+        s = sinais(funil="b2b")
+        self.assertIsNone(mudar_funil("P0", {}, s))
+
+    def test_autorizacao_leva_direto_a_p2(self):
+        from camucrm.rules.estagio import mudar_funil
+
+        s = sinais([Mensagem("out", AGORA - timedelta(days=1)),
+                    Mensagem("in", AGORA - timedelta(hours=2))], funil="b2b")
+        t = mudar_funil("S1", {"autorizou_envio_material": True}, s)
+        self.assertEqual(t.para, "P2")
+
+
+class TesteSugestaoDeB2B(unittest.TestCase):
+    """O sistema sugere; quem decide é humano (§1)."""
+
+    def test_autorizou_material_num_b2c_sugere_petshop(self):
+        from camucrm.rules.estagio import sugere_b2b
+
+        self.assertTrue(sugere_b2b("b2c", {"autorizou_envio_material": True}))
+
+    def test_visita_aceita_num_b2c_sugere_petshop(self):
+        from camucrm.rules.estagio import sugere_b2b
+
+        self.assertTrue(sugere_b2b("b2c", {"visita_aceita": True}))
+
+    def test_fato_de_consumidor_nao_sugere(self):
+        from camucrm.rules.estagio import sugere_b2b
+
+        self.assertFalse(sugere_b2b("b2c", {"foto_pet_recebida": True, "preco_apresentado": True}))
+
+    def test_conversa_ja_b2b_nao_sugere(self):
+        from camucrm.rules.estagio import sugere_b2b
+
+        self.assertFalse(sugere_b2b("b2b", {"autorizou_envio_material": True}))

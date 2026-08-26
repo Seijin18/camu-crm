@@ -166,8 +166,23 @@ def _avanco_recente(
     return (agora - quando) < timedelta(hours=24)
 
 
+def _estagio_de_partida(db: Database, conversa: Conversa) -> str:
+    """De onde a derivação parte: o histórico, não o cache.
+
+    `conversas.estagio` é conveniência para a fila não reprocessar tudo a cada
+    consulta. `eventos_estagio` é o que aconteceu. Quando os dois divergem, o
+    histórico ganha — é o que torna verdadeira a promessa de que o estado é
+    recalculável, e o que permite consertar um estágio inflado apagando o
+    evento que não devia existir.
+    """
+    return db.estagio_corrente(conversa.id) or conversa.estagio
+
+
 def _avanco_ao_vivo(db, conversa, fatos, sinais):
     """O avanço observado — a trilha inteira, não só o estágio final.
+
+    Parte do estágio que o histórico de eventos registra, não do cache em
+    `conversas.estagio` (ver `_estagio_de_partida`).
 
     Um bloco de mensagens pode cruzar vários estágios de uma vez: a cliente
     manda a foto, recebe a prévia e o preço, e responde, tudo antes de a
@@ -181,7 +196,7 @@ def _avanco_ao_vivo(db, conversa, fatos, sinais):
     processamento. É o que mantém `metrics.tempo_por_estagio` medindo tempo de
     verdade mesmo quando a extração roda em lote.
     """
-    estagio_atual = conversa.estagio
+    estagio_atual = _estagio_de_partida(db, conversa)
     transicoes: list[regras_estagio.Transicao] = []
 
     # Conversa encerrada por silêncio que voltou a falar reabre no maior

@@ -28,6 +28,7 @@ from .extraction.extractor import Extrator
 from .llm import LlmIndisponivelError, criar_llm
 from .pipeline import carregar_sinais, recalcular, recalcular_todas
 from .rules.fila import Candidato, formatar_fila, montar_fila
+from .rules.estagio import mudar_funil, sugere_b2b
 from .rules.temperatura import classificar
 from .taxonomia import BOLA_CAMU, FILA_TAMANHO_MAXIMO, estagio_label
 from .transport import Destinatario, criar_transporte
@@ -215,6 +216,49 @@ def cmd_marcar(args) -> int:
     return 0
 
 
+def cmd_tipo(args) -> int:
+    """Classifica um contato como B2B ou B2C. Decisão humana, sempre.
+
+    §1 tira inferência de decisão de negócio, e esta é a mais consequente:
+    contato no funil errado sai da fila pela regra errada e ninguém descobre
+    por quê. Por isso nada aqui é automático — o sistema só sugere (ver
+    `rules.estagio.sugere_b2b`) e espera alguém que conhece o cliente decidir.
+    """
+    quem = _operador(args)
+    banco = _db()
+    conversa = banco.get_conversa(args.conversa)
+    if conversa is None:
+        raise SystemExit(f"conversa {args.conversa} não existe")
+    if conversa.funil == args.tipo:
+        print(f"#{conversa.id} já é {args.tipo.upper()}; nada mudou.")
+        return 0
+
+    anterior = conversa.funil
+    banco.set_tipo_contato(conversa.contato_id, args.tipo)
+    banco.set_funil_conversa(conversa.id, args.tipo)
+    # A reclassificação é uma correção (§7): o padrão delas mostra o que o
+    # sistema não está vendo na hora de classificar.
+    banco.registrar_correcao(conversa.id, "funil", anterior, args.tipo, por=quem)
+
+    atualizada = banco.get_conversa(conversa.id)
+    assert atualizada is not None
+    fatos = banco.fatos_da_conversa(conversa.id)
+    sinais = carregar_sinais(banco, atualizada)
+    movimento = mudar_funil(atualizada.estagio, fatos, sinais)
+    if movimento:
+        banco.gravar_evento_estagio(
+            conversa.id, movimento.de, movimento.para, motivo=movimento.motivo
+        )
+        banco.atualizar_estado_conversa(conversa.id, estagio=movimento.para)
+        print(
+            f"#{conversa.id} {conversa.nome_contato}: {anterior.upper()} -> "
+            f"{args.tipo.upper()}, estágio {movimento.de} -> {movimento.para}"
+        )
+    else:
+        print(f"#{conversa.id} {conversa.nome_contato}: {anterior.upper()} -> {args.tipo.upper()}")
+    return 0
+
+
 def cmd_corrigir(args) -> int:
     """Grava uma correção humana (§7). Toda correção passa por aqui."""
     quem = _operador(args)
@@ -338,10 +382,15 @@ def _desenhar(banco: Database, *, extraindo: bool) -> None:
         print("  nenhuma ainda — mande uma mensagem para o WhatsApp da Camu")
     for c in sorted(candidatos, key=lambda c: -(c.sinais.horas_desde_inbound or 0)):
         bola = "nossa" if c.sinais.bola_com == BOLA_CAMU else "dele"
+        marca = (
+            "  << parece petshop: `camucrm tipo %s b2b`" % c.conversa_id
+            if sugere_b2b(c.funil, banco.fatos_da_conversa(c.conversa_id))
+            else ""
+        )
         print(
             f"  #{c.conversa_id:<4} {c.nome[:22]:<22} "
             f"{c.estagio:<3} {estagio_label(c.estagio)[:18]:<18} "
-            f"{c.classificacao.temperatura.upper():<10} bola: {bola}"
+            f"{c.classificacao.temperatura.upper():<10} bola: {bola}{marca}"
         )
 
     print("\nÚLTIMAS MENSAGENS")
@@ -445,6 +494,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("marco", choices=MARCOS_MANUAIS)
     p.add_argument("--por")
     p.set_defaults(func=cmd_marcar)
+
+    p = sub.add_parser("tipo", help="classifica a conversa como b2b ou b2c")
+    p.add_argument("conversa", type=int)
+    p.add_argument("tipo", choices=["b2b", "b2c"])
+    p.add_argument("--por")
+    p.set_defaults(func=cmd_tipo)
 
     p = sub.add_parser("corrigir", help="grava uma correção humana (§7)")
     p.add_argument("conversa", type=int)
