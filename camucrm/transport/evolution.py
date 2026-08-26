@@ -137,7 +137,11 @@ class EvolutionTransporte:
             texto=texto,
             enviada_em=_timestamp(dados.get("messageTimestamp")),
             direcao=SAIDA if from_me else ENTRADA,
-            nome=dados.get("pushName"),
+            # `pushName` no eco da nossa própria mensagem é o perfil da CAMU,
+            # não o do cliente. Aproveitá-lo renomeia o contato para "Camu" na
+            # primeira resposta que a gente manda — e a fila do dia passa a
+            # listar o nosso próprio nome no lugar do de quem está esperando.
+            nome=dados.get("pushName") if not from_me else None,
             externa_id=chave.get("id") if isinstance(chave, Mapping) else None,
             bruto=dict(evento),
         )

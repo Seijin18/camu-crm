@@ -142,3 +142,23 @@ class TesteRecepcaoNaoPrecisaDeCredencial(unittest.TestCase):
 
         transporte = criar_transporte("evolution", para_envio=False)
         self.assertEqual(transporte.nome, "evolution")
+
+
+class TesteNomeNoEco(unittest.TestCase):
+    """`pushName` no eco é o perfil da Camu, não o do cliente."""
+
+    def setUp(self):
+        self.t = EvolutionTransporte()
+
+    def test_inbound_traz_o_nome_do_cliente(self):
+        self.assertEqual(self.t.receber(evento()).nome, "Ana")
+
+    def test_eco_nao_traz_nome(self):
+        recebido = self.t.receber(
+            evento(
+                key={"remoteJid": "5511999@s.whatsapp.net", "id": "M9", "fromMe": True},
+                pushName="Camu",
+            )
+        )
+        self.assertEqual(recebido.direcao, "out")
+        self.assertIsNone(recebido.nome)

@@ -10,3 +10,4 @@ data/backfill/
 
 # Estado local do Claude Code
 .claude/
+logs/

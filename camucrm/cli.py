@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from .llm import LlmIndisponivelError, criar_llm
 from .pipeline import carregar_sinais, recalcular, recalcular_todas
 from .rules.fila import Candidato, formatar_fila, montar_fila
 from .rules.temperatura import classificar
-from .taxonomia import FILA_TAMANHO_MAXIMO, estagio_label
+from .taxonomia import BOLA_CAMU, FILA_TAMANHO_MAXIMO, estagio_label
 from .transport import Destinatario, criar_transporte
 
 
@@ -277,6 +278,108 @@ def cmd_ingerir(args) -> int:
     return 0
 
 
+def cmd_acompanhar(args) -> int:
+    """Painel de terminal que redesenha sozinho: o que entrou e onde parou.
+
+    Não é o painel da §13 (aquele é o passo 8 e só faz sentido com histórico).
+    É um instrumento de operação e de teste: mostra a conversa chegando, o
+    estágio subindo e a fila mudando, para dar para ver o sistema trabalhando
+    em vez de conferir tabela por tabela.
+
+    Com `--extrair`, roda a extração a cada ciclo. Ela só chama o LLM quando
+    há mensagem nova, então o custo acompanha o movimento e não o relógio.
+    """
+    banco = _db()
+    extrator = Extrator(banco, criar_llm(args.provider)) if args.extrair else None
+    logging.getLogger().setLevel(logging.WARNING)
+
+    try:
+        while True:
+            if extrator is not None:
+                try:
+                    extrator.processar_todas()
+                except Exception as exc:  # noqa: BLE001 - não derruba o painel
+                    print(f"(extração falhou: {exc})")
+            _desenhar(banco, extraindo=extrator is not None)
+            if args.uma_vez:
+                return 0
+            time.sleep(args.intervalo)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+def _desenhar(banco: Database, *, extraindo: bool) -> None:
+    agora = datetime.now(timezone.utc)
+    print("\033[2J\033[H", end="")  # limpa a tela e volta ao topo
+
+    local = agora.astimezone()
+    modo = "extraindo" if extraindo else "só observando"
+    print(f"camu-crm — {local:%d/%m %H:%M:%S} ({modo})")
+    print("=" * 72)
+
+    conversas = banco.listar_conversas_abertas()
+    candidatos = []
+    for conversa in conversas:
+        estado = recalcular(banco, conversa, agora=agora, persistir=False)
+        candidatos.append(
+            Candidato(
+                conversa_id=conversa.id,
+                nome=conversa.nome_contato or f"#{conversa.id}",
+                funil=conversa.funil,
+                estagio=estado.estagio,
+                classificacao=estado.classificacao,
+                sinais=estado.sinais,
+            )
+        )
+
+    print(f"\nCONVERSAS ABERTAS ({len(conversas)})")
+    if not candidatos:
+        print("  nenhuma ainda — mande uma mensagem para o WhatsApp da Camu")
+    for c in sorted(candidatos, key=lambda c: -(c.sinais.horas_desde_inbound or 0)):
+        bola = "nossa" if c.sinais.bola_com == BOLA_CAMU else "dele"
+        print(
+            f"  #{c.conversa_id:<4} {c.nome[:22]:<22} "
+            f"{c.estagio:<3} {estagio_label(c.estagio)[:18]:<18} "
+            f"{c.classificacao.temperatura.upper():<10} bola: {bola}"
+        )
+
+    print("\nÚLTIMAS MENSAGENS")
+    for direcao, texto, quando, nome in _ultimas_mensagens(banco):
+        seta = "<-" if direcao == "in" else "->"
+        quem = "cliente" if direcao == "in" else "Camu   "
+        print(f"  {quando:%H:%M} {seta} {quem} {nome[:16]:<16} {texto[:44]}")
+
+    itens = montar_fila(candidatos)
+    print(f"\nFILA DE HOJE ({len(itens)})")
+    if not itens:
+        print("  vazia")
+    for i, item in enumerate(itens, 1):
+        print(f"  {i}. [{item.prioridade}] {item.nome[:22]:<22} {item.acao}")
+
+    print("\n(ctrl+c para sair)")
+
+
+def _ultimas_mensagens(banco: Database, limite: int = 8):
+    with banco._conn() as conn:  # noqa: SLF001
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT m.direcao, m.texto, m.enviada_em, COALESCE(t.nome, '')
+                  FROM mensagens m
+                  JOIN conversas c ON c.id = m.conversa_id
+                  JOIN contatos t ON t.id = c.contato_id
+                 ORDER BY m.enviada_em DESC LIMIT %s
+                """,
+                (limite,),
+            )
+            linhas = cur.fetchall()
+    return [
+        (d, (t or "").replace("\n", " "), q.astimezone(), n)
+        for d, t, q, n in reversed(linhas)
+    ]
+
+
 def cmd_servir(args) -> int:
     """Sobe o receptor de webhook da Evolution API."""
     from .webhook import PORTA_PADRAO, servir
@@ -373,6 +476,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ingerir", help="lê um webhook do stdin")
     p.add_argument("--transporte")
     p.set_defaults(func=cmd_ingerir)
+
+    p = sub.add_parser("acompanhar", help="painel ao vivo do que está entrando")
+    p.add_argument("--intervalo", type=int, default=5, help="segundos entre atualizações")
+    p.add_argument("--extrair", action="store_true", help="extrai a cada ciclo")
+    p.add_argument("--uma-vez", action="store_true", help="desenha uma vez e sai")
+    p.add_argument("--provider")
+    p.set_defaults(func=cmd_acompanhar)
 
     p = sub.add_parser("servir", help="recebe webhooks da Evolution API")
     p.add_argument("--porta", type=int)

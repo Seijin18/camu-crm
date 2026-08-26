@@ -101,3 +101,30 @@ class TesteEventoDireto(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TesteNomeDoContato(unittest.TestCase):
+    def test_resposta_da_camu_nao_renomeia_o_contato(self):
+        """Senão a fila do dia lista "Camu" no lugar de quem está esperando."""
+        db = FakeDatabase()
+        transporte = EvolutionTransporte()
+        ingerir(db, transporte.receber(payload(ident="N1")), agora=AGORA)
+        ingerir(
+            db,
+            transporte.receber(
+                {
+                    "data": {
+                        "key": {
+                            "remoteJid": "5511999998888@s.whatsapp.net",
+                            "id": "N2",
+                            "fromMe": True,
+                        },
+                        "message": {"conversation": "Boa tarde, tudo bem?"},
+                        "messageTimestamp": int(AGORA.timestamp()),
+                        "pushName": "Camu",
+                    }
+                }
+            ),
+            agora=AGORA,
+        )
+        self.assertEqual(next(iter(db.contatos.values())).nome, "Ana")
