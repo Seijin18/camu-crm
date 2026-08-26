@@ -27,8 +27,18 @@ from camucrm.db import Database, TetoFollowupError
 DSN = os.getenv("CAMU_TEST_DSN", "").strip()
 
 
-@unittest.skipUnless(DSN, "defina CAMU_TEST_DSN para rodar contra Postgres real")
-class TesteTetoNoBanco(unittest.TestCase):
+class CasoIntegracao(unittest.TestCase):
+    """Base que apaga o que criou.
+
+    Estes testes escrevem no mesmo Postgres que a operação usa — não há um
+    banco de teste separado. Sem limpeza, cada execução deixa contatos órfãos
+    que aparecem na fila do dia e nas métricas, e o lixo é indistinguível de
+    lead real. `ON DELETE CASCADE` leva conversas, mensagens, fatos e eventos
+    junto do contato.
+    """
+
+    rotulo = "teste"
+
     @classmethod
     def setUpClass(cls):
         cls.db = Database(DSN)
@@ -39,10 +49,33 @@ class TesteTetoNoBanco(unittest.TestCase):
         cls.db.close()
 
     def setUp(self):
+        self._criados: list[int] = []
+        self.addCleanup(self._limpar)
+
+    def _novo_contato(self):
         contato = self.db.upsert_contato(
-            f"5511{os.urandom(4).hex()}"[:15], nome="Teste", tipo="b2c"
+            f"5511{os.urandom(4).hex()}"[:15], nome=self.rotulo, tipo="b2c"
         )
-        self.conversa = self.db.get_or_create_conversa(contato.id)
+        self._criados.append(contato.id)
+        return contato
+
+    def _limpar(self):
+        if not self._criados:
+            return
+        with self.db._conn() as conn:  # noqa: SLF001
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM contatos WHERE id = ANY(%s)", (self._criados,)
+                )
+
+
+@unittest.skipUnless(DSN, "defina CAMU_TEST_DSN para rodar contra Postgres real")
+class TesteTetoNoBanco(CasoIntegracao):
+    rotulo = "teste-teto"
+
+    def setUp(self):
+        super().setUp()
+        self.conversa = self.db.get_or_create_conversa(self._novo_contato().id)
 
     def test_dois_followups_sao_aceitos(self):
         self.assertEqual(self.db.registrar_followup(self.conversa.id, "toque 1"), 1)
@@ -85,7 +118,7 @@ class TesteTetoNoBanco(unittest.TestCase):
 
 
 @unittest.skipUnless(DSN, "defina CAMU_TEST_DSN para rodar contra Postgres real")
-class TesteUmaConversaAbertaPorContato(unittest.TestCase):
+class TesteUmaConversaAbertaPorContato(CasoIntegracao):
     """A corrida que o webhook expôs: dois eventos simultâneos do mesmo número.
 
     `get_or_create_conversa` lê e só então insere. Sob paralelismo real — que é
@@ -94,19 +127,11 @@ class TesteUmaConversaAbertaPorContato(unittest.TestCase):
     dados denunciasse o problema.
     """
 
-    @classmethod
-    def setUpClass(cls):
-        cls.db = Database(DSN)
-        cls.db.ensure_schema()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.db.close()
+    rotulo = "teste-corrida"
 
     def setUp(self):
-        self.contato = self.db.upsert_contato(
-            f"5511{os.urandom(4).hex()}"[:15], nome="Corrida", tipo="b2c"
-        )
+        super().setUp()
+        self.contato = self._novo_contato()
 
     def test_chamadas_concorrentes_devolvem_a_mesma_conversa(self):
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -139,7 +164,7 @@ class TesteUmaConversaAbertaPorContato(unittest.TestCase):
 
 
 @unittest.skipUnless(DSN, "defina CAMU_TEST_DSN para rodar contra Postgres real")
-class TesteEventoDeEstagioUnico(unittest.TestCase):
+class TesteEventoDeEstagioUnico(CasoIntegracao):
     """A segunda corrida que o webhook expôs: `S0 -> S1` gravado três vezes.
 
     Eventos concorrentes da mesma conversa leem todos o estágio antigo e
@@ -147,20 +172,11 @@ class TesteEventoDeEstagioUnico(unittest.TestCase):
     sobre esses eventos, e as duplicatas viram intervalos de zero hora.
     """
 
-    @classmethod
-    def setUpClass(cls):
-        cls.db = Database(DSN)
-        cls.db.ensure_schema()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.db.close()
+    rotulo = "teste-evento"
 
     def setUp(self):
-        contato = self.db.upsert_contato(
-            f"5511{os.urandom(4).hex()}"[:15], nome="Evento", tipo="b2c"
-        )
-        self.conversa = self.db.get_or_create_conversa(contato.id)
+        super().setUp()
+        self.conversa = self.db.get_or_create_conversa(self._novo_contato().id)
 
     def _eventos(self):
         with self.db._conn() as conn:  # noqa: SLF001
@@ -207,3 +223,25 @@ class TesteSchema(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(DSN, "defina CAMU_TEST_DSN para rodar contra Postgres real")
+class TesteLimpeza(CasoIntegracao):
+    """A própria limpeza precisa ser verificada — se ela falhar em silêncio,
+    o lixo volta a se acumular sem ninguém notar."""
+
+    rotulo = "teste-limpeza"
+
+    def _contar(self, contato_id: int) -> int:
+        with self.db._conn() as conn:  # noqa: SLF001
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM contatos WHERE id = %s", (contato_id,))
+                return cur.fetchone()[0]
+
+    def test_contato_criado_some_apos_o_teste(self):
+        contato = self._novo_contato()
+        self.db.get_or_create_conversa(contato.id)
+        self.assertEqual(self._contar(contato.id), 1)
+        self._limpar()
+        self._criados = []
+        self.assertEqual(self._contar(contato.id), 0)
