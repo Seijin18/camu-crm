@@ -5,6 +5,26 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+
+def _carregar_env() -> None:
+    """Carrega `.env` da raiz do projeto, sem sobrescrever o ambiente.
+
+    Variável já exportada no shell vence o arquivo — é o que permite apontar
+    um comando para outro banco (`CAMU_DB_DSN=... camucrm fila`) sem editar
+    nada. `python-dotenv` ausente não é erro: em produção as variáveis vêm do
+    ambiente do container, não de arquivo.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # pragma: no cover - depende do ambiente
+        return
+    raiz = Path(__file__).resolve().parent.parent / ".env"
+    if raiz.exists():
+        load_dotenv(raiz, override=False)
+
+
+_carregar_env()
+
 ENV_DSN = "CAMU_DB_DSN"
 ENV_PLAYBOOK = "CAMU_PLAYBOOK"
 ENV_OPERADOR = "CAMU_OPERADOR"
