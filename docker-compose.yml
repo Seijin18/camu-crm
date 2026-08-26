@@ -1,0 +1,27 @@
+# Infra mínima do CRM: só Postgres.
+#
+# O transporte (Evolution API) vive no docker-compose do WhatBot — este projeto
+# fala com ele por HTTP, através de um adaptador (§11). Subir uma segunda
+# instância aqui criaria um segundo chip pareado, que é exatamente o risco que
+# §11 manda evitar.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: camucrm_db
+    environment:
+      POSTGRES_USER: camu
+      POSTGRES_PASSWORD: camu
+      POSTGRES_DB: camucrm
+    ports:
+      # 5433 e não 5432: o Postgres do WhatBot já ocupa a porta padrão.
+      - "5433:5432"
+    volumes:
+      - camucrm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U camu -d camucrm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  camucrm_pgdata:

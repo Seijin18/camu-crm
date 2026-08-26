@@ -1,0 +1,342 @@
+"""Teste end-to-end único do ciclo completo.
+
+    mensagem -> extração (LLM) -> fatos -> estágio -> temperatura -> fila -> rascunho
+
+Convenção do repositório (herdada do WhatBot): toda mudança que altera esse
+ciclo **estende este arquivo**, nunca duplica um E2E paralelo. Um segundo
+arquivo E2E sempre acaba testando uma versão diferente do mesmo caminho, e a
+divergência entre os dois passa despercebida até produção.
+
+Sem rede e sem Postgres: `FakeLlm` e `FakeDatabase`.
+"""
+
+import json
+import logging
+import sys
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from fakes import FakeDatabase  # noqa: E402
+
+from camucrm.drafts import gerar as gerar_rascunho  # noqa: E402
+from camucrm.extraction.extractor import Extrator  # noqa: E402
+from camucrm.llm import FakeLlm, LlmIndisponivelError  # noqa: E402
+from camucrm.pipeline import recalcular  # noqa: E402
+from camucrm.rules.fila import Candidato, montar_fila  # noqa: E402
+from camucrm.taxonomia import ESFRIANDO, QUENTE  # noqa: E402
+
+AGORA = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+
+
+def resposta(**campos):
+    payload = {"objecao": None, "evidencias": {}}
+    payload.update(campos)
+    return json.dumps(payload)
+
+
+class TesteCicloB2C(unittest.TestCase):
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.conversa = self.db.criar_conversa(nome="Ana")
+
+    def _mensagens(self):
+        self.db.registrar_mensagem(
+            self.conversa.id, "in", "oi, vi o insta de voces", AGORA - timedelta(hours=6)
+        )
+        self.db.registrar_mensagem(
+            self.conversa.id, "out", "Oi! Me manda uma foto do seu pet?",
+            AGORA - timedelta(hours=5),
+        )
+        self.db.registrar_mensagem(
+            self.conversa.id, "in", "aqui ele, o nome dele e Thor",
+            AGORA - timedelta(hours=4),
+        )
+
+    def test_ciclo_completo_ate_a_fila(self):
+        self._mensagens()
+        llm = FakeLlm([
+            resposta(
+                foto_pet_recebida=True,
+                evidencias={"foto_pet_recebida": "aqui ele, o nome dele e Thor"},
+            )
+        ])
+        extrator = Extrator(self.db, llm)
+        resultado = extrator.processar_conversa(self.conversa.id, agora=AGORA)
+
+        # Fato extraído com evidência literal.
+        self.assertEqual(resultado.mensagens_processadas, 3)
+        self.assertTrue(self.db.fatos_da_conversa(self.conversa.id)["foto_pet_recebida"])
+
+        # Estágio derivado por regra, não pelo LLM.
+        self.assertEqual(resultado.estado.estagio, "S2")
+        self.assertEqual(resultado.estado.temperatura, QUENTE)
+
+        # Evento de estágio gravado com origem ao vivo.
+        eventos = [e for e in self.db.eventos if e["conversa_id"] == self.conversa.id]
+        self.assertEqual(eventos[-1]["para"], "S2")
+        self.assertEqual(eventos[-1]["origem"], "live")
+
+        # E a conversa entra na fila com prioridade 1 (bola com a Camu).
+        fila = montar_fila([
+            Candidato(self.conversa.id, "Ana", "b2c", resultado.estado.estagio,
+                      resultado.estado.classificacao, resultado.estado.sinais)
+        ])
+        self.assertEqual(fila[0].prioridade, 1)
+
+    def test_reprocessar_e_idempotente(self):
+        """§2: reprocessar não duplica evento nem regride estágio."""
+        self._mensagens()
+        extracao = resposta(
+            foto_pet_recebida=True,
+            evidencias={"foto_pet_recebida": "aqui ele, o nome dele e Thor"},
+        )
+        extrator = Extrator(self.db, FakeLlm([extracao, extracao]))
+        extrator.processar_conversa(self.conversa.id, agora=AGORA)
+        eventos_apos_primeira = len(self.db.eventos)
+        fatos_apos_primeira = len(self.db.fatos)
+
+        extrator.processar_conversa(self.conversa.id, agora=AGORA, forcar=True)
+        self.assertEqual(len(self.db.eventos), eventos_apos_primeira)
+        self.assertEqual(len(self.db.fatos), fatos_apos_primeira)
+
+    def test_bloco_novo_avanca_e_registra_objecao(self):
+        self._mensagens()
+        extrator = Extrator(self.db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "aqui ele, o nome dele e Thor"}),
+            resposta(preco_apresentado=True, objecao="frete",
+                     evidencias={"preco_apresentado": "a peca sai R$ 149 e o frete R$ 28",
+                                 "objecao": "o frete ficou salgado"}),
+        ]))
+        extrator.processar_conversa(self.conversa.id, agora=AGORA)
+
+        self.db.registrar_mensagem(
+            self.conversa.id, "out", "a peca sai R$ 149 e o frete R$ 28",
+            AGORA - timedelta(hours=3),
+        )
+        self.db.registrar_mensagem(
+            self.conversa.id, "in", "o frete ficou salgado", AGORA - timedelta(hours=2)
+        )
+        resultado = extrator.processar_conversa(self.conversa.id, agora=AGORA)
+
+        # S5, não S4: o cliente respondeu ao preço sem recusar (§3). O momento
+        # do fato é o da mensagem que o evidencia, então a resposta posterior
+        # caracteriza negociação já nesta passada.
+        self.assertEqual(resultado.estado.estagio, "S5")
+        self.assertEqual(self.db.objecoes[-1]["categoria"], "frete")
+        # A objeção guarda o estágio em que apareceu (§4).
+        self.assertEqual(self.db.objecoes[-1]["estagio"], "S2")
+
+    def test_fato_sem_evidencia_nao_avanca_estagio(self):
+        """A trava de §7: falso positivo de avanço = 0."""
+        self._mensagens()
+        extrator = Extrator(self.db, FakeLlm([
+            resposta(foto_pet_recebida=True, previa_enviada=True,
+                     evidencias={"foto_pet_recebida": "aqui ele, o nome dele e Thor"})
+        ]))
+        resultado = extrator.processar_conversa(self.conversa.id, agora=AGORA)
+        self.assertEqual(resultado.estado.estagio, "S2")
+        self.assertEqual(resultado.democoes[0].campo, "previa_enviada")
+
+    def test_llm_indisponivel_deixa_o_estagio_onde_estava(self):
+        self._mensagens()
+        # A falha é o objeto do teste; o log dela na saída da suíte só confunde.
+        self.addCleanup(logging.disable, logging.NOTSET)
+        logging.disable(logging.WARNING)
+
+        class LlmQuebrado:
+            nome = "quebrado"
+
+            def completar(self, system, user, *, json_estrito=False):
+                raise LlmIndisponivelError("cota esgotada")
+
+        resultado = Extrator(self.db, LlmQuebrado()).processar_conversa(
+            self.conversa.id, agora=AGORA
+        )
+        self.assertIsNotNone(resultado.erro)
+        self.assertEqual(resultado.estado.estagio, "S1")  # avançou só pelo inbound
+        self.assertIsNone(self.db.conversas[self.conversa.id].ultima_mensagem_processada_id)
+
+    def test_sem_mensagem_nova_recalcula_e_esfria(self):
+        """Esfriar é o que acontece quando nada acontece.
+
+        Com a bola do lado do cliente: enquanto a bola está com a Camu, a
+        conversa fica QUENTE por mais dias que passem — é dívida, não
+        follow-up (§5, §6 prioridade 1), e envelhecer não a torna menos
+        urgente.
+        """
+        self._mensagens()
+        self.db.registrar_mensagem(
+            self.conversa.id, "out", "Ficou pronto, olha so", AGORA - timedelta(hours=3)
+        )
+        extrator = Extrator(self.db, FakeLlm([resposta(), resposta()]))
+        extrator.processar_conversa(self.conversa.id, agora=AGORA)
+
+        depois = AGORA + timedelta(days=4)
+        resultado = extrator.processar_conversa(self.conversa.id, agora=depois)
+        self.assertEqual(resultado.mensagens_processadas, 0)
+        self.assertEqual(resultado.estado.temperatura, ESFRIANDO)
+
+    def test_bola_com_a_camu_permanece_quente_mesmo_dias_depois(self):
+        self._mensagens()
+        extrator = Extrator(self.db, FakeLlm([resposta()]))
+        extrator.processar_conversa(self.conversa.id, agora=AGORA)
+        resultado = extrator.processar_conversa(
+            self.conversa.id, agora=AGORA + timedelta(days=4)
+        )
+        self.assertEqual(resultado.estado.temperatura, QUENTE)
+
+
+class TesteTrilhaAoVivo(unittest.TestCase):
+    """Um bloco pode cruzar vários estágios, e todos precisam virar evento.
+
+    Sem isto, `S1→S2` e `S4→S6` — as métricas que §14 diz justificarem o
+    sistema — ficam permanentemente "sem amostra", porque a conversa salta de
+    S0 direto para o estágio final numa única extração.
+    """
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.conversa = self.db.criar_conversa(nome="Ana")
+        for direcao, texto, horas in (
+            ("in", "oi, vi o insta de voces", 8),
+            ("out", "Oi! Manda uma foto do seu pet?", 7),
+            ("in", "aqui esta a foto do Thor", 6),
+            ("out", "Ficou assim, olha so. A peca sai R$ 149 e o frete R$ 28", 4),
+            ("in", "o frete ficou salgado", 2),
+        ):
+            self.db.registrar_mensagem(
+                self.conversa.id, direcao, texto, AGORA - timedelta(hours=horas)
+            )
+        self.extracao = resposta(
+            foto_pet_recebida=True, previa_enviada=True, preco_apresentado=True,
+            objecao="frete",
+            evidencias={
+                "foto_pet_recebida": "aqui esta a foto do Thor",
+                "previa_enviada": "Ficou assim, olha so",
+                "preco_apresentado": "A peca sai R$ 149 e o frete R$ 28",
+                "objecao": "o frete ficou salgado",
+            },
+        )
+
+    def _eventos(self):
+        return [e for e in self.db.eventos if e["conversa_id"] == self.conversa.id]
+
+    def test_grava_um_evento_por_estagio_percorrido(self):
+        resultado = Extrator(self.db, FakeLlm([self.extracao])).processar_conversa(
+            self.conversa.id, agora=AGORA
+        )
+        self.assertEqual(resultado.estado.estagio, "S5")
+        self.assertEqual(
+            [e["para"] for e in self._eventos()], ["S1", "S2", "S3", "S4", "S5"]
+        )
+
+    def test_cada_evento_leva_o_momento_do_que_o_disparou(self):
+        """Não o momento do processamento — senão o tempo por estágio dá zero."""
+        Extrator(self.db, FakeLlm([self.extracao])).processar_conversa(
+            self.conversa.id, agora=AGORA
+        )
+        por_estagio = {e["para"]: e["em"] for e in self._eventos()}
+        self.assertEqual(por_estagio["S1"], AGORA - timedelta(hours=8))
+        self.assertEqual(por_estagio["S2"], AGORA - timedelta(hours=6))
+        self.assertEqual(por_estagio["S4"], AGORA - timedelta(hours=4))
+        self.assertLess(por_estagio["S1"], por_estagio["S2"])
+        self.assertTrue(all(m < AGORA for m in por_estagio.values()))
+
+    def test_reprocessar_nao_duplica_a_trilha(self):
+        extrator = Extrator(self.db, FakeLlm([self.extracao, self.extracao]))
+        extrator.processar_conversa(self.conversa.id, agora=AGORA)
+        antes = len(self._eventos())
+        extrator.processar_conversa(self.conversa.id, agora=AGORA, forcar=True)
+        self.assertEqual(len(self._eventos()), antes)
+
+
+class TesteAvancoNaoEsquentaConversaVelha(unittest.TestCase):
+    def test_extracao_em_lote_de_avanco_antigo_nao_deixa_quente(self):
+        """§5 conta quando o avanço ACONTECEU, não quando foi percebido.
+
+        Sem isso, rodar `make extrair` sobre a base atrasada deixaria tudo
+        QUENTE e a fila do dia perderia o sentido.
+        """
+        db = FakeDatabase()
+        conversa = db.criar_conversa(nome="Bruno")
+        db.registrar_mensagem(conversa.id, "in", "segue foto da Mimi",
+                              AGORA - timedelta(days=3, hours=2))
+        db.registrar_mensagem(conversa.id, "out", "Que linda! Ja te mando a previa",
+                              AGORA - timedelta(days=3))
+
+        resultado = Extrator(db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "segue foto da Mimi"})
+        ])).processar_conversa(conversa.id, agora=AGORA)
+
+        self.assertEqual(resultado.estado.estagio, "S2")
+        self.assertEqual(resultado.estado.temperatura, ESFRIANDO)
+
+    def test_estado_devolvido_bate_com_o_recalculo_seguinte(self):
+        """A conversa não pode oscilar entre duas temperaturas sozinha."""
+        db = FakeDatabase()
+        conversa = db.criar_conversa(nome="Bruno")
+        db.registrar_mensagem(conversa.id, "in", "segue foto da Mimi",
+                              AGORA - timedelta(days=3, hours=2))
+        db.registrar_mensagem(conversa.id, "out", "ja te mando",
+                              AGORA - timedelta(days=3))
+        primeiro = Extrator(db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "segue foto da Mimi"})
+        ])).processar_conversa(conversa.id, agora=AGORA)
+        segundo = recalcular(db, db.get_conversa(conversa.id), agora=AGORA)
+        self.assertEqual(primeiro.estado.temperatura, segundo.temperatura)
+        self.assertEqual(primeiro.estado.estagio, segundo.estagio)
+
+
+class TesteCicloB2B(unittest.TestCase):
+    def test_petshop_autoriza_e_recebe_proposta(self):
+        db = FakeDatabase()
+        conversa = db.criar_conversa(funil="b2b", estagio="P0", nome="PetX")
+        db.registrar_mensagem(conversa.id, "out", "Posso mandar uma foto de uma peca?",
+                              AGORA - timedelta(days=2))
+        db.registrar_mensagem(conversa.id, "in", "pode mandar sim",
+                              AGORA - timedelta(days=1, hours=20))
+
+        extrator = Extrator(db, FakeLlm([
+            resposta(autorizou_envio_material=True,
+                     evidencias={"autorizou_envio_material": "pode mandar sim"})
+        ]))
+        resultado = extrator.processar_conversa(conversa.id, agora=AGORA)
+        self.assertEqual(resultado.estado.estagio, "P2")
+
+        db.registrar_mensagem(conversa.id, "out", "Segue. Trabalhamos com consignacao.",
+                              AGORA - timedelta(days=1, hours=19))
+        estado = recalcular(db, db.get_conversa(conversa.id), agora=AGORA)
+        self.assertEqual(estado.estagio, "P3")
+
+
+class TesteRascunhoNoFimDoCiclo(unittest.TestCase):
+    def test_rascunho_usa_o_estagio_derivado(self):
+        db = FakeDatabase()
+        conversa = db.criar_conversa(nome="Ana")
+        db.registrar_mensagem(conversa.id, "in", "oi", AGORA - timedelta(hours=1))
+        estado = recalcular(db, conversa, agora=AGORA)
+
+        rascunho = gerar_rascunho(
+            FakeLlm([json.dumps({"opcoes": [
+                "Manda uma foto do seu pet?\nTe mostro como fica.",
+                "Consegue mandar uma foto dele?\nJá te envio a prévia.",
+            ]})]),
+            [("in", "oi")],
+            estagio=estado.estagio,
+            temperatura=estado.temperatura,
+            funil="b2c",
+            followups_enviados=0,
+        )
+        self.assertEqual(len(rascunho.opcoes), 2)
+        # S1: nenhuma opção pode abrir com preço.
+        self.assertFalse(any("R$" in o for o in rascunho.opcoes))
+
+
+if __name__ == "__main__":
+    unittest.main()

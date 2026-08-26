@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+*.log
+.pytest_cache/
+# O conjunto de avaliação real contém conversas de clientes (§12).
+data/eval/conversas.jsonl
+data/backfill/
+
+# Estado local do Claude Code
+.claude/
