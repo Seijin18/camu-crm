@@ -1,4 +1,4 @@
-.PHONY: help db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint
+.PHONY: help db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint painel servir acompanhar
 
 PY = ./.venv/bin/python
 COMPOSE = docker compose
@@ -44,3 +44,12 @@ metricas:  ## os três números da §14
 
 backfill:  ## importa e extrai o histórico. Ex.: make backfill ARQUIVO=dump.json
 	$(PY) -m camucrm backfill --arquivo $(ARQUIVO) --extrair
+
+painel:  ## sobe o painel web de leitura (127.0.0.1:8093, §13 antecipado)
+	$(PY) -m camucrm painel
+
+servir:  ## sobe o receptor de webhook da Evolution API
+	$(PY) -m camucrm servir
+
+acompanhar:  ## painel de terminal ao vivo (não é o painel da §13)
+	$(PY) -m camucrm acompanhar

@@ -13,9 +13,111 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from camucrm.db import Contato, Conversa, TetoFollowupError
+from camucrm.db import (
+    Contato,
+    Conversa,
+    ContatoResumido,
+    CorrecaoRegistro,
+    EventoRegistro,
+    FatoRegistro,
+    FollowupRegistro,
+    MarcoRegistro,
+    MensagemRegistro,
+    ObjecaoRegistro,
+    TetoFollowupError,
+)
 from camucrm.rules.sinais import Mensagem
 from camucrm.taxonomia import MAX_FOLLOWUPS, is_terminal, rank_estagio
+
+
+class _FakeCursor:
+    """Emula só as 3 formas de consulta que `camucrm.metrics` roda direto em
+    SQL (`conversao` e `tempo_por_estagio`), sem passar por método de
+    `Database`.
+
+    `metrics.py` é código existente que já não respeita "db.py é o único
+    lugar com SQL" — não é este change que resolve isso. Esta classe existe
+    só para que `GET /api/metricas` do painel tenha um smoke test sem
+    Postgres; ela reconhece as consultas pelo texto, não interpreta SQL de
+    verdade, e levanta se vir uma forma que não conhece.
+    """
+
+    def __init__(self, db: "FakeDatabase"):
+        self._db = db
+        self._resultado: list[tuple] = []
+
+    def __enter__(self) -> "_FakeCursor":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+    def execute(self, query: str, params: tuple = ()) -> None:
+        q = " ".join(query.split())
+        if "COUNT(DISTINCT conversa_id) FROM eventos_estagio" in q:
+            de = params[0]
+            desde = params[1] if len(params) > 1 else None
+            ids = {
+                e["conversa_id"] for e in self._db.eventos
+                if e["para"] == de and (desde is None or e["em"] >= desde)
+            }
+            self._resultado = [(len(ids),)]
+        elif "COUNT(DISTINCT a.conversa_id)" in q:
+            de, para = params[0], params[1]
+            desde = params[2] if len(params) > 2 else None
+            ids_de = {e["conversa_id"] for e in self._db.eventos if e["para"] == de}
+            ids_para = {
+                e["conversa_id"] for e in self._db.eventos
+                if e["para"] == para and (desde is None or e["em"] >= desde)
+            }
+            self._resultado = [(len(ids_de & ids_para),)]
+        elif "WITH transicoes AS" in q:
+            por_conversa: dict[int, list[dict]] = {}
+            for e in self._db.eventos:
+                if e["origem"] != "live":
+                    continue
+                por_conversa.setdefault(e["conversa_id"], []).append(e)
+            pares: dict[str, list[float]] = {}
+            for eventos in por_conversa.values():
+                ordenados = sorted(eventos, key=lambda e: e["em"])
+                for atual, prox in zip(ordenados, ordenados[1:]):
+                    horas = (prox["em"] - atual["em"]).total_seconds() / 3600.0
+                    pares.setdefault(atual["para"], []).append(horas)
+            linhas = []
+            for estagio in sorted(pares):
+                valores = sorted(pares[estagio])
+                n = len(valores)
+                meio = n // 2
+                mediana = (
+                    valores[meio] if n % 2
+                    else (valores[meio - 1] + valores[meio]) / 2
+                )
+                linhas.append((estagio, n, mediana))
+            self._resultado = linhas
+        else:
+            raise NotImplementedError(
+                f"FakeDatabase._conn não sabe emular esta consulta: {q[:80]!r}"
+            )
+
+    def fetchone(self):
+        return self._resultado[0] if self._resultado else None
+
+    def fetchall(self):
+        return list(self._resultado)
+
+
+class _FakeConn:
+    def __init__(self, db: "FakeDatabase"):
+        self._db = db
+
+    def __enter__(self) -> "_FakeConn":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+    def cursor(self) -> _FakeCursor:
+        return _FakeCursor(self._db)
 
 
 class FakeDatabase:
@@ -24,12 +126,16 @@ class FakeDatabase:
         self.conversas: dict[int, Conversa] = {}
         self.mensagens: dict[int, list[tuple[int, str, str, datetime]]] = {}
         self.externa_ids: set[str] = set()
-        self.fatos: list[tuple[int, str, str | None, datetime]] = []
+        # (conversa_id, chave, evidencia, extraido_em, mensagem_em)
+        self.fatos: list[tuple[int, str, str | None, datetime, datetime | None]] = []
         self.eventos: list[dict[str, Any]] = []
         self.objecoes: list[dict[str, Any]] = []
         self.correcoes: list[dict[str, Any]] = []
         self.followups: dict[int, list[tuple[int, str | None, datetime]]] = {}
         self.marcos: dict[int, set[str]] = {}
+        # `marco -> (em, por)`, por conversa — precisa de `por` e `em` reais
+        # para `marcos_detalhados`, que `self.marcos` (só o set) não guarda.
+        self.marcos_por: dict[int, dict[str, tuple[datetime, str | None]]] = {}
         self._proximo_id = 1
 
     # -- helpers de montagem ---------------------------------------------
@@ -40,11 +146,16 @@ class FakeDatabase:
         return valor
 
     def criar_conversa(
-        self, *, funil: str = "b2c", estagio: str = "S0", nome: str = "Teste"
+        self,
+        *,
+        funil: str = "b2c",
+        estagio: str = "S0",
+        nome: str = "Teste",
+        telefone: str | None = "5511900000000",
     ) -> Conversa:
         contato_id = self._novo_id()
         self.contatos[contato_id] = Contato(
-            contato_id, nome, f"hash{contato_id}", "5511900000000", funil, None,
+            contato_id, nome, f"hash{contato_id}", telefone, funil, None,
             datetime.now(timezone.utc),
         )
         conversa_id = self._novo_id()
@@ -114,20 +225,33 @@ class FakeDatabase:
             if not valor:
                 continue
             evidencia = evidencias.get(chave)
-            if (conversa_id, chave, evidencia) in {(c, k, e) for c, k, e, _ in self.fatos}:
+            existentes = {(c, k, e) for c, k, e, _, _ in self.fatos}
+            if (conversa_id, chave, evidencia) in existentes:
                 continue
             self.fatos.append(
-                (conversa_id, chave, evidencia, momentos.get(chave, extraido_em))
+                (conversa_id, chave, evidencia, extraido_em, momentos.get(chave))
             )
             inseridos += 1
         return inseridos
 
     def fatos_da_conversa(self, conversa_id: int) -> dict[str, bool]:
-        return {k: True for c, k, _, _ in self.fatos if c == conversa_id}
+        return {k: True for c, k, _, _, _ in self.fatos if c == conversa_id}
 
     def fato_registrado_em(self, conversa_id, chave) -> datetime | None:
-        momentos = [m for c, k, _, m in self.fatos if c == conversa_id and k == chave]
+        momentos = [
+            (mensagem_em or extraido_em)
+            for c, k, _, extraido_em, mensagem_em in self.fatos
+            if c == conversa_id and k == chave
+        ]
         return min(momentos) if momentos else None
+
+    def fatos_detalhados(self, conversa_id: int) -> list[FatoRegistro]:
+        linhas = [
+            FatoRegistro(k, True, e, extraido_em, mensagem_em)
+            for c, k, e, extraido_em, mensagem_em in self.fatos
+            if c == conversa_id
+        ]
+        return sorted(linhas, key=lambda f: f.extraido_em)
 
     def gravar_evento_estagio(self, conversa_id, de, para, *, origem="live", motivo=None, em=None):
         self.eventos.append(
@@ -135,6 +259,13 @@ class FakeDatabase:
              "origem": origem, "motivo": motivo,
              "em": em or datetime.now(timezone.utc)}
         )
+
+    def eventos_da_conversa(self, conversa_id: int) -> list[EventoRegistro]:
+        eventos = [e for e in self.eventos if e["conversa_id"] == conversa_id]
+        return [
+            EventoRegistro(e["de"], e["para"], e["em"], e["origem"], e["motivo"])
+            for e in eventos
+        ]
 
     def estagio_maximo_alcancado(self, conversa_id: int) -> str | None:
         alcancados = [
@@ -159,15 +290,33 @@ class FakeDatabase:
 
     def gravar_objecao(self, conversa_id, categoria, *, estagio=None, trecho=None, em=None):
         self.objecoes.append(
-            {"conversa_id": conversa_id, "categoria": categoria, "estagio": estagio,
-             "trecho": trecho, "em": em or datetime.now(timezone.utc)}
+            {"id": self._novo_id(), "conversa_id": conversa_id, "categoria": categoria,
+             "estagio": estagio, "trecho": trecho, "em": em or datetime.now(timezone.utc)}
         )
 
     def distribuicao_objecoes(self, desde=None) -> dict[str, int]:
         contagem: dict[str, int] = {}
         for o in self.objecoes:
+            if desde is not None and o["em"] < desde:
+                continue
             contagem[o["categoria"]] = contagem.get(o["categoria"], 0) + 1
         return contagem
+
+    def _conn(self) -> _FakeConn:
+        """Só para `camucrm.metrics`, que fala SQL direto com `Database`.
+
+        Ver `_FakeCursor` no topo do módulo — emulação estreita, não um
+        motor de SQL de verdade.
+        """
+        return _FakeConn(self)
+
+    def objecoes_da_conversa(self, conversa_id: int) -> list[ObjecaoRegistro]:
+        linhas = [
+            ObjecaoRegistro(o["id"], o["categoria"], o["estagio"], o["trecho"], o["em"])
+            for o in self.objecoes
+            if o["conversa_id"] == conversa_id
+        ]
+        return sorted(linhas, key=lambda o: o.em)
 
     def atualizar_estado_conversa(self, conversa_id, **campos):
         conversa = self.conversas[conversa_id]
@@ -190,10 +339,23 @@ class FakeDatabase:
         enviados = self.followups.get(conversa_id) or []
         return max((f[2] for f in enviados), default=None)
 
+    def followups_da_conversa(self, conversa_id: int) -> list[FollowupRegistro]:
+        enviados = self.followups.get(conversa_id) or []
+        return [
+            FollowupRegistro(numero, texto, enviado_em)
+            for numero, texto, enviado_em in sorted(enviados, key=lambda f: f[0])
+        ]
+
     def registrar_marco(self, conversa_id, marco, *, por=None):
         self.marcos.setdefault(conversa_id, set()).add(marco)
+        self.marcos_por.setdefault(conversa_id, {})[marco] = (
+            datetime.now(timezone.utc), por,
+        )
 
     def marco_em(self, conversa_id: int, marco: str):
+        registro = self.marcos_por.get(conversa_id, {}).get(marco)
+        if registro:
+            return registro[0]
         return (
             datetime.now(timezone.utc)
             if marco in self.marcos.get(conversa_id, set())
@@ -203,10 +365,71 @@ class FakeDatabase:
     def marcos_da_conversa(self, conversa_id: int) -> set[str]:
         return set(self.marcos.get(conversa_id, set()))
 
+    def marcos_detalhados(self, conversa_id: int) -> list[MarcoRegistro]:
+        registros = self.marcos_por.get(conversa_id, {})
+        linhas = [
+            MarcoRegistro(marco, em, por) for marco, (em, por) in registros.items()
+        ]
+        return sorted(linhas, key=lambda m: m.em)
+
     def registrar_correcao(self, conversa_id, campo, antes, depois, *, por=None):
         self.correcoes.append(
-            {"conversa_id": conversa_id, "campo": campo, "antes": antes,
-             "depois": depois, "por": por}
+            {"id": self._novo_id(), "conversa_id": conversa_id, "campo": campo,
+             "antes": antes, "depois": depois, "por": por,
+             "em": datetime.now(timezone.utc)}
+        )
+
+    def correcoes_da_conversa(self, conversa_id: int) -> list[CorrecaoRegistro]:
+        linhas = [
+            CorrecaoRegistro(
+                c["id"], c["campo"], c["antes"], c["depois"], c["em"], c["por"]
+            )
+            for c in self.correcoes
+            if c["conversa_id"] == conversa_id
+        ]
+        return sorted(linhas, key=lambda c: c.em, reverse=True)
+
+    def listar_mensagens_registradas(
+        self, *, conversa_id: int | None = None, desde_id: int | None = None,
+        limite: int = 200,
+    ) -> list[MensagemRegistro]:
+        todas = []
+        for c_id, linhas in self.mensagens.items():
+            if conversa_id is not None and c_id != conversa_id:
+                continue
+            for identificador, direcao, texto, enviada_em in linhas:
+                if identificador > (desde_id or 0):
+                    todas.append(
+                        MensagemRegistro(identificador, c_id, direcao, texto, enviada_em)
+                    )
+        todas.sort(key=lambda m: m.id)
+        return todas[:limite]
+
+    def ultimas_mensagens_globais(
+        self, limite: int = 8
+    ) -> list[tuple[str, str, datetime, str]]:
+        todas = []
+        for conversa_id, linhas in self.mensagens.items():
+            conversa = self.conversas.get(conversa_id)
+            nome = (conversa.nome_contato if conversa else "") or ""
+            for _, direcao, texto, enviada_em in linhas:
+                todas.append((direcao, texto, enviada_em, nome))
+        todas.sort(key=lambda item: item[2])
+        recentes = todas[-limite:]
+        return [
+            (d, (t or "").replace("\n", " "), q, n) for d, t, q, n in recentes
+        ]
+
+    def contato_resumido(self, conversa_id: int) -> ContatoResumido | None:
+        conversa = self.conversas.get(conversa_id)
+        if conversa is None:
+            return None
+        contato = self.contatos.get(conversa.contato_id)
+        if contato is None:
+            return None
+        return ContatoResumido(
+            contato.id, contato.nome, contato.tipo,
+            contato.telefone is not None, contato.criado_em,
         )
 
     def upsert_contato(self, telefone, *, nome=None, tipo="b2c", origem=None) -> Contato:

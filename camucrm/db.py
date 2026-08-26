@@ -118,6 +118,88 @@ class Objecao:
     em: datetime
 
 
+# --------------------------------------------------------------------------
+# Dataclasses de leitura do painel (§13, antecipado — change `painel-leitura`)
+# --------------------------------------------------------------------------
+#
+# Sufixo `Registro` para não colidir com as dataclasses de gravação acima
+# (`Fato`, `EventoEstagio`, `Objecao`, que carregam `conversa_id` e servem à
+# escrita) nem com `drafts.Rascunho`. Estas são projeções de leitura — uma
+# linha por consulta do painel, sem `conversa_id` repetido em toda linha
+# porque o chamador já sabe de qual conversa está pedindo.
+
+
+@dataclass
+class FatoRegistro:
+    chave: str
+    valor: bool
+    evidencia: str | None
+    extraido_em: datetime
+    mensagem_em: datetime | None
+
+
+@dataclass
+class EventoRegistro:
+    de: str | None
+    para: str
+    em: datetime
+    origem: str
+    motivo: str | None
+
+
+@dataclass
+class ObjecaoRegistro:
+    id: int
+    categoria: str
+    estagio: str | None
+    trecho: str | None
+    em: datetime
+
+
+@dataclass
+class FollowupRegistro:
+    numero: int
+    texto: str | None
+    enviado_em: datetime
+
+
+@dataclass
+class MarcoRegistro:
+    marco: str
+    em: datetime
+    por: str | None
+
+
+@dataclass
+class CorrecaoRegistro:
+    id: int
+    campo: str
+    antes: str | None
+    depois: str | None
+    em: datetime
+    por: str | None
+
+
+@dataclass
+class MensagemRegistro:
+    id: int
+    conversa_id: int
+    direcao: str
+    texto: str
+    enviada_em: datetime
+
+
+@dataclass
+class ContatoResumido:
+    """Resumo de contato para o painel — nunca carrega telefone em claro (§12)."""
+
+    id: int
+    nome: str | None
+    tipo: str
+    tem_telefone: bool
+    criado_em: datetime
+
+
 class TetoFollowupError(RuntimeError):
     """Tentativa de furar o teto de 2 follow-ups (§6).
 
@@ -302,8 +384,16 @@ CREATE TABLE IF NOT EXISTS marcos_manuais (
 class Database:
     """Pool de conexões + as consultas que o CRM precisa."""
 
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, *, max_size: int = 5):
+        # DIVERGÊNCIA do plano original (registrada, não silenciosa): o plano
+        # de `painel-leitura` previa que o painel precisaria de um pool maior
+        # que 5 conexões (uma por requisição concorrente de um operador
+        # atualizando várias telas). `Database` não aceitava `max_size` antes
+        # deste change; o parâmetro é novo aqui, opcional e retrocompatível —
+        # todo chamador existente (`cli._db`, `webhook.get_db`) continua
+        # recebendo o pool de 5 conexões de sempre.
         self._dsn = dsn
+        self._max_size = max_size
         self._pool: Optional[ConnectionPool] = None
         self._logger = logger
 
@@ -312,7 +402,7 @@ class Database:
     def init_pool(self) -> None:
         if self._pool is None:
             self._pool = ConnectionPool(
-                conninfo=self._dsn, min_size=1, max_size=5, open=True
+                conninfo=self._dsn, min_size=1, max_size=self._max_size, open=True
             )
 
     def close(self) -> None:
@@ -898,6 +988,163 @@ class Database:
                     (limite,),
                 )
                 return list(cur.fetchall())
+
+    # -- leitura do painel (§13, antecipado) -------------------------------
+    #
+    # Todo método abaixo é só-leitura, sem N+1 escondido dentro dele: cada um
+    # é uma única consulta. O N+1 entre conversas do painel (uma chamada
+    # destas por card) é aceito conscientemente no lado do chamador
+    # (`camucrm.painel.api`), não escondido aqui.
+
+    def fatos_detalhados(self, conversa_id: int) -> list[FatoRegistro]:
+        """Fatos com evidência, linha a linha — não agregados por chave.
+
+        Diferente de `fatos_da_conversa` (que faz `GROUP BY` e devolve só o
+        booleano corrente), o painel precisa mostrar a evidência literal que
+        sustenta cada afirmação (invariante 1 do CLAUDE.md), e a mesma chave
+        pode ter mais de uma linha ao longo do tempo.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT chave, valor, evidencia, extraido_em, mensagem_em "
+                    "FROM fatos WHERE conversa_id = %s AND valor "
+                    "ORDER BY extraido_em",
+                    (conversa_id,),
+                )
+                return [FatoRegistro(*row) for row in cur.fetchall()]
+
+    def eventos_da_conversa(self, conversa_id: int) -> list[EventoRegistro]:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT de, para, em, origem, motivo FROM eventos_estagio "
+                    "WHERE conversa_id = %s ORDER BY id",
+                    (conversa_id,),
+                )
+                return [EventoRegistro(*row) for row in cur.fetchall()]
+
+    def objecoes_da_conversa(self, conversa_id: int) -> list[ObjecaoRegistro]:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, categoria, estagio, trecho, em FROM objecoes "
+                    "WHERE conversa_id = %s ORDER BY em",
+                    (conversa_id,),
+                )
+                return [ObjecaoRegistro(*row) for row in cur.fetchall()]
+
+    def followups_da_conversa(self, conversa_id: int) -> list[FollowupRegistro]:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT numero, texto, enviado_em FROM followups "
+                    "WHERE conversa_id = %s ORDER BY numero",
+                    (conversa_id,),
+                )
+                return [FollowupRegistro(*row) for row in cur.fetchall()]
+
+    def marcos_detalhados(self, conversa_id: int) -> list[MarcoRegistro]:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT marco, em, por FROM marcos_manuais "
+                    "WHERE conversa_id = %s ORDER BY em",
+                    (conversa_id,),
+                )
+                return [MarcoRegistro(*row) for row in cur.fetchall()]
+
+    def correcoes_da_conversa(self, conversa_id: int) -> list[CorrecaoRegistro]:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, campo, antes, depois, em, por FROM correcoes "
+                    "WHERE conversa_id = %s ORDER BY em DESC",
+                    (conversa_id,),
+                )
+                return [CorrecaoRegistro(*row) for row in cur.fetchall()]
+
+    def listar_mensagens_registradas(
+        self,
+        *,
+        conversa_id: int | None = None,
+        desde_id: int | None = None,
+        limite: int = 200,
+    ) -> list[MensagemRegistro]:
+        """Mensagens gravadas, opcionalmente restritas a uma conversa.
+
+        Usada tanto por `GET /api/conversas/{id}/mensagens` (com
+        `conversa_id`) quanto, futuramente, por um feed global — mesma
+        consulta, um parâmetro a mais, para não duplicar SQL entre os dois
+        usos.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if conversa_id is not None:
+                    cur.execute(
+                        "SELECT id, conversa_id, direcao, texto, enviada_em "
+                        "FROM mensagens WHERE conversa_id = %s AND id > %s "
+                        "ORDER BY id LIMIT %s",
+                        (conversa_id, desde_id or 0, limite),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT id, conversa_id, direcao, texto, enviada_em "
+                        "FROM mensagens WHERE id > %s ORDER BY id LIMIT %s",
+                        (desde_id or 0, limite),
+                    )
+                return [MensagemRegistro(*row) for row in cur.fetchall()]
+
+    def ultimas_mensagens_globais(
+        self, limite: int = 8
+    ) -> list[tuple[str, str, datetime, str]]:
+        """As últimas mensagens de toda a base, mais nova por último.
+
+        Movido de `cli._ultimas_mensagens` para cá: era o único SQL cru fora
+        de `db.py` (CLAUDE.md: "db.py é o único lugar do repo com SQL"). O
+        formato de retorno é o que `cli._desenhar` já consumia — mantido para
+        não duplicar a normalização (strip de quebra de linha, fuso local,
+        ordem cronológica) entre `cli.acompanhar` e o painel.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT m.direcao, m.texto, m.enviada_em, COALESCE(t.nome, '')
+                      FROM mensagens m
+                      JOIN conversas c ON c.id = m.conversa_id
+                      JOIN contatos t ON t.id = c.contato_id
+                     ORDER BY m.enviada_em DESC LIMIT %s
+                    """,
+                    (limite,),
+                )
+                linhas = cur.fetchall()
+        return [
+            (d, (t or "").replace("\n", " "), q.astimezone(), n)
+            for d, t, q, n in reversed(linhas)
+        ]
+
+    def contato_resumido(self, conversa_id: int) -> ContatoResumido | None:
+        """Resumo do contato de uma conversa — telefone NUNCA em claro (§12).
+
+        `tem_telefone` é o único jeito de o painel saber que o número existe:
+        suficiente para o operador confirmar que dá para enviar por
+        `camucrm enviar`, sem que o número em si trafegue pela API de leitura.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT ct.id, ct.nome, ct.tipo,
+                           (ct.telefone IS NOT NULL) AS tem_telefone, ct.criado_em
+                      FROM conversas c
+                      JOIN contatos ct ON ct.id = c.contato_id
+                     WHERE c.id = %s
+                    """,
+                    (conversa_id,),
+                )
+                row = cur.fetchone()
+                return ContatoResumido(*row) if row else None
 
     # -- retenção (§12) ---------------------------------------------------
 

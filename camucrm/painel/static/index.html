@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>camu-crm — painel</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header>
+    <h1>camu-crm — painel de leitura</h1>
+    <nav class="abas">
+      <a href="#/" data-rota="/">Fila</a>
+      <a href="#/kanban" data-rota="/kanban">Kanban</a>
+      <a href="#/conversas" data-rota="/conversas">Conversas</a>
+      <a href="#/metricas" data-rota="/metricas">Métricas (§14)</a>
+    </nav>
+    <div class="token-config">
+      <input id="campo-token" type="password" placeholder="X-Camu-Token" />
+      <button id="botao-salvar-token" class="secundario">Salvar token</button>
+      <button id="botao-atualizar">Atualizar</button>
+    </div>
+  </header>
+  <main id="conteudo">
+    <p class="aviso">Carregando…</p>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

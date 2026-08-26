@@ -1,0 +1,262 @@
+/* Painel de leitura do camu-crm. CSS puro, sem framework (CLAUDE.md). */
+
+:root {
+  --bg: #0f1115;
+  --bg-elev: #171a21;
+  --borda: #2a2e38;
+  --texto: #e6e8ec;
+  --texto-fraco: #9aa0ab;
+  --acento: #5b8def;
+  --quente: #e5533d;
+  --morno: #e5a83d;
+  --esfriando: #4a90d9;
+  --frio: #6c7280;
+  --encerrado: #3a3d45;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--texto);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--borda);
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+header h1 {
+  font-size: 1rem;
+  margin: 0;
+  font-weight: 600;
+}
+
+nav.abas {
+  display: flex;
+  gap: 0.5rem;
+}
+
+nav.abas a {
+  color: var(--texto-fraco);
+  text-decoration: none;
+  padding: 0.4rem 0.8rem;
+  border-radius: 6px;
+}
+
+nav.abas a.ativa {
+  color: var(--texto);
+  background: var(--bg-elev);
+}
+
+.token-config {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.token-config input {
+  background: var(--bg-elev);
+  border: 1px solid var(--borda);
+  color: var(--texto);
+  padding: 0.3rem 0.5rem;
+  border-radius: 6px;
+  width: 10rem;
+}
+
+button {
+  background: var(--acento);
+  color: white;
+  border: none;
+  padding: 0.4rem 0.9rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+button.secundario {
+  background: var(--bg-elev);
+  color: var(--texto);
+  border: 1px solid var(--borda);
+}
+
+main {
+  padding: 1.25rem;
+}
+
+.aviso {
+  color: var(--texto-fraco);
+  font-size: 0.85rem;
+  margin-bottom: 1rem;
+}
+
+/* -- Fila (tela inicial, §6) ------------------------------------------ */
+
+.fila-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.9rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  margin-bottom: 0.5rem;
+}
+
+.fila-item .prioridade {
+  font-weight: 700;
+  color: var(--acento);
+  width: 1.5rem;
+}
+
+.fila-item .nome {
+  flex: 1;
+  font-weight: 600;
+}
+
+.fila-item .acao {
+  color: var(--texto-fraco);
+  font-size: 0.85rem;
+}
+
+.tag {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.tag.quente { background: var(--quente); color: white; }
+.tag.morno { background: var(--morno); color: black; }
+.tag.esfriando { background: var(--esfriando); color: white; }
+.tag.frio { background: var(--frio); color: white; }
+.tag.encerrado { background: var(--encerrado); color: var(--texto-fraco); }
+
+/* -- Kanban -------------------------------------------------------------- */
+
+.kanban {
+  display: flex;
+  gap: 0.75rem;
+  overflow-x: auto;
+  padding-bottom: 0.5rem;
+}
+
+.coluna {
+  min-width: 220px;
+  background: var(--bg-elev);
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  padding: 0.6rem;
+}
+
+.coluna.derivada {
+  opacity: 0.6;
+}
+
+.coluna .titulo {
+  font-weight: 600;
+  font-size: 0.85rem;
+  margin-bottom: 0.4rem;
+  display: flex;
+  justify-content: space-between;
+}
+
+.coluna .motivo-recusa {
+  font-size: 0.7rem;
+  color: var(--texto-fraco);
+  margin-bottom: 0.5rem;
+}
+
+.card {
+  background: var(--bg);
+  border: 1px solid var(--borda);
+  border-radius: 6px;
+  padding: 0.5rem;
+  margin-bottom: 0.4rem;
+  font-size: 0.8rem;
+  cursor: not-allowed; /* sem drag habilitado neste change */
+}
+
+.card .nome {
+  font-weight: 600;
+  display: block;
+}
+
+.card .sinal {
+  color: var(--texto-fraco);
+  font-size: 0.72rem;
+}
+
+/* -- Detalhe de conversa -------------------------------------------------- */
+
+.secao {
+  margin-bottom: 1.25rem;
+}
+
+.secao h3 {
+  font-size: 0.85rem;
+  color: var(--texto-fraco);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.4rem;
+}
+
+.linha {
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--borda);
+  font-size: 0.85rem;
+}
+
+.evidencia {
+  color: var(--texto-fraco);
+  font-style: italic;
+}
+
+.aviso-backfill {
+  color: var(--morno);
+  font-size: 0.75rem;
+}
+
+.msg {
+  padding: 0.3rem 0.6rem;
+  border-radius: 8px;
+  margin-bottom: 0.3rem;
+  max-width: 70%;
+  font-size: 0.85rem;
+}
+
+.msg.in {
+  background: var(--bg-elev);
+  margin-right: auto;
+}
+
+.msg.out {
+  background: var(--acento);
+  color: white;
+  margin-left: auto;
+  text-align: right;
+}
+
+.filtros {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.filtros select, .filtros input {
+  background: var(--bg-elev);
+  border: 1px solid var(--borda);
+  color: var(--texto);
+  padding: 0.3rem 0.5rem;
+  border-radius: 6px;
+}

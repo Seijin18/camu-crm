@@ -410,23 +410,11 @@ def _desenhar(banco: Database, *, extraindo: bool) -> None:
 
 
 def _ultimas_mensagens(banco: Database, limite: int = 8):
-    with banco._conn() as conn:  # noqa: SLF001
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT m.direcao, m.texto, m.enviada_em, COALESCE(t.nome, '')
-                  FROM mensagens m
-                  JOIN conversas c ON c.id = m.conversa_id
-                  JOIN contatos t ON t.id = c.contato_id
-                 ORDER BY m.enviada_em DESC LIMIT %s
-                """,
-                (limite,),
-            )
-            linhas = cur.fetchall()
-    return [
-        (d, (t or "").replace("\n", " "), q.astimezone(), n)
-        for d, t, q, n in reversed(linhas)
-    ]
+    """Wrapper fino: o SQL mora em `db.ultimas_mensagens_globais` (CLAUDE.md:
+    "db.py é o único lugar do repo com SQL"). Movido de propósito no change
+    `painel-leitura`, para que `cli.acompanhar` e o painel web leiam da mesma
+    consulta em vez de duas SQLs que podem divergir."""
+    return banco.ultimas_mensagens_globais(limite)
 
 
 def cmd_servir(args) -> int:
@@ -437,6 +425,17 @@ def cmd_servir(args) -> int:
     print(f"Ouvindo em http://0.0.0.0:{porta}/webhook/evolution")
     print("Este serviço não envia nada — só recebe (§10).")
     servir(porta)
+    return 0
+
+
+def cmd_painel(args) -> int:
+    """Sobe o painel web de leitura (§13, antecipado — change `painel-leitura`)."""
+    from .painel import PORTA_PADRAO, servir as servir_painel
+
+    porta = args.porta or PORTA_PADRAO
+    print(f"Painel em http://127.0.0.1:{porta}")
+    print("Este painel não envia nada — envio continua por `camucrm enviar` (§10).")
+    servir_painel(porta)
     return 0
 
 
@@ -542,6 +541,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("servir", help="recebe webhooks da Evolution API")
     p.add_argument("--porta", type=int)
     p.set_defaults(func=cmd_servir)
+
+    p = sub.add_parser("painel", help="painel web de leitura (§13, antecipado)")
+    p.add_argument("--porta", type=int)
+    p.set_defaults(func=cmd_painel)
 
     return parser
 
