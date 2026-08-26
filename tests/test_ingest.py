@@ -1,0 +1,103 @@
+"""Ingestão (`camucrm/ingest.py`): o caminho único de entrada."""
+
+import sys
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from fakes import FakeDatabase  # noqa: E402
+
+from camucrm.ingest import ingerir  # noqa: E402
+from camucrm.transport.base import EventoRecebido  # noqa: E402
+from camucrm.transport.evolution import EvolutionTransporte  # noqa: E402
+
+AGORA = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+
+
+def payload(texto="oi", ident="M1", from_me=False, telefone="5511999998888"):
+    return {
+        "event": "messages.upsert",
+        "data": {
+            "key": {
+                "remoteJid": f"{telefone}@s.whatsapp.net",
+                "id": ident,
+                "fromMe": from_me,
+            },
+            "message": {"conversation": texto},
+            "messageTimestamp": int((AGORA - timedelta(hours=1)).timestamp()),
+            "pushName": "Ana",
+        },
+    }
+
+
+class TesteIngestao(unittest.TestCase):
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.transporte = EvolutionTransporte("http://x", "k", "i")
+
+    def _ingerir(self, bruto):
+        return ingerir(self.db, self.transporte.receber(bruto), agora=AGORA)
+
+    def test_cria_contato_conversa_e_mensagem(self):
+        resultado = self._ingerir(payload())
+        self.assertFalse(resultado.ignorada)
+        self.assertEqual(resultado.contato, "Ana")
+        self.assertEqual(resultado.estado.estagio, "S1")
+
+    def test_evento_que_nao_e_mensagem_e_ignorado_sem_erro(self):
+        resultado = ingerir(self.db, self.transporte.receber({"event": "connection"}))
+        self.assertTrue(resultado.ignorada)
+        self.assertEqual(self.db.contatos, {})
+
+    def test_reentrega_nao_duplica_nem_move_o_relogio(self):
+        """Webhook reentregue não pode fazer a temperatura oscilar."""
+        primeiro = self._ingerir(payload())
+        cid = primeiro.conversa_id
+        antes = self.db.conversas[cid].ultimo_inbound
+
+        repetido = self._ingerir(payload())
+
+        self.assertTrue(repetido.duplicada)
+        self.assertEqual(len(self.db.mensagens[cid]), 1)
+        self.assertEqual(self.db.conversas[cid].ultimo_inbound, antes)
+
+    def test_mensagem_seguinte_do_mesmo_numero_reusa_a_conversa(self):
+        primeiro = self._ingerir(payload(ident="M1"))
+        segundo = self._ingerir(payload(texto="ainda ta ai?", ident="M2"))
+        self.assertEqual(primeiro.conversa_id, segundo.conversa_id)
+
+    def test_eco_da_propria_mensagem_vira_outbound(self):
+        """O eco decide a bola, e a bola é o sinal de maior peso (§5)."""
+        self._ingerir(payload(ident="M1"))
+        resultado = self._ingerir(
+            payload(texto="Oi! Manda uma foto?", ident="M2", from_me=True)
+        )
+        self.assertEqual(resultado.estado.sinais.bola_com, "cliente")
+
+    def test_contato_nasce_b2c(self):
+        """Classificar petshop por heurística seria inferência (§1)."""
+        self._ingerir(payload())
+        self.assertEqual(next(iter(self.db.contatos.values())).tipo, "b2c")
+
+
+class TesteEventoDireto(unittest.TestCase):
+    def test_aceita_evento_ja_normalizado(self):
+        db = FakeDatabase()
+        resultado = ingerir(
+            db,
+            EventoRecebido(
+                telefone="5511911112222",
+                texto="oi",
+                enviada_em=AGORA - timedelta(hours=2),
+                nome="Bruno",
+                externa_id="X1",
+            ),
+            agora=AGORA,
+        )
+        self.assertEqual(resultado.contato, "Bruno")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3,3 +3,5 @@ psycopg_pool
 requests
 google-genai
 python-dotenv
+fastapi
+uvicorn[standard]

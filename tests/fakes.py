@@ -23,6 +23,7 @@ class FakeDatabase:
         self.contatos: dict[int, Contato] = {}
         self.conversas: dict[int, Conversa] = {}
         self.mensagens: dict[int, list[tuple[int, str, str, datetime]]] = {}
+        self.externa_ids: set[str] = set()
         self.fatos: list[tuple[int, str, str | None, datetime]] = []
         self.eventos: list[dict[str, Any]] = []
         self.objecoes: list[dict[str, Any]] = []
@@ -72,9 +73,13 @@ class FakeDatabase:
     ) -> int | None:
         enviada_em = enviada_em or datetime.now(timezone.utc)
         existentes = self.mensagens.setdefault(conversa_id, [])
-        if externa_id and any(True for m in existentes if m[0] == externa_id):
+        # Espelha o índice único parcial de `mensagens.externa_id`: sem isto o
+        # fake aceitaria reentrega e um bug de deduplicação passaria batido.
+        if externa_id and externa_id in self.externa_ids:
             return None
         identificador = self._novo_id()
+        if externa_id:
+            self.externa_ids.add(externa_id)
         existentes.append((identificador, direcao, texto, enviada_em))
         conversa = self.conversas[conversa_id]
         if direcao == "in":

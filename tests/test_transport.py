@@ -108,3 +108,37 @@ class TesteConsoleNaoEnvia(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TesteRecepcaoNaoPrecisaDeCredencial(unittest.TestCase):
+    """Receber é parsing puro; só enviar precisa de chave.
+
+    A propriedade que isso compra (§10): o processo do webhook nunca carrega
+    credencial de envio, então não envia por bug nem se for comprometido.
+    """
+
+    def test_parseia_sem_nenhuma_credencial(self):
+        recebido = EvolutionTransporte().receber(evento())
+        self.assertEqual(recebido.texto, "oi")
+
+    def test_enviar_sem_credencial_recusa(self):
+        from camucrm.transport.base import TransporteError
+
+        with self.assertRaises(TransporteError) as ctx:
+            EvolutionTransporte().enviar(
+                Destinatario("5511999"), "oi", aprovado_por="Marcos"
+            )
+        self.assertIn("apenas para recepção", str(ctx.exception))
+
+    def test_falta_de_aprovacao_vem_antes_da_falta_de_credencial(self):
+        """Envio não autorizado é recusado mesmo com credencial completa."""
+        with self.assertRaises(EnvioNaoAutorizadoError):
+            EvolutionTransporte("http://x", "k", "i").enviar(
+                Destinatario("5511999"), "oi", aprovado_por=""
+            )
+
+    def test_fabrica_em_modo_recepcao_nao_exige_ambiente(self):
+        from camucrm.transport import criar_transporte
+
+        transporte = criar_transporte("evolution", para_envio=False)
+        self.assertEqual(transporte.nome, "evolution")

@@ -19,7 +19,13 @@ ENV_PROVIDER = "CAMU_LLM_PROVIDER"
 ENV_GEMINI_API_KEY = "GEMINI_API_KEY"
 ENV_GEMINI_MODEL = "CAMU_GEMINI_MODEL"
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+
+# Modelos tentados em ordem quando o principal responde 404 (retirado do ar) ou
+# 503 (sobrecarga). O Google aposenta modelo sem aviso — `gemini-2.5-flash`
+# saiu de circulação durante a construção deste projeto —, e uma extração que
+# para porque um nome mudou custa a fila do dia inteiro.
+GEMINI_FALLBACKS = ("gemini-3.5-flash", "gemini-flash-latest")
 
 
 class LlmIndisponivelError(RuntimeError):
@@ -78,6 +84,7 @@ class GeminiLlm:
         self._genai = genai
         self._client = genai.Client(api_key=api_key)
         self.modelo = modelo or os.getenv(ENV_GEMINI_MODEL, DEFAULT_GEMINI_MODEL)
+        self._candidatos = [self.modelo, *(m for m in GEMINI_FALLBACKS if m != self.modelo)]
 
     def completar(self, system: str, user: str, *, json_estrito: bool = False) -> str:
         from google.genai import types
@@ -88,17 +95,45 @@ class GeminiLlm:
             # fato inventado, que é o modo de falha mais caro (§2).
             temperature=0.0,
             response_mime_type="application/json" if json_estrito else "text/plain",
+            # Este cliente não expõe ferramenta nenhuma; deixar o AFC ligado só
+            # rende aviso do SDK a cada chamada.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
         )
-        try:
-            resposta = self._client.models.generate_content(
-                model=self.modelo, contents=user, config=config
-            )
-        except Exception as exc:  # noqa: BLE001 - o SDK levanta tipos variados
-            raise LlmIndisponivelError(f"Gemini indisponível: {exc}") from exc
-        texto = getattr(resposta, "text", None)
-        if not texto:
-            raise LlmIndisponivelError("Gemini devolveu resposta vazia")
-        return texto
+        ultimo_erro: Exception | None = None
+        for modelo in self._candidatos:
+            try:
+                resposta = self._client.models.generate_content(
+                    model=modelo, contents=user, config=config
+                )
+            except Exception as exc:  # noqa: BLE001 - o SDK levanta tipos variados
+                ultimo_erro = exc
+                if not _vale_tentar_outro_modelo(exc):
+                    break
+                logger.warning("Gemini %s indisponível (%s); tentando o próximo", modelo, exc)
+                continue
+            texto = getattr(resposta, "text", None)
+            if not texto:
+                raise LlmIndisponivelError("Gemini devolveu resposta vazia")
+            if modelo != self.modelo:
+                logger.info("Extração usou o modelo de fallback %s", modelo)
+            return texto
+        raise LlmIndisponivelError(f"Gemini indisponível: {ultimo_erro}") from ultimo_erro
+
+
+def _vale_tentar_outro_modelo(exc: Exception) -> bool:
+    """Se o erro é do modelo (aposentado, sobrecarregado) e não da conta.
+
+    Cota estourada e chave inválida valem para todos os modelos — insistir só
+    gastaria tempo e apareceria como lentidão na fila, não como erro.
+    """
+    mensagem = str(exc).lower()
+    if "quota" in mensagem or "resource_exhausted" in mensagem:
+        return False
+    if "api key" in mensagem or "permission" in mensagem or "401" in mensagem:
+        return False
+    return any(t in mensagem for t in ("404", "not_found", "503", "unavailable", "overloaded"))
 
 
 def criar_llm(provider: str | None = None) -> LlmClient:

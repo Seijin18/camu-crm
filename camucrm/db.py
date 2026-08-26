@@ -162,6 +162,16 @@ CREATE TABLE IF NOT EXISTS conversas (
     atualizado_em   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS conversas_contato_idx ON conversas (contato_id);
+-- Uma conversa aberta por contato, garantido pelo banco.
+--
+-- `get_or_create_conversa` lê e só então insere, e o webhook processa eventos
+-- em paralelo: duas mensagens do mesmo número chegando juntas viam ambas
+-- "nenhuma conversa aberta" e criavam duas. O histórico se dividia entre elas,
+-- o estágio parava no que cada metade sustentava, e nada nos dados denunciava
+-- o problema. Como o teto de follow-ups (§6), a garantia precisa ser do banco:
+-- a segunda inserção conflita e o chamador relê a que venceu.
+CREATE UNIQUE INDEX IF NOT EXISTS conversas_uma_aberta_por_contato
+    ON conversas (contato_id) WHERE resultado IS NULL;
 CREATE INDEX IF NOT EXISTS conversas_triagem_idx
     ON conversas (temperatura, estagio);
 
@@ -220,6 +230,20 @@ CREATE TABLE IF NOT EXISTS eventos_estagio (
 );
 CREATE INDEX IF NOT EXISTS eventos_estagio_conversa_idx
     ON eventos_estagio (conversa_id, em);
+-- Cada transição acontece uma vez por conversa.
+--
+-- §2 exige que reprocessar não duplique evento, e `transicao()` garante isso
+-- para chamadas em série. Não garante sob concorrência: três webhooks da
+-- mesma conversa chegando juntos leem todos `estagio = S0`, todos derivam S1
+-- e todos gravam. `eventos_estagio` é histórico permanente — `metrics` usa
+-- LEAD() sobre ele, e transições duplicadas viram intervalos de zero hora que
+-- afundam a mediana de tempo por estágio sem que nada pareça errado.
+--
+-- Custo aceito: uma conversa que reabre para o mesmo estágio duas vezes
+-- (SX -> S3, esfria, SX -> S3 de novo) registra só a primeira reabertura.
+-- Perder esse evento raro custa menos que sujar toda a métrica de tempo.
+CREATE UNIQUE INDEX IF NOT EXISTS eventos_estagio_transicao_unica
+    ON eventos_estagio (conversa_id, coalesce(de, ''), para);
 CREATE INDEX IF NOT EXISTS eventos_estagio_origem_idx
     ON eventos_estagio (origem, para);
 
@@ -383,16 +407,34 @@ class Database:
                     raise ValueError(f"contato {contato_id} não existe")
                 funil_final = funil or tipo_row[0]
                 estagio = "P0" if funil_final == B2B else "S0"
+                # `ON CONFLICT DO NOTHING` + releitura: sob corrida, quem
+                # perdeu não levanta erro, apenas relê a conversa que venceu.
                 cur.execute(
                     """
                     INSERT INTO conversas (contato_id, funil, estagio, bola_com)
-                    VALUES (%s, %s, %s, %s) RETURNING id
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
                     """,
                     (contato_id, funil_final, estagio, BOLA_CLIENTE),
                 )
-                conversa_id = cur.fetchone()[0]
-                cur.execute(f"{self._CONVERSA_SELECT} WHERE c.id = %s", (conversa_id,))
-                return Conversa(*cur.fetchone())
+                row = cur.fetchone()
+                if row is not None:
+                    cur.execute(f"{self._CONVERSA_SELECT} WHERE c.id = %s", (row[0],))
+                    return Conversa(*cur.fetchone())
+
+                cur.execute(
+                    f"{self._CONVERSA_SELECT} WHERE c.contato_id = %s "
+                    "AND c.resultado IS NULL ORDER BY c.id LIMIT 1",
+                    (contato_id,),
+                )
+                perdida = cur.fetchone()
+                if perdida is None:
+                    raise RuntimeError(
+                        f"conversa do contato {contato_id} sumiu entre o conflito "
+                        "e a releitura"
+                    )
+                return Conversa(*perdida)
 
     def get_conversa(self, conversa_id: int) -> Conversa | None:
         with self._conn() as conn:
@@ -617,6 +659,7 @@ class Database:
                     """
                     INSERT INTO eventos_estagio (conversa_id, de, para, em, origem, motivo)
                     VALUES (%s, %s, %s, COALESCE(%s, now()), %s, %s)
+                    ON CONFLICT DO NOTHING
                     """,
                     (conversa_id, de, para, em, origem, motivo),
                 )

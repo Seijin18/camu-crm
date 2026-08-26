@@ -22,6 +22,7 @@ from .backfill import extrair_historico, importar_conversas
 from .db import Database, MARCOS_MANUAIS, TetoFollowupError
 from .drafts import RascunhoInvalidoError, gerar as gerar_rascunho
 from .extraction import FATOS_BOOLEANOS
+from .ingest import ingerir
 from .extraction.extractor import Extrator
 from .llm import LlmIndisponivelError, criar_llm
 from .pipeline import carregar_sinais, recalcular, recalcular_todas
@@ -264,26 +265,28 @@ def cmd_purgar(args) -> int:
 
 
 def cmd_ingerir(args) -> int:
-    """Lê um payload de webhook do stdin e grava a mensagem."""
+    """Lê um payload de webhook do stdin e ingere.
+
+    Mesmo caminho que o webhook usa (`camucrm.ingest`) — dois caminhos de
+    entrada acabariam divergindo.
+    """
     banco = _db()
     transporte = criar_transporte(args.transporte)
     payload = json.loads(sys.stdin.read())
-    evento = transporte.receber(payload)
-    if evento is None:
-        print("Evento ignorado (não é mensagem de conversa).")
-        return 0
-    contato = banco.upsert_contato(evento.telefone, nome=evento.nome, origem=transporte.nome)
-    conversa = banco.get_or_create_conversa(contato.id)
-    inserida = banco.registrar_mensagem(
-        conversa.id, evento.direcao, evento.texto, evento.enviada_em,
-        externa_id=evento.externa_id,
-    )
-    if inserida is None:
-        print(f"Mensagem já conhecida (externa_id={evento.externa_id}); nada mudou.")
-        return 0
-    estado = recalcular(banco, banco.get_conversa(conversa.id))
-    print(f"#{conversa.id} {contato.label}: {estado.estagio}, {estado.temperatura.upper()}")
+    print(ingerir(banco, transporte.receber(payload), origem="whatsapp"))
     return 0
+
+
+def cmd_servir(args) -> int:
+    """Sobe o receptor de webhook da Evolution API."""
+    from .webhook import PORTA_PADRAO, servir
+
+    porta = args.porta or PORTA_PADRAO
+    print(f"Ouvindo em http://0.0.0.0:{porta}/webhook/evolution")
+    print("Este serviço não envia nada — só recebe (§10).")
+    servir(porta)
+    return 0
+
 
 
 # --------------------------------------------------------------------------
@@ -370,6 +373,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ingerir", help="lê um webhook do stdin")
     p.add_argument("--transporte")
     p.set_defaults(func=cmd_ingerir)
+
+    p = sub.add_parser("servir", help="recebe webhooks da Evolution API")
+    p.add_argument("--porta", type=int)
+    p.set_defaults(func=cmd_servir)
 
     return parser
 

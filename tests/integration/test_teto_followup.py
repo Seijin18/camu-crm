@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
 
@@ -81,6 +82,116 @@ class TesteTetoNoBanco(unittest.TestCase):
                         "INSERT INTO followups (conversa_id, numero) VALUES (%s, 3)",
                         (self.conversa.id,),
                     )
+
+
+@unittest.skipUnless(DSN, "defina CAMU_TEST_DSN para rodar contra Postgres real")
+class TesteUmaConversaAbertaPorContato(unittest.TestCase):
+    """A corrida que o webhook expôs: dois eventos simultâneos do mesmo número.
+
+    `get_or_create_conversa` lê e só então insere. Sob paralelismo real — que é
+    como a Evolution API entrega — as duas leituras viam "nenhuma conversa
+    aberta" e criavam duas, dividindo o histórico entre elas sem que nada nos
+    dados denunciasse o problema.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db = Database(DSN)
+        cls.db.ensure_schema()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db.close()
+
+    def setUp(self):
+        self.contato = self.db.upsert_contato(
+            f"5511{os.urandom(4).hex()}"[:15], nome="Corrida", tipo="b2c"
+        )
+
+    def test_chamadas_concorrentes_devolvem_a_mesma_conversa(self):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            ids = {
+                f.result().id
+                for f in [
+                    executor.submit(self.db.get_or_create_conversa, self.contato.id)
+                    for _ in range(8)
+                ]
+            }
+        self.assertEqual(len(ids), 1, f"criou {len(ids)} conversas: {ids}")
+
+    def test_insercao_crua_de_segunda_conversa_aberta_e_recusada(self):
+        self.db.get_or_create_conversa(self.contato.id)
+        with self.db._conn() as conn:  # noqa: SLF001
+            with self.assertRaises(psycopg.errors.UniqueViolation):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO conversas (contato_id, funil, estagio) "
+                        "VALUES (%s, 'b2c', 'S0')",
+                        (self.contato.id,),
+                    )
+
+    def test_conversa_fechada_libera_uma_nova(self):
+        """O índice é parcial: só vale para `resultado IS NULL`."""
+        primeira = self.db.get_or_create_conversa(self.contato.id)
+        self.db.atualizar_estado_conversa(primeira.id, resultado="ganho")
+        segunda = self.db.get_or_create_conversa(self.contato.id)
+        self.assertNotEqual(primeira.id, segunda.id)
+
+
+@unittest.skipUnless(DSN, "defina CAMU_TEST_DSN para rodar contra Postgres real")
+class TesteEventoDeEstagioUnico(unittest.TestCase):
+    """A segunda corrida que o webhook expôs: `S0 -> S1` gravado três vezes.
+
+    Eventos concorrentes da mesma conversa leem todos o estágio antigo e
+    gravam todos a mesma transição. `metrics.tempo_por_estagio` usa LEAD()
+    sobre esses eventos, e as duplicatas viram intervalos de zero hora.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db = Database(DSN)
+        cls.db.ensure_schema()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db.close()
+
+    def setUp(self):
+        contato = self.db.upsert_contato(
+            f"5511{os.urandom(4).hex()}"[:15], nome="Evento", tipo="b2c"
+        )
+        self.conversa = self.db.get_or_create_conversa(contato.id)
+
+    def _eventos(self):
+        with self.db._conn() as conn:  # noqa: SLF001
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT de, para FROM eventos_estagio WHERE conversa_id = %s",
+                    (self.conversa.id,),
+                )
+                return cur.fetchall()
+
+    def test_gravacoes_concorrentes_da_mesma_transicao_geram_um_evento(self):
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            for f in [
+                executor.submit(
+                    self.db.gravar_evento_estagio, self.conversa.id, "S0", "S1"
+                )
+                for _ in range(6)
+            ]:
+                f.result()
+        self.assertEqual(self._eventos(), [("S0", "S1")])
+
+    def test_transicoes_diferentes_convivem(self):
+        self.db.gravar_evento_estagio(self.conversa.id, "S0", "S1")
+        self.db.gravar_evento_estagio(self.conversa.id, "S1", "S2")
+        self.assertEqual(sorted(self._eventos()), [("S0", "S1"), ("S1", "S2")])
+
+    def test_entrada_sem_estagio_anterior_tambem_deduplica(self):
+        """`de IS NULL` precisa do coalesce no índice para conflitar."""
+        self.db.gravar_evento_estagio(self.conversa.id, None, "S0")
+        self.db.gravar_evento_estagio(self.conversa.id, None, "S0")
+        self.assertEqual(self._eventos(), [(None, "S0")])
 
 
 @unittest.skipUnless(DSN, "defina CAMU_TEST_DSN para rodar contra Postgres real")

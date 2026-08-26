@@ -35,8 +35,26 @@ _RETENTAVEIS = (requests.ConnectionError, requests.Timeout)
 class EvolutionTransporte:
     nome = "evolution"
 
-    def __init__(self, base_url: str, api_key: str, instancia: str, *, timeout: int = 10):
-        self.base_url = base_url.rstrip("/")
+    def __init__(
+        self,
+        base_url: str = "",
+        api_key: str = "",
+        instancia: str = "",
+        *,
+        timeout: int = 10,
+    ):
+        """Credenciais são opcionais — só o envio precisa delas.
+
+        A metade de recepção do contrato (`receber`) é parsing puro: não abre
+        conexão, não autentica, não sabe qual instância está pareada. Exigir
+        `api_key` para receber obrigaria o processo do webhook a carregar uma
+        credencial de envio que ele nunca usa — e um receptor sem credencial
+        **não consegue** enviar, nem por bug nem se for comprometido, que é a
+        garantia que §10 pede em vez de disciplina.
+
+        A validação mora em `enviar`, onde a credencial é de fato usada.
+        """
+        self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key
         self.instancia = instancia
         self.timeout = timeout
@@ -47,6 +65,7 @@ class EvolutionTransporte:
         self, contato: Destinatario, texto: str, *, aprovado_por: str
     ) -> ResultadoEnvio:
         quem = validar_aprovacao(self.nome, aprovado_por)
+        self._exigir_credenciais()
         url = f"{self.base_url}/message/sendText/{self.instancia}"
         try:
             resposta = requests.post(
@@ -67,6 +86,23 @@ class EvolutionTransporte:
             raise TransporteError(
                 self.nome, str(exc), retentavel=isinstance(exc, _RETENTAVEIS)
             ) from exc
+
+    def _exigir_credenciais(self) -> None:
+        faltando = [
+            nome
+            for nome, valor in (
+                ("EVOLUTION_API_BASE_URL", self.base_url),
+                ("EVOLUTION_API_KEY", self.api_key),
+                ("EVOLUTION_INSTANCE", self.instancia),
+            )
+            if not valor
+        ]
+        if faltando:
+            raise TransporteError(
+                self.nome,
+                f"envio exige {', '.join(faltando)} — este processo foi criado "
+                "apenas para recepção",
+            )
 
     # -- recebimento ------------------------------------------------------
 

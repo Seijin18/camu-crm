@@ -22,11 +22,16 @@ __all__ = [
 ]
 
 
-def criar_transporte(nome: str | None = None):
+def criar_transporte(nome: str | None = None, *, para_envio: bool = True):
     """Fábrica por nome, lendo credenciais do ambiente.
 
     O padrão é `console` (dry-run) e isso é deliberado: um deploy sem
     `CAMU_TRANSPORTE=evolution` explícito não manda mensagem nenhuma.
+
+    `para_envio=False` monta um transporte **só de recepção**: nenhuma
+    credencial é lida nem exigida, porque `receber` é parsing puro. É o modo
+    do webhook — um processo que nunca teve a chave não envia por acidente
+    nem sob ataque, o que é mais forte que prometer que não vai enviar.
     """
     import os
 
@@ -35,6 +40,9 @@ def criar_transporte(nome: str | None = None):
         return ConsoleTransporte()
     if escolhido == "evolution":
         from .evolution import EvolutionTransporte
+
+        if not para_envio:
+            return EvolutionTransporte()
 
         base_url = os.getenv("EVOLUTION_API_BASE_URL", "").strip()
         api_key = os.getenv("EVOLUTION_API_KEY", "").strip()
