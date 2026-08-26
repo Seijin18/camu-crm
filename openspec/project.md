@@ -41,10 +41,26 @@ Ordem de §13 do documento de definições, por dependência:
 | 5 | Regras de estágio e temperatura | Implementado — `rules/` |
 | 6 | Fila com o teto de 2 | Implementado — `rules/fila.py` + constraint em `db.py` |
 | 7 | Rascunhos com 2 opções | Implementado — `drafts.py` |
-| 8 | Painel | **Não feito, deliberadamente.** É o último; só faz sentido com histórico |
+| 8 | Painel | Em andamento, antecipado — changes `painel-leitura`, `painel-tempo-real`, `acoes-no-painel`, `rascunho-registrado`, `resumo-conversa`, `analise-desempenho` |
+| — | Webhook de ingestão | Implementado nos commits `5a407af` e `d54d432`, sem virar change |
 
 Os passos 1 e 4 são os únicos que exigem o Marcos e não podem ser delegados.
 São também os que determinam se o resto vale alguma coisa.
+
+**Nota sobre a antecipação do painel**: §13 lista o painel como último passo,
+e §6 supõe histórico acumulado antes dele fazer sentido. A antecipação foi
+pedido explícito do usuário, e a tensão com §6/§13 é assumida, não escondida
+— cada `proposal.md` dos changes `painel-*` cita essa nota. A mitigação: o
+painel não tem nenhuma rota de envio nem segura credencial da Evolution API
+(`camucrm.painel` nunca importa `camucrm.transport`) — `camucrm enviar`
+continua o único caminho de envio de mensagem.
+
+**Nota sobre `webhook-ingestao`**: implementado sem passar pelo fluxo
+OpenSpec (commits `5a407af` "feat: receptor de webhook da Evolution API +
+correções de concorrência" e `d54d432` "feat: extração ao receber,
+classificação B2B/B2C e correção do estágio-cache"). Registrado aqui para
+que a ausência de um change correspondente em `openspec/changes/` não seja
+lida como "não feito".
 
 ## Decisões que divergem ou estendem o documento
 
@@ -81,16 +97,43 @@ Todas justificadas no ponto de uso; listadas aqui para não se perderem.
 - **Envio exige `aprovado_por`** (`transport/base.py`). §1 diz "envio: humano,
   sempre" e §10 proíbe disparo automático. Um parâmetro obrigatório com o nome
   de quem autorizou transforma isso em propriedade de tipo, não em disciplina.
+- **Terceira superfície de LLM** (`camucrm/summaries.py`, change
+  `resumo-conversa`). §1/`CLAUDE.md` fixam "exatamente dois lugares" para o
+  LLM. `extraction/` alimenta `fatos`, que alimenta as regras — corretude
+  estrutural, um erro vira estágio errado sistematicamente. `drafts.py` e
+  `summaries.py` são terminais: a saída não retroalimenta `fatos` nem regra
+  nenhuma, um erro custa uma leitura ruim, nunca um estágio errado. A regra
+  original permanece íntegra — se `rules/` importar `llm`, a arquitetura
+  vazou, e isso é testado por `ast.parse`, não por convenção.
+- **Tabelas `rascunhos` e `resumos_conversa`** (adições ao modelo da §9,
+  changes `rascunho-registrado` e `resumo-conversa`), na mesma forma de
+  `followups` e `marcos_manuais` acima. `rascunhos` registra o que hoje
+  `drafts.gerar` produz e descarta — sem isso, não há como medir se a opção 1
+  ou a opção 2 converte melhor. `resumos_conversa` é folha do grafo: nenhuma
+  regra a lê, e apagar a tabela inteira não muda estágio, temperatura nem
+  fila de nenhuma conversa — existe só para leitura humana mais rápida.
 
 ## Próximos changes candidatos
+
+`ground-truth-marcos` e `midia-foto-pet` continuam à frente **em valor** —
+nenhuma das duas depende do painel, e ambas seguem bloqueando afirmações
+mais fortes do que o painel pretende fazer. O custo aceito de o painel ter
+sido antecipado (ver nota acima) é registrado de forma verificável, não só
+prometido: **a tela `/funciona` (change `analise-desempenho`) fica proibida
+de afirmar qualquer coisa sobre acurácia de extração até
+`ground-truth-marcos` entrar** — conversão de estágio e tempo por estágio
+podem ser exibidos, porque não dependem do eval.
 
 Nesta ordem de dependência:
 
 1. **`ground-truth-marcos`** — as 30 conversas rotuladas (§7). Bloqueia
-   qualquer afirmação sobre qualidade de extração.
-2. **`webhook-ingestao`** — hoje `camucrm ingerir` lê um payload do stdin.
-   Falta o endpoint que recebe da Evolution API continuamente.
-3. **`midia-foto-pet`** — S2 é o estágio-chave e hoje depende de o cliente
+   qualquer afirmação sobre qualidade de extração, incluindo a tela
+   `/funciona` do painel.
+2. **`midia-foto-pet`** — S2 é o estágio-chave e hoje depende de o cliente
    escrever algo junto da foto. Tratar mídia traz retenção e LGPD (§12) junto,
    e por isso é capability própria.
-4. **`painel`** — §13 passo 8. Só depois de haver histórico.
+
+O painel não é mais candidato — é change ativo, antecipado. Ver os seis
+changes `painel-leitura`, `painel-tempo-real`, `acoes-no-painel`,
+`rascunho-registrado`, `resumo-conversa` e `analise-desempenho` em
+`openspec/changes/`.
