@@ -3,7 +3,21 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+
+
+def _rodando_em_teste() -> bool:
+    """Se o processo atual é uma execução de testes.
+
+    A suíte NÃO pode ler o `.env` do desenvolvedor. Um teste cujo resultado
+    depende da configuração local passa numa máquina e falha noutra, e o modo
+    de falha pior é silencioso: `CAMU_DB_DSN` do arquivo apontaria a suíte
+    para o banco de produção. Já aconteceu aqui — dois testes de webhook
+    começaram a receber 401 porque o `.env` definia `CAMU_WEBHOOK_TOKEN`.
+    """
+    principal = getattr(sys.modules.get("__main__"), "__file__", "") or ""
+    return "unittest" in principal or "pytest" in sys.modules
 
 
 def _carregar_env() -> None:
@@ -14,6 +28,8 @@ def _carregar_env() -> None:
     nada. `python-dotenv` ausente não é erro: em produção as variáveis vêm do
     ambiente do container, não de arquivo.
     """
+    if _rodando_em_teste():
+        return
     try:
         from dotenv import load_dotenv
     except ImportError:  # pragma: no cover - depende do ambiente

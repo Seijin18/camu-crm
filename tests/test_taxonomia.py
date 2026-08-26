@@ -71,3 +71,16 @@ class TesteRotulos(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TesteIsolamentoDaSuite(unittest.TestCase):
+    """A suíte não pode depender do `.env` do desenvolvedor.
+
+    O modo de falha pior é silencioso: `CAMU_DB_DSN` vindo do arquivo
+    apontaria os testes para o banco de produção.
+    """
+
+    def test_env_do_projeto_nao_e_carregado_em_teste(self):
+        from camucrm import config
+
+        self.assertTrue(config._rodando_em_teste())
