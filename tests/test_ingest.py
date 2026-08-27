@@ -82,6 +82,41 @@ class TesteIngestao(unittest.TestCase):
         self.assertEqual(next(iter(self.db.contatos.values())).tipo, "b2c")
 
 
+class TesteContatoDeProspeccaoNasceB2B(unittest.TestCase):
+    """Change `prospeccao-b2b-shortlist`, requirement "Conversão usa tipo
+    B2B da origem curada, não inferência de conteúdo": telefone presente em
+    `prospeccoes` faz o contato novo nascer B2B, mesmo com `tipo_padrao`
+    B2C (o default de `ingerir`) — não é heurística sobre o texto da
+    mensagem, é usar a classificação que o operador já deu ao importar a
+    planilha."""
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.transporte = EvolutionTransporte("http://x", "k", "i")
+
+    def test_telefone_da_shortlist_cria_contato_b2b(self):
+        telefone = "5511999998888"
+        self.db.criar_prospeccao(nome="Petshop da Shortlist", telefone=telefone)
+
+        resultado = ingerir(
+            self.db, self.transporte.receber(payload(telefone=telefone)), agora=AGORA
+        )
+
+        self.assertFalse(resultado.ignorada)
+        contato = next(iter(self.db.contatos.values()))
+        self.assertEqual(contato.tipo, "b2b")
+
+    def test_telefone_fora_da_shortlist_continua_b2c(self):
+        """Sem prospecção nenhuma para o telefone, o default de sempre
+        (B2C) continua valendo — nenhum efeito colateral do change."""
+        resultado = ingerir(
+            self.db, self.transporte.receber(payload(telefone="5511900001111")), agora=AGORA
+        )
+        self.assertFalse(resultado.ignorada)
+        contato = next(iter(self.db.contatos.values()))
+        self.assertEqual(contato.tipo, "b2c")
+
+
 class TesteMidiaSemLegendaNaIngestao(unittest.TestCase):
     """Change `mensagem-sem-texto-preservada`: o marcador percorre o mesmo
     caminho de texto normal — grava mensagem, atualiza `bola_com`, e nunca

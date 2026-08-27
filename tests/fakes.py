@@ -23,17 +23,44 @@ from camucrm.db import (
     EventoRegistro,
     FatoRegistro,
     FollowupRegistro,
+    LinhaInvalida,
     MarcoRegistro,
     MensagemRegistro,
     ObjecaoRegistro,
+    ProspeccaoRegistro,
     RascunhoRegistro,
     RascunhoVinculadoRegistro,
     ResumoConversa,
+    ResumoImportacao,
     TetoFollowupError,
     _normalizar_texto,
+    hash_telefone,
 )
+from camucrm.prospeccao import normalizar_telefone_br
 from camucrm.rules.sinais import Mensagem
 from camucrm.taxonomia import MAX_FOLLOWUPS, is_terminal, rank_estagio
+
+
+def _float_ou_none(valor):
+    """Espelha `db._float_ou_none` (change `prospeccao-b2b-shortlist`): campo
+    numérico malformado da planilha vira `None`, não reprova a linha."""
+    texto = (str(valor) if valor is not None else "").strip()
+    if not texto:
+        return None
+    try:
+        return float(texto.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _int_ou_none(valor):
+    texto = (str(valor) if valor is not None else "").strip()
+    if not texto:
+        return None
+    try:
+        return int(float(texto))
+    except ValueError:
+        return None
 
 
 class _FakeCursor:
@@ -178,6 +205,10 @@ class FakeDatabase:
         self.resumos: dict[int, ResumoConversa] = {}
         # change `ingestao-a-prova-de-falha`: staging do payload cru.
         self.eventos_brutos: dict[int, EventoBrutoRegistro] = {}
+        # change `prospeccao-b2b-shortlist`: chave é `telefone_hash`, mesmo
+        # índice único de dedupe que `prospeccoes_telefone_hash` garante no
+        # banco real — reimportar a mesma planilha atualiza a mesma entrada.
+        self.prospeccoes: dict[str, dict[str, Any]] = {}
         self._proximo_id = 1
         # Proxy de `conversas.atualizado_em` para `token_de_mudanca` (change
         # `painel-tempo-real`): o fake não guarda timestamp de atualização
@@ -203,8 +234,14 @@ class FakeDatabase:
         e_teste: bool = False,
     ) -> Conversa:
         contato_id = self._novo_id()
+        # `hash_telefone(telefone)` (change `prospeccao-b2b-shortlist`), não
+        # um placeholder arbitrário: a detecção de conversão compara este
+        # hash contra o de `prospeccoes` (mesma função nos dois lados,
+        # também no banco real) — um placeholder que ignorasse `telefone`
+        # nunca casaria com nada, mesmo quando o número é o mesmo de
+        # verdade.
         self.contatos[contato_id] = Contato(
-            contato_id, nome, f"hash{contato_id}", telefone, funil, None,
+            contato_id, nome, hash_telefone(telefone or ""), telefone, funil, None,
             datetime.now(timezone.utc), e_teste,
         )
         conversa_id = self._novo_id()
@@ -767,8 +804,12 @@ class FakeDatabase:
             if contato.telefone == telefone:
                 return contato
         contato_id = self._novo_id()
+        # `hash_telefone(telefone)` (change `prospeccao-b2b-shortlist`): ver
+        # comentário equivalente em `criar_conversa` — precisa ser o MESMO
+        # hash que `prospeccoes.telefone_hash` usa para a detecção de
+        # conversão funcionar no fake como funciona no banco real.
         contato = Contato(
-            contato_id, nome, f"hash-{telefone}", telefone, tipo, origem,
+            contato_id, nome, hash_telefone(telefone), telefone, tipo, origem,
             datetime.now(timezone.utc),
         )
         self.contatos[contato_id] = contato
@@ -1050,3 +1091,154 @@ class FakeDatabase:
             key=lambda r: r.id,
         )
         return pendentes[:limite]
+
+    # -- prospecção B2B (change `prospeccao-b2b-shortlist`) ---------------
+
+    def _prospeccao_registro(self, dados: dict[str, Any]) -> ProspeccaoRegistro:
+        """Monta o `ProspeccaoRegistro` de leitura, resolvendo `contato_id`/
+        `conversa_id` por telefone_hash — espelha o `LEFT JOIN`/`LEFT JOIN
+        LATERAL` de `db.Database.listar_prospeccoes` (a conversa escolhida
+        prioriza a aberta, senão a mais recente encerrada, mesma ordem de
+        `marcar_contato_teste`)."""
+        contato = next(
+            (c for c in self.contatos.values() if c.telefone_hash == dados["telefone_hash"]),
+            None,
+        )
+        contato_id = contato.id if contato else None
+        conversa_id = None
+        if contato_id is not None:
+            candidatas = [c for c in self.conversas.values() if c.contato_id == contato_id]
+            if candidatas:
+                candidatas.sort(key=lambda c: (c.resultado is not None, -c.id))
+                conversa_id = candidatas[0].id
+        return ProspeccaoRegistro(
+            id=dados["id"], nome=dados["nome"], telefone=dados["telefone"],
+            bairro=dados["bairro"], zona=dados["zona"], nota=dados["nota"],
+            avaliacoes=dados["avaliacoes"], site=dados["site"],
+            tier_origem=dados["tier_origem"], status_origem=dados["status_origem"],
+            aberto_em=dados["aberto_em"], aberto_por=dados["aberto_por"],
+            criado_em=dados["criado_em"], contato_id=contato_id, conversa_id=conversa_id,
+        )
+
+    def criar_prospeccao(
+        self,
+        *,
+        nome: str = "Petshop Teste",
+        telefone: str = "5512999998888",
+        bairro: str | None = None,
+        zona: str | None = None,
+        nota: float | None = None,
+        avaliacoes: int | None = None,
+        site: str | None = None,
+        tier_origem: str | None = None,
+        status_origem: str | None = None,
+    ) -> ProspeccaoRegistro:
+        """Helper de teste — espelha `criar_conversa`, mas para
+        `prospeccoes`. `telefone` já deve vir normalizado (dígitos + código
+        do país) quando o teste precisa bater com um `contato` real; use
+        `camucrm.prospeccao.normalizar_telefone_br` se estiver simulando o
+        formato bruto da planilha."""
+        telefone_hash = hash_telefone(telefone)
+        prospeccao_id = self._novo_id()
+        agora = datetime.now(timezone.utc)
+        self.prospeccoes[telefone_hash] = {
+            "id": prospeccao_id, "nome": nome, "telefone": telefone,
+            "telefone_hash": telefone_hash, "bairro": bairro, "zona": zona,
+            "nota": nota, "avaliacoes": avaliacoes, "site": site,
+            "tier_origem": tier_origem, "status_origem": status_origem,
+            "aberto_em": None, "aberto_por": None, "criado_em": agora,
+        }
+        return self._prospeccao_registro(self.prospeccoes[telefone_hash])
+
+    def importar_prospeccoes(self, linhas) -> ResumoImportacao:
+        """Espelha `db.Database.importar_prospeccoes`: upsert por
+        `telefone_hash`, telefone ilegível ou nome vazio vira `invalidas`
+        (nunca descartado em silêncio), nunca lança."""
+        novos = 0
+        atualizados = 0
+        invalidas: list[LinhaInvalida] = []
+        for indice, linha in enumerate(linhas, start=1):
+            nome = (linha.get("petshop") or "").strip()
+            telefone_bruto = linha.get("telefone") or ""
+            telefone = normalizar_telefone_br(telefone_bruto)
+            if telefone is None:
+                invalidas.append(
+                    LinhaInvalida(
+                        linha=indice, petshop=nome or None,
+                        motivo=f"telefone ilegível: {telefone_bruto!r}",
+                    )
+                )
+                continue
+            if not nome:
+                invalidas.append(
+                    LinhaInvalida(linha=indice, petshop=None, motivo="nome do petshop vazio")
+                )
+                continue
+            telefone_hash = hash_telefone(telefone)
+            existente = self.prospeccoes.get(telefone_hash)
+            agora = datetime.now(timezone.utc)
+            self.prospeccoes[telefone_hash] = {
+                "id": existente["id"] if existente else self._novo_id(),
+                "nome": nome, "telefone": telefone, "telefone_hash": telefone_hash,
+                "bairro": linha.get("bairro") or None, "zona": linha.get("zona") or None,
+                "nota": _float_ou_none(linha.get("nota")),
+                "avaliacoes": _int_ou_none(linha.get("avaliacoes")),
+                "site": linha.get("site") or None,
+                "tier_origem": linha.get("tier_origem") or None,
+                "status_origem": linha.get("status_origem") or None,
+                "aberto_em": existente["aberto_em"] if existente else None,
+                "aberto_por": existente["aberto_por"] if existente else None,
+                "criado_em": existente["criado_em"] if existente else agora,
+            }
+            if existente:
+                atualizados += 1
+            else:
+                novos += 1
+        return ResumoImportacao(novos=novos, atualizados=atualizados, invalidas=invalidas)
+
+    def listar_prospeccoes(
+        self,
+        *,
+        zona: str | None = None,
+        bairro: str | None = None,
+        nota_minima: float | None = None,
+        tier: str | None = None,
+        apenas_nao_convertidas: bool = False,
+        limite: int = 500,
+    ) -> list[ProspeccaoRegistro]:
+        resultado = []
+        for dados in self.prospeccoes.values():
+            if zona and dados["zona"] != zona:
+                continue
+            if bairro and dados["bairro"] != bairro:
+                continue
+            if nota_minima is not None and (dados["nota"] is None or dados["nota"] < nota_minima):
+                continue
+            if tier and dados["tier_origem"] != tier:
+                continue
+            registro = self._prospeccao_registro(dados)
+            if apenas_nao_convertidas and registro.contato_id is not None:
+                continue
+            resultado.append(registro)
+        resultado.sort(key=lambda p: p.nome)
+        return resultado[:limite]
+
+    def marcar_prospeccao_aberta(self, prospeccao_id: int, *, por: str | None = None) -> None:
+        for dados in self.prospeccoes.values():
+            if dados["id"] == prospeccao_id:
+                dados["aberto_em"] = datetime.now(timezone.utc)
+                dados["aberto_por"] = por
+                return
+
+    def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
+        dados = self.prospeccoes.get(telefone_hash)
+        if dados is None:
+            return None
+        return ProspeccaoRegistro(
+            id=dados["id"], nome=dados["nome"], telefone=dados["telefone"],
+            bairro=dados["bairro"], zona=dados["zona"], nota=dados["nota"],
+            avaliacoes=dados["avaliacoes"], site=dados["site"],
+            tier_origem=dados["tier_origem"], status_origem=dados["status_origem"],
+            aberto_em=dados["aberto_em"], aberto_por=dados["aberto_por"],
+            criado_em=dados["criado_em"],
+        )

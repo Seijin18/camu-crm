@@ -1452,6 +1452,202 @@ async function renderizarFormularioEval(container, { conversaId, entradaId } = {
   container.appendChild(form);
 }
 
+/*
+ * Change `prospeccao-b2b-shortlist`: shortlist B2B levantada externamente
+ * (planilha de petshops), SEPARADA de contatos/conversas/kanban/fila/
+ * métricas — só duas abas próprias, "Importar prospecção" e "Prospecção".
+ *
+ * Regras que este bloco não pode quebrar:
+ *   - o botão de disparo é um `<a target="_blank">` para
+ *     `api.whatsapp.com/send` — nunca uma chamada de servidor deste painel;
+ *     o clique só REGISTRA que o operador abriu o link
+ *     (`POST /prospeccao/{id}/abrir`), nunca confirma envio.
+ *   - linha já convertida (mesmo telefone virou contato/conversa real via
+ *     webhook) mostra link para `#/conversas/{id}`, nunca o botão de
+ *     disparo — a API já resolve isso (`mensagem`/`link_whatsapp` vêm
+ *     `null` quando `convertida: true`).
+ */
+
+async function renderizarImportarProspeccao(container) {
+  container.appendChild(el("h2", { texto: "Importar prospecção (B2B)" }));
+  container.appendChild(
+    el("p", {
+      class: "aviso",
+      texto:
+        "CSV com colunas: petshop, bairro, zona, telefone, nota, avaliacoes, " +
+        "site, tier_origem, status_origem. Reimportar a mesma planilha " +
+        "atualiza por telefone — nunca duplica.",
+    })
+  );
+
+  const campoArquivo = el("input", { type: "file", accept: ".csv,text/csv" });
+  const botaoImportar = el("button", { texto: "Importar" });
+  const areaResultado = el("div", { class: "prospeccao-resultado" });
+
+  botaoImportar.addEventListener("click", async () => {
+    if (!campoArquivo.files || campoArquivo.files.length === 0) {
+      areaResultado.textContent = "Selecione um arquivo CSV primeiro.";
+      return;
+    }
+    botaoImportar.disabled = true;
+    areaResultado.textContent = "Importando…";
+    try {
+      const form = new FormData();
+      form.append("arquivo", campoArquivo.files[0]);
+      const resposta = await fetch("/api/prospeccao/importar", {
+        method: "POST",
+        headers: { "X-Camu-Token": obterToken() },
+        body: form,
+      });
+      const dados = await resposta.json();
+      if (!resposta.ok) {
+        throw new Error(dados.erro || `erro HTTP ${resposta.status}`);
+      }
+      areaResultado.textContent = "";
+      areaResultado.appendChild(
+        el("p", {
+          texto: `${dados.novos} novo(s) — ${dados.atualizados} atualizado(s) — ${dados.invalidas.length} inválida(s)`,
+        })
+      );
+      dados.invalidas.forEach((inv) => {
+        areaResultado.appendChild(
+          el("p", {
+            class: "aviso",
+            texto: `linha ${inv.linha}${inv.petshop ? ` (${inv.petshop})` : ""}: ${inv.motivo}`,
+          })
+        );
+      });
+    } catch (erro) {
+      areaResultado.textContent = `Erro: ${erro.message}`;
+    } finally {
+      botaoImportar.disabled = false;
+    }
+  });
+
+  container.appendChild(campoArquivo);
+  container.appendChild(botaoImportar);
+  container.appendChild(areaResultado);
+}
+
+function linhaProspeccao(p) {
+  const linha = el("div", { class: "prospeccao-item" });
+  linha.appendChild(
+    el("span", {
+      class: "nome",
+      texto: `${p.nome} — ${p.bairro || "?"} / ${p.zona || "?"}`,
+    })
+  );
+  linha.appendChild(
+    el("span", {
+      class: "aviso",
+      texto: `nota ${p.nota ?? "?"} (${p.avaliacoes ?? "?"} avaliações) — tier ${p.tier_origem || "?"}`,
+    })
+  );
+
+  if (p.convertida) {
+    const link = el("a", { texto: "já é conversa — abrir" });
+    link.href = `#/conversas/${p.conversa_id}`;
+    linha.appendChild(link);
+    return linha;
+  }
+
+  if (!p.mensagem || !p.link_whatsapp) {
+    linha.appendChild(
+      el("span", {
+        class: "aviso",
+        texto: "sem template de mensagem configurado (CAMU_MENSAGEM_PROSPECCAO)",
+      })
+    );
+    return linha;
+  }
+
+  const botaoCopiar = el("button", { class: "secundario", texto: "Copiar mensagem" });
+  botaoCopiar.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(p.mensagem);
+      botaoCopiar.textContent = "Copiado!";
+    } catch (e) {
+      botaoCopiar.textContent = "Copie manualmente (clipboard indisponível)";
+    }
+    setTimeout(() => { botaoCopiar.textContent = "Copiar mensagem"; }, 2000);
+  });
+
+  // O clique abre o link do WhatsApp (`target="_blank"`) — nada aqui chama
+  // o servidor para "enviar"; a chamada abaixo só REGISTRA a abertura
+  // (design.md: intenção registrada, não confirmação de envio).
+  const linkWhatsapp = el("a", {
+    class: "prospeccao-link-whatsapp",
+    texto: "Abrir WhatsApp",
+    target: "_blank",
+    rel: "noopener noreferrer",
+  });
+  linkWhatsapp.href = p.link_whatsapp;
+  linkWhatsapp.addEventListener("click", () => {
+    chamarApiEscrever(`/prospeccao/${p.id}/abrir`, { por: obterOperador() }).catch(() => {
+      /* falha ao registrar a abertura não deve impedir o link de abrir. */
+    });
+  });
+
+  linha.appendChild(botaoCopiar);
+  linha.appendChild(linkWhatsapp);
+  return linha;
+}
+
+async function renderizarProspeccao(container) {
+  container.appendChild(el("h2", { texto: "Prospecção B2B" }));
+  container.appendChild(
+    el("p", {
+      class: "aviso",
+      texto:
+        "Shortlist levantada externamente — nunca aparece em kanban, fila, " +
+        "conversas ou métricas enquanto não virar conversa real.",
+    })
+  );
+
+  const filtros = el("div", { class: "filtros" });
+  const campoZona = el("input", { type: "text", placeholder: "zona" });
+  const campoBairro = el("input", { type: "text", placeholder: "bairro" });
+  const campoNota = el("input", { type: "number", step: "0.1", placeholder: "nota mínima" });
+  const campoTier = el("input", { type: "text", placeholder: "tier" });
+  const labelNaoConvertidas = el("label", { class: "modo-teste" });
+  const checkNaoConvertidas = el("input", { type: "checkbox" });
+  labelNaoConvertidas.appendChild(checkNaoConvertidas);
+  labelNaoConvertidas.appendChild(document.createTextNode(" só não convertidas"));
+
+  const lista = el("div", { id: "lista-prospeccao" });
+
+  const carregar = async () => {
+    lista.textContent = "";
+    const params = new URLSearchParams();
+    if (campoZona.value.trim()) params.set("zona", campoZona.value.trim());
+    if (campoBairro.value.trim()) params.set("bairro", campoBairro.value.trim());
+    if (campoNota.value) params.set("nota_minima", campoNota.value);
+    if (campoTier.value.trim()) params.set("tier", campoTier.value.trim());
+    if (checkNaoConvertidas.checked) params.set("nao_convertidas", "1");
+    const dados = await chamarApi(`/prospeccao?${params.toString()}`);
+    lista.appendChild(el("p", { class: "aviso", texto: `${dados.prospeccoes.length} petshop(s)` }));
+    if (dados.prospeccoes.length === 0) {
+      lista.appendChild(el("p", { class: "aviso", texto: "nenhuma linha para os filtros atuais" }));
+    }
+    dados.prospeccoes.forEach((p) => lista.appendChild(linhaProspeccao(p)));
+  };
+
+  [campoZona, campoBairro, campoNota, campoTier].forEach((campo) => {
+    campo.addEventListener("change", carregar);
+  });
+  checkNaoConvertidas.addEventListener("change", carregar);
+
+  filtros.appendChild(campoZona);
+  filtros.appendChild(campoBairro);
+  filtros.appendChild(campoNota);
+  filtros.appendChild(campoTier);
+  filtros.appendChild(labelNaoConvertidas);
+
+  container.appendChild(filtros);
+  container.appendChild(lista);
+  await carregar();
+}
+
 // -- Roteador ----------------------------------------------------------------
 
 // Cada render limpa o container e só faz `appendChild` depois de um `await`
@@ -1517,6 +1713,12 @@ async function renderizarRota() {
       await renderizarFormularioEval(conteudo, { conversaId: partes[2] });
     } else if (partes[0] === "groundtruth" && partes[1] === "editar" && partes[2]) {
       await renderizarFormularioEval(conteudo, { entradaId: partes[2] });
+    } else if (partes[0] === "prospeccao" && partes[1] === "importar") {
+      marcarAbaAtiva("/prospeccao/importar");
+      await renderizarImportarProspeccao(conteudo);
+    } else if (partes[0] === "prospeccao") {
+      marcarAbaAtiva("/prospeccao");
+      await renderizarProspeccao(conteudo);
     } else {
       conteudo.appendChild(el("p", { class: "aviso", texto: "rota desconhecida" }));
     }

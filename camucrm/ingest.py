@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from . import acoes
-from .db import Database
+from .db import Database, hash_telefone
 from .pipeline import EstadoConversa, recalcular
 from .rules.sinais import SAIDA
 from .taxonomia import B2B, B2C
@@ -100,6 +100,15 @@ def ingerir(
         return ResultadoIngestao(None, None, ignorada=True)
 
     tipo = tipo_padrao if tipo_padrao in (B2B, B2C) else B2C
+    # Change `prospeccao-b2b-shortlist`: telefone presente na shortlist B2B
+    # faz o contato novo nascer `tipo=b2b`, mesmo que o `tipo_padrao` do
+    # chamador seja B2C. Não é inferência de conteúdo de conversa (§1
+    # continua intacto) — é usar uma classificação já curada explicitamente
+    # pelo operador ao importar a planilha (design.md do change). Só afeta
+    # contato NOVO: `db.upsert_contato` nunca atualiza `tipo` de um contato
+    # já existente via `ON CONFLICT`.
+    if db.prospeccao_por_telefone_hash(hash_telefone(evento.telefone)) is not None:
+        tipo = B2B
     externa_id = _externa_id_efetivo(evento)
 
     # Change `ingestao-a-prova-de-falha`, spec.md "Cadeia de ingestão é

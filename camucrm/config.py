@@ -45,6 +45,9 @@ ENV_DSN = "CAMU_DB_DSN"
 ENV_PLAYBOOK = "CAMU_PLAYBOOK"
 ENV_OPERADOR = "CAMU_OPERADOR"
 ENV_EVAL_DATASET = "CAMU_EVAL_DATASET"
+# Change `prospeccao-b2b-shortlist`: template da mensagem de prospecção B2B,
+# path configurável — mesmo padrão de `ENV_PLAYBOOK`.
+ENV_MENSAGEM_PROSPECCAO = "CAMU_MENSAGEM_PROSPECCAO"
 
 DSN_PADRAO = "postgresql://camu:camu@localhost:5433/camucrm"
 
@@ -52,6 +55,13 @@ DSN_PADRAO = "postgresql://camu:camu@localhost:5433/camucrm"
 # O caminho é configurável porque o playbook vive no repositório de operação,
 # não neste.
 PLAYBOOK_PADRAO = "docs/playbook-tom.md"
+
+# Change `prospeccao-b2b-shortlist`: DIFERENTE de `PLAYBOOK_PADRAO` (que é
+# referência para o LLM, nunca enviado verbatim), este arquivo é enviado
+# literal ao petshop via link de WhatsApp — por isso não tem cabeçalho/prosa
+# de documentação como `playbook-tom.md`, só o texto da mensagem com o
+# placeholder `{nome}` (`camucrm/prospeccao.py::montar_mensagem`).
+MENSAGEM_PROSPECCAO_PADRAO = "docs/mensagem-prospeccao.md"
 
 # §7: as 30 conversas de ground truth. Change `ground-truth-no-painel` —
 # permite a suíte de testes apontar para um arquivo temporário sem tocar o
@@ -77,6 +87,21 @@ def playbook() -> str | None:
     caminho = Path(os.getenv(ENV_PLAYBOOK, PLAYBOOK_PADRAO))
     if caminho.exists():
         return caminho.read_text(encoding="utf-8")
+    return None
+
+
+def mensagem_prospeccao() -> str | None:
+    """Template de mensagem de prospecção B2B (change
+    `prospeccao-b2b-shortlist`), se existir. Mesmo padrão de leitura de
+    `playbook()` (arquivo + env var), mas o conteúdo aqui é enviado literal
+    ao petshop — só `{nome}` é substituído
+    (`camucrm/prospeccao.py::montar_mensagem`), nunca injetado num prompt de
+    LLM. `None` quando o arquivo não existe: a tela de prospecção mostra que
+    não há template configurado, em vez de quebrar.
+    """
+    caminho = Path(os.getenv(ENV_MENSAGEM_PROSPECCAO, MENSAGEM_PROSPECCAO_PADRAO))
+    if caminho.exists():
+        return caminho.read_text(encoding="utf-8").strip()
     return None
 
 

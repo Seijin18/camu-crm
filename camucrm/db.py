@@ -30,6 +30,7 @@ import psycopg
 from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool
 
+from .prospeccao import normalizar_telefone_br
 from .rules.estagio import ORIGEM_LIVE
 from .rules.sinais import ENTRADA, SAIDA, Mensagem
 from .taxonomia import B2B, B2C, BOLA_CLIENTE, MAX_FOLLOWUPS
@@ -111,6 +112,31 @@ def _condicao_teste(coluna: str, *, incluir_teste: bool, apenas_teste: bool) -> 
     if incluir_teste:
         return ""
     return f"AND {coluna} = FALSE"
+
+
+def _float_ou_none(valor: Any) -> float | None:
+    """Change `prospeccao-b2b-shortlist`: campo numérico da planilha
+    (`nota`) tolerante a célula vazia/malformada — só o telefone ilegível
+    reprova a linha inteira (requirement "Importação nunca descarta linha em
+    silêncio"); um `nota`/`avaliacoes` estranho vira `NULL`, não erro.
+    """
+    texto = (str(valor) if valor is not None else "").strip()
+    if not texto:
+        return None
+    try:
+        return float(texto.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _int_ou_none(valor: Any) -> int | None:
+    texto = (str(valor) if valor is not None else "").strip()
+    if not texto:
+        return None
+    try:
+        return int(float(texto))
+    except ValueError:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -360,6 +386,58 @@ class EventoBrutoRegistro:
     processado_em: datetime | None
     erro: str | None
     tentativas: int
+
+
+@dataclass
+class LinhaInvalida:
+    """Uma linha da planilha de prospecção que não virou linha de
+    `prospeccoes` (change `prospeccao-b2b-shortlist`, requirement
+    "Importação nunca descarta linha em silêncio"). `linha` é a posição
+    (1-based, sem contar o cabeçalho) dentro do arquivo importado — o que
+    permite ao operador achar a linha na planilha original."""
+
+    linha: int
+    petshop: str | None
+    motivo: str
+
+
+@dataclass
+class ResumoImportacao:
+    """Resultado de `Database.importar_prospeccoes` — nunca descarta linha
+    em silêncio: toda linha da planilha vira `novos`/`atualizados` OU uma
+    entrada em `invalidas`, nunca some sem indicação."""
+
+    novos: int
+    atualizados: int
+    invalidas: list[LinhaInvalida]
+
+
+@dataclass
+class ProspeccaoRegistro:
+    """Uma linha de `prospeccoes` (change `prospeccao-b2b-shortlist`),
+    já com a detecção de conversão resolvida pelo `LEFT JOIN` de
+    `Database.listar_prospeccoes` (design.md: "sem estado próprio").
+    `contato_id`/`conversa_id` são `None` quando a linha ainda não virou
+    conversa real, OU quando o registro veio de
+    `Database.prospeccao_por_telefone_hash` (que não faz o join — quem
+    chama, `ingest.ingerir`, só precisa saber se a linha existe, não do
+    estado de conversão)."""
+
+    id: int
+    nome: str
+    telefone: str
+    bairro: str | None
+    zona: str | None
+    nota: float | None
+    avaliacoes: int | None
+    site: str | None
+    tier_origem: str | None
+    status_origem: str | None
+    aberto_em: datetime | None
+    aberto_por: str | None
+    criado_em: datetime
+    contato_id: int | None = None
+    conversa_id: int | None = None
 
 
 class TetoFollowupError(RuntimeError):
@@ -682,6 +760,37 @@ CREATE TABLE IF NOT EXISTS eventos_recebidos_bruto (
 -- Índice parcial: só as linhas que `listar_eventos_brutos_pendentes` lê.
 CREATE INDEX IF NOT EXISTS eventos_recebidos_bruto_pendentes_idx
     ON eventos_recebidos_bruto (id) WHERE NOT processado;
+
+-- ADIÇÃO (change `prospeccao-b2b-shortlist`, design.md): shortlist B2B
+-- levantada externamente (petshops, base legal = legítimo interesse B2B,
+-- §12 do documento — ver `openspec/project.md`), inteiramente separada de
+-- `contatos`/`conversas`. `telefone_hash` reaproveita `hash_telefone` (mesmo
+-- salt/normalização de `contatos`) para dedupe na reimportação E para a
+-- detecção de conversão via `LEFT JOIN` em `Database.listar_prospeccoes` —
+-- sem coluna própria, sem job de sincronização (design.md: "sempre correto
+-- no momento da leitura"). Tabela inteiramente NOVA: `CREATE TABLE IF NOT
+-- EXISTS` já é suficiente para um banco de desenvolvimento existente ganhar
+-- a tabela sem precisar recriar o volume — não há coluna sendo retrofitada
+-- numa tabela antiga (diferente de `contatos.e_teste`, que precisou de
+-- `ALTER TABLE`).
+CREATE TABLE IF NOT EXISTS prospeccoes (
+    id              SERIAL PRIMARY KEY,
+    nome            VARCHAR(200) NOT NULL,
+    telefone        VARCHAR(32) NOT NULL,
+    telefone_hash   VARCHAR(64) NOT NULL UNIQUE,
+    bairro          VARCHAR(120),
+    zona            VARCHAR(60),
+    nota            NUMERIC(2,1),
+    avaliacoes      INTEGER,
+    site            VARCHAR(300),
+    tier_origem     VARCHAR(8),
+    status_origem   VARCHAR(60),
+    aberto_em       TIMESTAMP WITH TIME ZONE,
+    aberto_por      VARCHAR(48),
+    criado_em       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    atualizado_em   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS prospeccoes_zona_idx ON prospeccoes (zona, bairro);
 """
 
 # §12, extensão da purga (change `rascunho-registrado`): texto escrito para
@@ -2585,6 +2694,195 @@ class Database:
                     (dias,),
                 )
                 return cur.rowcount
+
+    # -- prospecção B2B (change `prospeccao-b2b-shortlist`) ----------------
+    #
+    # Tabela inteiramente separada de `contatos`/`conversas` (design.md,
+    # requirement "Shortlist separada de contatos/conversas"): nenhum método
+    # abaixo é chamado por `listar_conversas_abertas`/`metrics.py`/qualquer
+    # leitura de kanban, fila, conversas ou métricas — o único ponto de
+    # contato com o resto do sistema é a leitura de `prospeccao_por_
+    # telefone_hash` que `ingest.ingerir` faz para decidir o `tipo` do
+    # contato novo.
+
+    _PROSPECCAO_SELECT = """
+        SELECT p.id, p.nome, p.telefone, p.bairro, p.zona, p.nota,
+               p.avaliacoes, p.site, p.tier_origem, p.status_origem,
+               p.aberto_em, p.aberto_por, p.criado_em
+          FROM prospeccoes p
+    """
+
+    def importar_prospeccoes(self, linhas: Iterable[dict[str, Any]]) -> ResumoImportacao:
+        """Upsert por `telefone_hash` — reimportar a mesma planilha ATUALIZA,
+        nunca duplica (requirement "Reimportar a mesma planilha atualiza,
+        não duplica"). `linhas` é o que `csv.DictReader` produz (chaves =
+        cabeçalho do CSV do usuário: `petshop, bairro, zona, telefone, nota,
+        avaliacoes, site, tier_origem, status_origem`); o parsing do arquivo
+        em si é responsabilidade de quem chama (`camucrm/painel/api.py`),
+        não deste método.
+
+        Telefone ilegível (`normalizar_telefone_br` devolve `None`) ou nome
+        vazio reprova só AQUELA linha, sempre reportada em `invalidas` com o
+        motivo — nunca descartada em silêncio (requirement "Importação
+        nunca descarta linha em silêncio"). Campo numérico malformado
+        (`nota`/`avaliacoes`) não reprova a linha, vira `NULL`
+        (`_float_ou_none`/`_int_ou_none`).
+
+        `(xmax = 0) AS inserida`: truque padrão de Postgres para saber, no
+        mesmo `INSERT ... ON CONFLICT DO UPDATE`, se a linha era nova ou já
+        existia — evita uma segunda consulta só para contar novos/
+        atualizados.
+        """
+        novos = 0
+        atualizados = 0
+        invalidas: list[LinhaInvalida] = []
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                for indice, linha in enumerate(linhas, start=1):
+                    nome = (linha.get("petshop") or "").strip()
+                    telefone_bruto = linha.get("telefone") or ""
+                    telefone = normalizar_telefone_br(telefone_bruto)
+                    if telefone is None:
+                        invalidas.append(
+                            LinhaInvalida(
+                                linha=indice,
+                                petshop=nome or None,
+                                motivo=f"telefone ilegível: {telefone_bruto!r}",
+                            )
+                        )
+                        continue
+                    if not nome:
+                        invalidas.append(
+                            LinhaInvalida(
+                                linha=indice, petshop=None,
+                                motivo="nome do petshop vazio",
+                            )
+                        )
+                        continue
+                    telefone_hash = hash_telefone(telefone)
+                    cur.execute(
+                        """
+                        INSERT INTO prospeccoes (
+                            nome, telefone, telefone_hash, bairro, zona, nota,
+                            avaliacoes, site, tier_origem, status_origem
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (telefone_hash) DO UPDATE SET
+                            nome = EXCLUDED.nome,
+                            bairro = EXCLUDED.bairro,
+                            zona = EXCLUDED.zona,
+                            nota = EXCLUDED.nota,
+                            avaliacoes = EXCLUDED.avaliacoes,
+                            site = EXCLUDED.site,
+                            tier_origem = EXCLUDED.tier_origem,
+                            status_origem = EXCLUDED.status_origem,
+                            atualizado_em = now()
+                        RETURNING (xmax = 0) AS inserida
+                        """,
+                        (
+                            nome, telefone, telefone_hash,
+                            linha.get("bairro") or None, linha.get("zona") or None,
+                            _float_ou_none(linha.get("nota")),
+                            _int_ou_none(linha.get("avaliacoes")),
+                            linha.get("site") or None,
+                            linha.get("tier_origem") or None,
+                            linha.get("status_origem") or None,
+                        ),
+                    )
+                    if cur.fetchone()[0]:
+                        novos += 1
+                    else:
+                        atualizados += 1
+        return ResumoImportacao(novos=novos, atualizados=atualizados, invalidas=invalidas)
+
+    def listar_prospeccoes(
+        self,
+        *,
+        zona: str | None = None,
+        bairro: str | None = None,
+        nota_minima: float | None = None,
+        tier: str | None = None,
+        apenas_nao_convertidas: bool = False,
+        limite: int = 500,
+    ) -> list[ProspeccaoRegistro]:
+        """Lista com filtros + detecção de conversão (design.md: "sem estado
+        próprio") via `LEFT JOIN` por `telefone_hash` contra `contatos`.
+        `contato_id`/`conversa_id` não nulos = a linha já é conversa real —
+        quem chama (`camucrm/painel/views.py`) decide se mostra o link de
+        WhatsApp ou o link para `#/conversas/{conversa_id}`.
+
+        A conversa escolhida por contato (`LEFT JOIN LATERAL`) prioriza a
+        aberta, senão a mais recente encerrada — mesma ordem de
+        `Database.marcar_contato_teste` (`ORDER BY (resultado IS NULL) DESC,
+        id DESC`), para o link sempre apontar para algo navegável.
+        """
+        condicoes = []
+        params: list[Any] = []
+        if zona:
+            condicoes.append("p.zona = %s")
+            params.append(zona)
+        if bairro:
+            condicoes.append("p.bairro = %s")
+            params.append(bairro)
+        if nota_minima is not None:
+            condicoes.append("p.nota >= %s")
+            params.append(nota_minima)
+        if tier:
+            condicoes.append("p.tier_origem = %s")
+            params.append(tier)
+        if apenas_nao_convertidas:
+            condicoes.append("c.id IS NULL")
+        where = f"WHERE {' AND '.join(condicoes)}" if condicoes else ""
+        params.append(limite)
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT p.id, p.nome, p.telefone, p.bairro, p.zona, p.nota,
+                           p.avaliacoes, p.site, p.tier_origem, p.status_origem,
+                           p.aberto_em, p.aberto_por, p.criado_em,
+                           c.id AS contato_id, cv.id AS conversa_id
+                      FROM prospeccoes p
+                      LEFT JOIN contatos c ON c.telefone_hash = p.telefone_hash
+                      LEFT JOIN LATERAL (
+                          SELECT id FROM conversas
+                           WHERE contato_id = c.id
+                           ORDER BY (resultado IS NULL) DESC, id DESC
+                           LIMIT 1
+                      ) cv ON c.id IS NOT NULL
+                     {where}
+                     ORDER BY p.nome
+                     LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                return [ProspeccaoRegistro(*row) for row in cur.fetchall()]
+
+    def marcar_prospeccao_aberta(self, prospeccao_id: int, *, por: str | None = None) -> None:
+        """Registra que o operador clicou "abrir WhatsApp" — intenção
+        registrada, nunca confirmação de envio (design.md: o sistema não tem
+        como saber se a mensagem foi de fato enviada dentro do WhatsApp)."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE prospeccoes SET aberto_em = now(), aberto_por = %s "
+                    "WHERE id = %s",
+                    (por, prospeccao_id),
+                )
+
+    def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
+        """Usado por `ingest.ingerir` para decidir se um contato novo nasce
+        `tipo=b2b` (requirement "Conversão usa tipo B2B da origem curada").
+        Sem o `LEFT JOIN` de `listar_prospeccoes` — quem chama só precisa
+        saber se a linha existe, não do estado de conversão.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"{self._PROSPECCAO_SELECT} WHERE p.telefone_hash = %s",
+                    (telefone_hash,),
+                )
+                row = cur.fetchone()
+                return ProspeccaoRegistro(*row) if row else None
 
 
 def _texto(valor: Any) -> str | None:

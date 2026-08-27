@@ -24,10 +24,12 @@ from ..db import (
     MarcoRegistro,
     MensagemRegistro,
     ObjecaoRegistro,
+    ProspeccaoRegistro,
     RascunhoRegistro,
     ResumoConversa,
+    ResumoImportacao,
 )
-from .. import metrics
+from .. import metrics, prospeccao
 from ..evaluation.dataset import TAMANHO_MINIMO, ConversaRotulada
 from ..evaluation.runner import META_FALSOS_POSITIVOS, META_FATOS, META_OBJECAO, RelatorioEval
 from ..pipeline import EstadoConversa
@@ -740,4 +742,72 @@ def metricas_para_json(metricas_chave, tempo_por_estagio, saude_taxonomia) -> di
             "veredito": saude_taxonomia.veredito,
             "distribuicao": saude_taxonomia.distribuicao,
         },
+    }
+
+
+# --------------------------------------------------------------------------
+# Prospecção B2B (change `prospeccao-b2b-shortlist`) — sempre separada de
+# `card_conversa`/`detalhe_conversa` acima: nenhuma destas funções é chamada
+# por `montar_kanban`/`item_fila_para_json`/`o_que_funciona_para_json`, e
+# vice-versa (requirement "Shortlist separada de contatos/conversas").
+# --------------------------------------------------------------------------
+
+
+def resumo_importacao_para_json(resumo: ResumoImportacao) -> dict[str, Any]:
+    """Payload de `POST /api/prospeccao/importar` — toda linha inválida vem
+    com o motivo (requirement "Importação nunca descarta linha em
+    silêncio"), nunca só uma contagem."""
+    return {
+        "novos": resumo.novos,
+        "atualizados": resumo.atualizados,
+        "invalidas": [
+            {"linha": li.linha, "petshop": li.petshop, "motivo": li.motivo}
+            for li in resumo.invalidas
+        ],
+    }
+
+
+def prospeccao_para_json(
+    registro: ProspeccaoRegistro, template: str | None
+) -> dict[str, Any]:
+    """Payload de uma linha de `GET /api/prospeccao`.
+
+    `convertida=True` (linha já tem `contato_id`) nunca carrega
+    `mensagem`/`link_whatsapp` — a tela mostra o link para
+    `#/conversas/{conversa_id}` em vez do botão de disparo (design.md:
+    detecção de conversão sem estado próprio). Sem `template` (arquivo de
+    `config.mensagem_prospeccao()` ausente), os dois também vêm `None`: a
+    tela avisa que falta configurar `CAMU_MENSAGEM_PROSPECCAO`, em vez de
+    montar uma mensagem vazia.
+
+    Telefone em claro não sai por aqui — só embutido no `link_whatsapp`
+    (necessário para o `<a href>` funcionar), nunca como campo próprio;
+    mesma cautela de `_contato_para_json` (§12), ainda que a base legal
+    aqui seja diferente (legítimo interesse B2B, `design.md`, não a mesma
+    de `contatos`/`conversas`).
+    """
+    convertida = registro.contato_id is not None
+    mensagem = None
+    link = None
+    if template and not convertida:
+        mensagem = prospeccao.montar_mensagem(template, registro.nome)
+        link = prospeccao.link_whatsapp(registro.telefone, mensagem)
+    return {
+        "id": registro.id,
+        "nome": registro.nome,
+        "bairro": registro.bairro,
+        "zona": registro.zona,
+        "nota": float(registro.nota) if registro.nota is not None else None,
+        "avaliacoes": registro.avaliacoes,
+        "site": registro.site,
+        "tier_origem": registro.tier_origem,
+        "status_origem": registro.status_origem,
+        "aberto_em": registro.aberto_em.isoformat() if registro.aberto_em else None,
+        "aberto_por": registro.aberto_por,
+        "criado_em": registro.criado_em.isoformat(),
+        "convertida": convertida,
+        "contato_id": registro.contato_id,
+        "conversa_id": registro.conversa_id,
+        "mensagem": mensagem,
+        "link_whatsapp": link,
     }

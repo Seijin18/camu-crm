@@ -741,5 +741,145 @@ class TesteRotasDeResumo(unittest.TestCase):
                 self.assertNotIn("enviar", caminho)
 
 
+class TesteRotasDeProspeccao(unittest.TestCase):
+    """Change `prospeccao-b2b-shortlist`: as três rotas novas — importar
+    (CSV), listar (com filtros) e abrir (registra intenção de disparo,
+    nunca envia). Sempre separado de contatos/conversas — ver
+    `TesteProspeccaoNuncaAparecEmTelasDeConversa` abaixo."""
+
+    def setUp(self):
+        self.cliente = TestClient(server.app)
+        contexto = patch.dict("os.environ", {}, clear=False)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        os.environ.pop(server.ENV_TOKEN, None)
+        self.fake = FakeDatabase()
+        patcher = patch.object(server, "get_db", return_value=self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _csv(self, linhas: str) -> bytes:
+        cabecalho = "petshop,bairro,zona,telefone,nota,avaliacoes,site,tier_origem,status_origem\n"
+        return (cabecalho + linhas).encode("utf-8")
+
+    def test_importar_csv_cria_linhas_e_reporta_resumo(self):
+        conteudo = self._csv(
+            "Petshop A,Centro,Leste,(12) 98157-5051,4.6,223,,A,valido\n"
+            "Petshop Sem Telefone,Centro,Leste,,4.0,10,,B,valido\n"
+        )
+        resposta = self.cliente.post(
+            "/api/prospeccao/importar",
+            files={"arquivo": ("shortlist.csv", conteudo, "text/csv")},
+        )
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertEqual(corpo["novos"], 1)
+        self.assertEqual(corpo["atualizados"], 0)
+        self.assertEqual(len(corpo["invalidas"]), 1)
+        self.assertIn("ilegível", corpo["invalidas"][0]["motivo"])
+
+    def test_reimportar_mesmo_csv_atualiza_nao_duplica(self):
+        conteudo = self._csv("Petshop A,Centro,Leste,(12) 98157-5051,4.6,223,,A,valido\n")
+        self.cliente.post(
+            "/api/prospeccao/importar",
+            files={"arquivo": ("shortlist.csv", conteudo, "text/csv")},
+        )
+        resposta = self.cliente.post(
+            "/api/prospeccao/importar",
+            files={"arquivo": ("shortlist.csv", conteudo, "text/csv")},
+        )
+        corpo = resposta.json()
+        self.assertEqual(corpo["novos"], 0)
+        self.assertEqual(corpo["atualizados"], 1)
+
+    def test_listar_prospeccao_traz_link_e_mensagem(self):
+        self.fake.criar_prospeccao(
+            nome="Petshop com Slogan | Desde sempre", telefone="5512999990010",
+        )
+        with patch("camucrm.painel.api.config.mensagem_prospeccao", return_value="Oi, {nome}!"):
+            resposta = self.cliente.get("/api/prospeccao")
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertEqual(len(corpo["prospeccoes"]), 1)
+        item = corpo["prospeccoes"][0]
+        self.assertFalse(item["convertida"])
+        self.assertEqual(item["mensagem"], "Oi, petshop com slogan!")
+        self.assertTrue(item["link_whatsapp"].startswith("https://api.whatsapp.com/send/"))
+
+    def test_listar_prospeccao_respeita_filtro_de_zona(self):
+        self.fake.criar_prospeccao(nome="Leste", zona="Leste", telefone="5512999990011")
+        self.fake.criar_prospeccao(nome="Norte", zona="Norte", telefone="5512999990012")
+        resposta = self.cliente.get("/api/prospeccao?zona=Norte")
+        corpo = resposta.json()
+        self.assertEqual([p["nome"] for p in corpo["prospeccoes"]], ["Norte"])
+
+    def test_linha_convertida_nao_traz_link_de_whatsapp(self):
+        telefone = "5512999990013"
+        self.fake.criar_prospeccao(nome="Convertido", telefone=telefone)
+        self.fake.criar_conversa(funil="b2b", estagio="P0", nome="Convertido", telefone=telefone)
+        with patch("camucrm.painel.api.config.mensagem_prospeccao", return_value="Oi, {nome}!"):
+            resposta = self.cliente.get("/api/prospeccao")
+        item = resposta.json()["prospeccoes"][0]
+        self.assertTrue(item["convertida"])
+        self.assertIsNone(item["mensagem"])
+        self.assertIsNone(item["link_whatsapp"])
+        self.assertIsNotNone(item["conversa_id"])
+
+    def test_abrir_prospeccao_registra_quem_e_quando(self):
+        prospeccao = self.fake.criar_prospeccao(nome="Petshop Z", telefone="5512999990014")
+        resposta = self.cliente.post(
+            f"/api/prospeccao/{prospeccao.id}/abrir", json={"por": "marcos"}
+        )
+        self.assertEqual(resposta.status_code, 200)
+        self.assertTrue(resposta.json()["ok"])
+        registro = self.fake.listar_prospeccoes()[0]
+        self.assertIsNotNone(registro.aberto_em)
+        self.assertEqual(registro.aberto_por, "marcos")
+
+    def test_nenhuma_rota_de_prospeccao_contem_enviar(self):
+        caminhos = set(server.app.openapi()["paths"].keys())
+        for caminho in caminhos:
+            if "prospeccao" in caminho:
+                self.assertNotIn("enviar", caminho)
+
+
+class TesteProspeccaoNuncaAparecEmTelasDeConversa(unittest.TestCase):
+    """Requirement "Shortlist separada de contatos/conversas" (design.md):
+    importar prospecção não pode mudar o que kanban/fila/conversas/
+    o-que-funciona mostram — nenhuma dessas rotas lê `prospeccoes`."""
+
+    def setUp(self):
+        self.cliente = TestClient(server.app)
+        contexto = patch.dict("os.environ", {}, clear=False)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        os.environ.pop(server.ENV_TOKEN, None)
+        self.fake = FakeDatabase()
+        patcher = patch.object(server, "get_db", return_value=self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_prospeccoes_nao_aparecem_em_kanban_fila_conversas_ou_o_que_funciona(self):
+        for i in range(5):
+            self.fake.criar_prospeccao(nome=f"Petshop {i}", telefone=f"551299999{i:04d}")
+
+        kanban = self.cliente.get("/api/kanban").json()
+        self.assertEqual(kanban["total"], 0)
+        for k in kanban["kanbans"]:
+            for coluna in k["colunas"]:
+                self.assertEqual(coluna["cards"], [])
+
+        fila = self.cliente.get("/api/fila").json()
+        self.assertEqual(fila["total"], 0)
+        self.assertEqual(fila["itens"], [])
+
+        conversas = self.cliente.get("/api/conversas").json()
+        self.assertEqual(conversas["total"], 0)
+        self.assertEqual(conversas["conversas"], [])
+
+        funciona = self.cliente.get("/api/o-que-funciona").json()
+        self.assertEqual(funciona["funil"]["onde_morrem"]["n"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

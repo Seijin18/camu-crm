@@ -34,13 +34,15 @@ clicar, nunca automática").
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -674,6 +676,72 @@ def resumo_da_conversa(conversa_id: int, db: Database = Depends(_db)):
         return views.resumo_para_json(None, mensagens_desde=None)
     pendentes = db.mensagens_desde(conversa_id, cache.ultima_mensagem_id)
     return views.resumo_para_json(cache, mensagens_desde=pendentes)
+
+
+# --------------------------------------------------------------------------
+# Prospecção B2B (change `prospeccao-b2b-shortlist`) — shortlist separada de
+# contatos/conversas (design.md, requirement "Shortlist separada de
+# contatos/conversas"): nenhuma rota aqui toca `contatos`/`conversas` para
+# escrever, e nenhuma rota de kanban/fila/conversas/métricas lê
+# `prospeccoes`. Nenhuma chamada a `camucrm.llm` (o texto é template fixo,
+# `camucrm.prospeccao.montar_mensagem`) nem a `camucrm.transport` (decisão 2
+# do design.md: o "disparo" é o link `api.whatsapp.com/send`, nunca uma rota
+# de envio — o clique do operador abre o link, o envio de fato é humano,
+# dentro do WhatsApp).
+# --------------------------------------------------------------------------
+
+
+class AbrirProspeccaoBody(BaseModel):
+    por: str | None = None
+
+
+@router.post("/prospeccao/importar")
+def importar_prospeccao(arquivo: UploadFile, db: Database = Depends(_db)):
+    """Upload de CSV (`petshop,bairro,zona,telefone,nota,avaliacoes,site,
+    tier_origem,status_origem`) — parsing aqui, upsert em
+    `db.importar_prospeccoes`. `utf-8-sig` tolera planilha exportada com BOM
+    (comum em CSV salvo por Excel), sem exigir que o operador reexporte."""
+    bruto = arquivo.file.read().decode("utf-8-sig")
+    linhas = list(csv.DictReader(io.StringIO(bruto)))
+    resumo = db.importar_prospeccoes(linhas)
+    return views.resumo_importacao_para_json(resumo)
+
+
+@router.get("/prospeccao")
+def listar_prospeccao(
+    zona: str | None = None,
+    bairro: str | None = None,
+    nota_minima: float | None = None,
+    tier: str | None = None,
+    nao_convertidas: bool = False,
+    db: Database = Depends(_db),
+):
+    """Lista + link de WhatsApp pronto por linha, calculado a partir do
+    template de `config.mensagem_prospeccao()` — `mensagem`/`link_whatsapp`
+    vêm `None` quando a linha já é conversa real (`views.
+    prospeccao_para_json` decide) ou quando não há template configurado."""
+    registros = db.listar_prospeccoes(
+        zona=zona,
+        bairro=bairro,
+        nota_minima=nota_minima,
+        tier=tier,
+        apenas_nao_convertidas=nao_convertidas,
+    )
+    template = config.mensagem_prospeccao()
+    return {
+        "prospeccoes": [views.prospeccao_para_json(p, template) for p in registros]
+    }
+
+
+@router.post("/prospeccao/{prospeccao_id}/abrir")
+def abrir_prospeccao(
+    prospeccao_id: int, corpo: AbrirProspeccaoBody, db: Database = Depends(_db)
+):
+    """Registra a abertura do link (intenção, não confirmação de envio —
+    design.md). Nunca chama `transport.enviar`: o clique já abriu o link em
+    outra aba antes desta chamada acontecer (front-end)."""
+    db.marcar_prospeccao_aberta(prospeccao_id, por=corpo.por)
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------------
