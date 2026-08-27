@@ -38,6 +38,27 @@ def resposta(**campos):
     return json.dumps(payload)
 
 
+DUMP_OBJECAO = [
+    {
+        "telefone": "5511999997777",
+        "nome": "Bruno",
+        "tipo": "b2c",
+        "mensagens": [
+            {"direcao": "in", "texto": "quero saber o preco",
+             "enviada_em": "2026-07-01T10:00:00Z"},
+            {"direcao": "out", "texto": "Ficou R$ 149 com frete gratis",
+             "enviada_em": "2026-07-01T10:20:00Z"},
+            {"direcao": "in", "texto": "achei caro",
+             "enviada_em": "2026-07-01T10:40:00Z"},
+        ],
+    }
+]
+
+
+def _resposta_com_objecao():
+    return json.dumps({"objecao": "preco", "evidencias": {"objecao": "achei caro"}})
+
+
 class TesteImportacao(unittest.TestCase):
     def test_importa_contato_conversa_e_mensagens(self):
         db = FakeDatabase()
@@ -95,6 +116,48 @@ class TesteOrigemBackfill(unittest.TestCase):
         # ter acabado de ser importado.
         conversa = next(iter(db.conversas.values()))
         self.assertIsNone(db.ultimo_avanco_em(conversa.id))
+
+
+class TesteReprocessamentoIdempotente(unittest.TestCase):
+    """§2 (change `literalidade-e-idempotencia-da-extracao`): o cenário
+    concreto que motivou o achado — `forcar=True` sempre relê a conversa
+    inteira (`desde=None`), então rodar `extrair_historico`/`make backfill
+    --forcar` duas vezes reapresenta a mesma objeção ao LLM. Sem o índice
+    único de `objecoes` (`gravar_objecao` com `ON CONFLICT DO NOTHING`), a
+    segunda rodada duplicaria a linha e poluiria `distribuicao_objecoes`
+    (§4) permanentemente.
+    """
+
+    def test_forcar_duas_vezes_nao_muda_contagem_de_objecoes(self):
+        db = FakeDatabase()
+        importar_conversas(db, DUMP_OBJECAO)
+        extrator = Extrator(
+            db, FakeLlm([_resposta_com_objecao(), _resposta_com_objecao()])
+        )
+
+        extrair_historico(db, extrator, agora=AGORA)
+        self.assertEqual(len(db.objecoes), 1)
+
+        # Segunda rodada de `--forcar`: mesma conversa, mesma objeção.
+        extrair_historico(db, extrator, agora=AGORA)
+        self.assertEqual(len(db.objecoes), 1)
+
+    def test_processar_conversa_forcar_duas_vezes_nao_duplica_objecao(self):
+        """Mesmo cenário, direto em `Extrator.processar_conversa` — sem
+        passar pelo `backfill.extrair_historico` — para não deixar a garantia
+        acoplada só ao caminho de backfill."""
+        db = FakeDatabase()
+        importar_conversas(db, DUMP_OBJECAO)
+        conversa = next(iter(db.conversas.values()))
+        extrator = Extrator(
+            db, FakeLlm([_resposta_com_objecao(), _resposta_com_objecao()])
+        )
+
+        extrator.processar_conversa(conversa.id, agora=AGORA, forcar=True)
+        self.assertEqual(len(db.objecoes), 1)
+
+        extrator.processar_conversa(conversa.id, agora=AGORA, forcar=True)
+        self.assertEqual(len(db.objecoes), 1)
 
 
 if __name__ == "__main__":

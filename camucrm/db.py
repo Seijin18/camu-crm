@@ -430,6 +430,16 @@ CREATE TABLE IF NOT EXISTS objecoes (
     em              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS objecoes_categoria_idx ON objecoes (categoria, em);
+-- ADIÇÃO (§2, idempotência): sem isto, reprocessamento — a regressão do
+-- watermark de `ultima_mensagem_processada_id` acima, OU qualquer
+-- `forcar=True` (`camucrm extrair --forcar`, `make backfill` reexecutado) —
+-- duplica a linha de objeção a cada rodada, poluindo permanentemente
+-- `distribuicao_objecoes` (a revisão mensal da §4). Mesma família de solução
+-- já usada em `fatos_dedupe_idx`: `md5(coalesce(trecho, ''))` porque duas
+-- ocorrências da mesma objeção sem trecho (`trecho IS NULL`) também devem
+-- deduplicar, e `NULL != NULL` em SQL não bloquearia isso sem o coalesce.
+CREATE UNIQUE INDEX IF NOT EXISTS objecoes_dedupe_idx
+    ON objecoes (conversa_id, categoria, coalesce(estagio, ''), md5(coalesce(trecho, '')));
 
 -- §7: toda correção humana grava aqui. Alimenta o eval e, pelo padrão das
 -- correções, mostra o que o prompt não está vendo. Correção que só ajusta a
@@ -800,6 +810,14 @@ class Database:
         e podem ser recalculados de `fatos` + `mensagens` a qualquer momento.
         A coluna existe para a fila não precisar reprocessar tudo a cada
         consulta — se divergir, o replay ganha.
+
+        `ultima_mensagem_processada_id` (§2, watermark de idempotência) usa
+        `GREATEST` contra o valor já gravado — mesmo padrão de
+        `ultimo_inbound`/`ultimo_outbound` em `registrar_mensagem`. Sem isso,
+        dois processamentos quase simultâneos da mesma conversa (webhook e
+        `camucrm extrair` juntos, ou dois webhooks) podem gravar o menor dos
+        dois valores por último, regredindo o watermark e reapresentando ao
+        LLM um bloco de mensagens já processado.
         """
         campos, valores = [], []
         for nome, valor in (
@@ -807,11 +825,17 @@ class Database:
             ("temperatura", temperatura),
             ("bola_com", bola_com),
             ("resultado", resultado),
-            ("ultima_mensagem_processada_id", ultima_mensagem_processada_id),
         ):
             if valor is not None:
                 campos.append(f"{nome} = %s")
                 valores.append(valor)
+        if ultima_mensagem_processada_id is not None:
+            campos.append(
+                "ultima_mensagem_processada_id = "
+                "GREATEST(COALESCE(ultima_mensagem_processada_id, %s), %s)"
+            )
+            valores.append(ultima_mensagem_processada_id)
+            valores.append(ultima_mensagem_processada_id)
         if not campos:
             return
         campos.append("atualizado_em = now()")
@@ -1095,12 +1119,20 @@ class Database:
         trecho: str | None = None,
         em: datetime | None = None,
     ) -> None:
+        """Grava uma ocorrência de objeção (§2, §4).
+
+        Idempotente via `objecoes_dedupe_idx`: a mesma (conversa, categoria,
+        estágio, trecho) gravada de novo — por reprocessamento concorrente ou
+        por `forcar=True` — não duplica linha. `ON CONFLICT DO NOTHING` é a
+        mesma família de solução já usada em `fatos`.
+        """
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO objecoes (conversa_id, categoria, estagio, trecho, em)
                     VALUES (%s, %s, %s, %s, COALESCE(%s, now()))
+                    ON CONFLICT DO NOTHING
                     """,
                     (conversa_id, categoria, estagio, trecho, em),
                 )

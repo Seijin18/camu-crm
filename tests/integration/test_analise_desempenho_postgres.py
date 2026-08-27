@@ -79,8 +79,13 @@ class TesteOndeConversasMorrem(CasoIntegracaoAnalise):
 class TesteObjecaoPorEstagio(CasoIntegracaoAnalise):
     def test_agrupa_por_estagio_e_categoria(self):
         c = self._nova_conversa()
-        self.db.gravar_objecao(c.id, "frete", estagio="S4")
-        self.db.gravar_objecao(c.id, "frete", estagio="S4")
+        # Trechos diferentes: duas ocorrências REAIS e distintas de "frete"
+        # no mesmo estágio. Idênticas (mesma categoria/estágio/trecho) é
+        # exatamente o que `objecoes_dedupe_idx` (change
+        # `literalidade-e-idempotencia-da-extracao`) colapsa numa linha só —
+        # ver `test_idempotencia_extracao_postgres.py`.
+        self.db.gravar_objecao(c.id, "frete", estagio="S4", trecho="o frete ficou caro")
+        self.db.gravar_objecao(c.id, "frete", estagio="S4", trecho="demora demais")
         self.db.gravar_objecao(c.id, "preco", estagio="S2")
 
         resultado = self.db.distribuicao_objecoes_por_estagio()

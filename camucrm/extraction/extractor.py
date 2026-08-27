@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from ..db import Database
 from ..llm import LlmClient, LlmIndisponivelError
 from ..pipeline import EstadoConversa, recalcular
-from ..rules.estagio import ORIGEM_LIVE
+from ..rules.estagio import ORIGEM_LIVE, estagio_inicial
 from . import prompt as prompt_mod
 from .contract import (
     ContratoInvalidoError,
@@ -85,7 +85,7 @@ class Extrator:
 
         fatos_conhecidos = self.db.fatos_da_conversa(conversa_id)
         mensagens = [(direcao, texto) for _, direcao, texto, _ in novas]
-        corpus = build_corpus(texto for _, _, texto, _ in novas)
+        corpus = build_corpus(mensagens)
 
         try:
             bruto = self.llm.completar(
@@ -114,9 +114,33 @@ class Extrator:
                 "; ".join(str(d) for d in extracao.democoes),
             )
 
+        # Estágio atribuído à objeção (§4): fora de `forcar`, o estágio da
+        # conversa ANTES deste bloco chegar (`conversa.estagio`, o cache lido
+        # no topo do método) — é o que separa "objetou antes da prévia" de
+        # "objetou depois", e é exatamente o valor que
+        # `test_bloco_novo_avanca_e_registra_objecao` (tests/test_e2e.py)
+        # prova.
+        #
+        # Com `forcar=True` (backfill, ou `camucrm extrair --forcar`),
+        # `conversa.estagio` NÃO serve mais: cada rodada relê a conversa
+        # INTEIRA desde o início (`desde=None` acima), mas o cache já foi
+        # reescrito pela rodada anterior — a primeira execução parte de
+        # S0/P0, a segunda encontra o cache já em S4/SX e usa ISSO como "o
+        # estágio de antes". A mesma objeção, gravada de novo pela mesma
+        # releitura, ganharia um `estagio` diferente a cada rodada, e o
+        # `ON CONFLICT` de `objecoes_dedupe_idx` (que inclui `estagio` na
+        # chave, por especificação) nunca colidiria — a rodada duplicaria a
+        # linha do mesmo jeito que motivou este change. `forcar=True` sempre
+        # relê do zero, então "o estágio de antes" tem que ser sempre o
+        # mesmo zero: o estágio inicial do funil, do mesmo jeito que
+        # `pipeline._trilha_de_backfill` sempre reparte da origem, e não do
+        # cache, para a trilha de estágio em si.
+        estagio_da_objecao = (
+            estagio_inicial(conversa.funil) if forcar else conversa.estagio
+        )
         self._persistir(
             conversa_id,
-            conversa.estagio,
+            estagio_da_objecao,
             extracao,
             agora,
             [(texto, enviada_em) for _, _, texto, enviada_em in novas],

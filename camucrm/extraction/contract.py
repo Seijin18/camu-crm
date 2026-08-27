@@ -36,6 +36,28 @@ FATOS_BOOLEANOS = (
 CAMPO_OBJECAO = "objecao"
 CAMPO_EVIDENCIAS = "evidencias"
 
+# Direção exigida por campo (§2, mapeamento do change
+# `literalidade-e-idempotencia-da-extracao`). Fatos que dependem de fala do
+# CLIENTE não podem ser "confirmados" por uma pergunta ou script da própria
+# Camu, e vice-versa — sem isto, a conferência de literalidade provava só que
+# o trecho existe em ALGUM lugar da conversa, não que quem precisava dizê-lo
+# disse. `objecao` fica de fora deste mapa de propósito: o contrato normativo
+# (spec deste change) só exige direção para os 7 campos booleanos; a
+# categoria de objeção continua conferida contra o corpus geral (os dois
+# lados), como já era.
+DIRECAO_CLIENTE = "in"
+DIRECAO_CAMU = "out"
+
+DIRECAO_POR_CAMPO: Mapping[str, str] = {
+    "foto_pet_recebida": DIRECAO_CLIENTE,
+    "preco_apresentado": DIRECAO_CAMU,
+    "previa_enviada": DIRECAO_CAMU,
+    "intencao_compra_explicita": DIRECAO_CLIENTE,
+    "recusa_explicita": DIRECAO_CLIENTE,
+    "autorizou_envio_material": DIRECAO_CLIENTE,
+    "visita_aceita": DIRECAO_CLIENTE,
+}
+
 # Evidência curta demais casa com qualquer coisa e não prova nada ("ok", "sim"
 # aparecem em toda conversa). Três caracteres é o piso: aceita "sim" — que é
 # uma confirmação real e frequente em DM — e rejeita ruído de um ou dois
@@ -125,20 +147,76 @@ def _fold(texto: str) -> str:
     que varia entre transcrições), mas afrouxar mais que isso transformaria a
     conferência de literalidade em conferência de palavras soltas, que é
     exatamente o que §2 quer impedir.
+
+    `\\s` inclui `\\n` — por isso `build_corpus` NUNCA deve juntar mensagens
+    com um separador de espaço em branco puro: `_fold` o colapsaria e a
+    fronteira entre duas mensagens desapareceria (ver `SEPARADOR_MENSAGEM`).
     """
     decomposto = unicodedata.normalize("NFKD", texto)
     sem_acento = "".join(c for c in decomposto if not unicodedata.combining(c))
     return re.sub(r"\s+", " ", sem_acento).strip().lower()
 
 
-def build_corpus(textos: Iterable[str]) -> str:
-    """Junta as mensagens da conversa num corpus para conferir evidências.
+# Separador de fronteira entre mensagens (§2, change
+# `literalidade-e-idempotencia-da-extracao`). Precisa estar FORA da classe
+# `\s` — `"\n"` puro é colapsado por `_fold` (`re.sub(r"\s+", " ", ...)`), e
+# nesse caso o fim de uma mensagem se cola ao começo da próxima, formando um
+# trecho que ninguém disse mas que casa como se fosse contíguo. `"\x00"`
+# nunca aparece em texto real de WhatsApp e sobrevive à normalização intacto,
+# então a fronteira continua detectável (e continua impossível de casar como
+# substring válido) depois do fold.
+SEPARADOR_MENSAGEM = "\x00"
 
-    O separador `\\n` importa: sem ele, o fim de uma mensagem e o começo da
-    seguinte formariam trechos que nunca foram ditos, e uma evidência
-    inventada poderia casar por acidente.
+
+@dataclass(frozen=True)
+class Corpus:
+    """Corpus de literalidade, separado por quem falou (§2, direção da
+    evidência).
+
+    `cliente` só tem mensagens `in`, `camu` só tem mensagens `out` — um
+    trecho que só existe do lado errado não deve casar contra o corpus do
+    campo que exige o lado certo (ver `DIRECAO_POR_CAMPO`). `geral` funde os
+    dois lados, na mesma fronteira preservada, e serve para o que não tem
+    direção exigida (a objeção, e o fallback de compatibilidade).
     """
-    return _fold("\n".join(t for t in textos if t))
+
+    cliente: str
+    camu: str
+    geral: str
+
+    def para_campo(self, campo: str) -> str:
+        direcao = DIRECAO_POR_CAMPO.get(campo)
+        if direcao == DIRECAO_CLIENTE:
+            return self.cliente
+        if direcao == DIRECAO_CAMU:
+            return self.camu
+        return self.geral
+
+
+def _juntar(textos: list[str]) -> str:
+    return _fold(SEPARADOR_MENSAGEM.join(t for t in textos if t))
+
+
+def build_corpus(mensagens: Iterable[tuple[str, str]]) -> Corpus:
+    """Junta as mensagens da conversa em corpus separados por direção.
+
+    `mensagens` é uma sequência de `(direcao, texto)` — mesmo formato que o
+    prompt recebe. O separador entre mensagens (`SEPARADOR_MENSAGEM`) importa:
+    sem ele, o fim de uma mensagem e o começo da seguinte formariam trechos
+    que nunca foram ditos, e uma evidência inventada poderia casar por
+    acidente; com um separador que `_fold` colapsa em espaço comum (como
+    `"\\n"` puro), a proteção desaparece silenciosamente.
+    """
+    cliente, camu, geral = [], [], []
+    for direcao, texto in mensagens:
+        if not texto:
+            continue
+        geral.append(texto)
+        if direcao == DIRECAO_CLIENTE:
+            cliente.append(texto)
+        elif direcao == DIRECAO_CAMU:
+            camu.append(texto)
+    return Corpus(cliente=_juntar(cliente), camu=_juntar(camu), geral=_juntar(geral))
 
 
 def _coerce_bool(valor: Any) -> bool | None:
@@ -203,15 +281,18 @@ def parse_resposta_llm(bruto: str | Mapping[str, Any]) -> dict[str, Any]:
 def validar(
     bruto: str | Mapping[str, Any],
     *,
-    corpus: str | None = None,
+    corpus: Corpus | None = None,
 ) -> Extracao:
     """Aplica o contrato à saída do LLM, rebaixando o que não se sustenta.
 
-    `corpus` é o texto da conversa já normalizado por `build_corpus`. Quando
-    ausente, a conferência de literalidade é pulada e só a exigência de
-    evidência não-vazia vale — modo usado no eval, onde o rótulo humano não
-    traz trecho. Em produção sempre passe o corpus: é ele que transforma
-    "exige evidência" em "exige evidência verdadeira".
+    `corpus` vem de `build_corpus`, já separado por direção. Quando ausente,
+    a conferência de literalidade é pulada e só a exigência de evidência
+    não-vazia vale — modo usado no eval, onde o rótulo humano não traz
+    trecho. Em produção sempre passe o corpus: é ele que transforma "exige
+    evidência" em "exige evidência verdadeira", e agora também "evidência
+    dita por quem tinha que dizer" (§2, direção da evidência) — um trecho que
+    só existe do lado errado da conversa (a Camu "confirmando" um fato que só
+    o cliente pode afirmar, ou vice-versa) não sustenta o campo.
     """
     payload = parse_resposta_llm(bruto)
     evidencias_brutas = payload.get(CAMPO_EVIDENCIAS) or {}
@@ -234,7 +315,8 @@ def validar(
 
         evidencia = evidencias_brutas.get(campo)
         evidencia = evidencia.strip() if isinstance(evidencia, str) else ""
-        motivo = _motivo_recusa(evidencia, corpus)
+        corpus_campo = corpus.para_campo(campo) if corpus is not None else None
+        motivo = _motivo_recusa(evidencia, corpus_campo)
         if motivo:
             democoes.append(Democao(campo, motivo, evidencia or None))
             fatos[campo] = False
@@ -243,8 +325,9 @@ def validar(
         fatos[campo] = True
         evidencias[campo] = evidencia
 
+    corpus_objecao = corpus.geral if corpus is not None else None
     objecao, evidencia_objecao, democao_objecao = _validar_objecao(
-        payload.get(CAMPO_OBJECAO), evidencias_brutas.get(CAMPO_OBJECAO), corpus
+        payload.get(CAMPO_OBJECAO), evidencias_brutas.get(CAMPO_OBJECAO), corpus_objecao
     )
     if democao_objecao:
         democoes.append(democao_objecao)

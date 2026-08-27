@@ -90,8 +90,13 @@ class TesteObjecaoPorEstagio(unittest.TestCase):
     def test_preserva_o_cruzamento_estagio_categoria(self):
         db = FakeDatabase()
         c = db.criar_conversa(funil="b2c", estagio="S4")
-        db.gravar_objecao(c.id, "frete", estagio="S4")
-        db.gravar_objecao(c.id, "frete", estagio="S4")
+        # Trechos diferentes: duas ocorrências REAIS e distintas de "frete"
+        # no mesmo estágio. Idênticas (mesma categoria/estágio/trecho) é
+        # exatamente o que `objecoes_dedupe_idx` (change
+        # `literalidade-e-idempotencia-da-extracao`) agora colapsa em uma
+        # linha só — ver `tests/test_db_idempotencia.py`.
+        db.gravar_objecao(c.id, "frete", estagio="S4", trecho="o frete ficou caro")
+        db.gravar_objecao(c.id, "frete", estagio="S4", trecho="demora demais pra chegar")
         db.gravar_objecao(c.id, "preco", estagio="S2")
 
         resultado = metrics.objecao_por_estagio(db)

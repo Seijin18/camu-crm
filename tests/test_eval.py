@@ -87,16 +87,28 @@ class TesteTravaDeFalsoPositivo(unittest.TestCase):
         self.assertFalse(r.falso_positivo_estagio)
 
     def test_um_falso_positivo_reprova_mesmo_com_fatos_perfeitos(self):
-        conversas = carregar(escrever([CONVERSA]))
-        # O modelo inventa `previa_enviada` com um trecho que existe: o
-        # contrato aceita, a regra avança, e o eval precisa reprovar.
+        # `previa_enviada` exige evidência do lado da Camu (§2, direção da
+        # evidência) — por isso esta conversa, diferente da `CONVERSA`
+        # global, precisa de uma mensagem `out` real para o modelo poder
+        # citar. O trecho é literal E do lado certo, mas semanticamente não é
+        # uma prévia — é isso que o contrato (literalidade + direção) não
+        # pega, e o eval, comparando com o rótulo, precisa reprovar.
+        conversa_com_out = json.loads(json.dumps(CONVERSA))
+        conversa_com_out["mensagens"].append(
+            {"direcao": "out", "texto": "Aqui esta o numero do seu pedido: 482",
+             "enviada_em": "2026-07-01T10:41:00Z"}
+        )
+        conversas = carregar(escrever([conversa_com_out]))
+        # O modelo inventa `previa_enviada` com um trecho que existe (literal
+        # e do lado certo): o contrato aceita, a regra avança, e o eval
+        # precisa reprovar.
         llm = FakeLlm([
             resposta(
                 foto_pet_recebida=True,
                 previa_enviada=True,
                 evidencias={
                     "foto_pet_recebida": "aqui esta a foto do Thor",
-                    "previa_enviada": "aqui esta a foto do Thor",
+                    "previa_enviada": "aqui esta o numero do seu pedido: 482",
                 },
             )
         ])

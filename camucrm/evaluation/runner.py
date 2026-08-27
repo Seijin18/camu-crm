@@ -228,6 +228,6 @@ def _extrair(llm: LlmClient, conversa: ConversaRotulada) -> tuple[Extracao, str 
             prompt_mod.user_prompt(conversa.transcricao, funil=conversa.funil),
             json_estrito=True,
         )
-        return validar(bruto, corpus=build_corpus(conversa.textos)), None
+        return validar(bruto, corpus=build_corpus(conversa.transcricao)), None
     except (LlmIndisponivelError, ContratoInvalidoError) as exc:
         return extracao_vazia(), str(exc)

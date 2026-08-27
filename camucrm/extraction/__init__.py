@@ -3,6 +3,7 @@
 from .contract import (
     FATOS_BOOLEANOS,
     ContratoInvalidoError,
+    Corpus,
     Democao,
     Extracao,
     build_corpus,
@@ -14,6 +15,7 @@ from .extractor import Extrator, ResultadoExtracao
 
 __all__ = [
     "ContratoInvalidoError",
+    "Corpus",
     "Democao",
     "Extracao",
     "Extrator",

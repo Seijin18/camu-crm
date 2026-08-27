@@ -330,6 +330,18 @@ class FakeDatabase:
         return max(momentos) if momentos else None
 
     def gravar_objecao(self, conversa_id, categoria, *, estagio=None, trecho=None, em=None):
+        # Espelha `objecoes_dedupe_idx` + `ON CONFLICT DO NOTHING`: mesma
+        # (conversa, categoria, estagio, trecho) gravada de novo (reprocessa-
+        # mento concorrente ou `forcar=True`) não duplica linha. Um fake que
+        # não reproduzisse isso deixaria passar batido o próprio bug que este
+        # change corrige — ver docstring do módulo.
+        chave = (conversa_id, categoria, estagio, trecho)
+        existentes = {
+            (o["conversa_id"], o["categoria"], o["estagio"], o["trecho"])
+            for o in self.objecoes
+        }
+        if chave in existentes:
+            return
         self.objecoes.append(
             {"id": self._novo_id(), "conversa_id": conversa_id, "categoria": categoria,
              "estagio": estagio, "trecho": trecho, "em": em or datetime.now(timezone.utc)}
@@ -371,10 +383,17 @@ class FakeDatabase:
         return sorted(linhas, key=lambda o: o.em)
 
     def atualizar_estado_conversa(self, conversa_id, **campos):
+        # Espelha o `GREATEST` de `db.py`: o watermark de idempotência nunca
+        # regride, mesmo que o chamador passe um id menor que o já gravado
+        # (processamento concorrente/fora de ordem) — ver docstring do módulo.
         conversa = self.conversas[conversa_id]
         for nome, valor in campos.items():
-            if valor is not None:
-                setattr(conversa, nome, valor)
+            if valor is None:
+                continue
+            if nome == "ultima_mensagem_processada_id":
+                atual = conversa.ultima_mensagem_processada_id
+                valor = valor if atual is None else max(atual, valor)
+            setattr(conversa, nome, valor)
         self._toques_conversa += 1
 
     def token_de_mudanca(self) -> str:

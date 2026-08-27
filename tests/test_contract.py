@@ -14,7 +14,14 @@ from camucrm.extraction.contract import (
     validar,
 )
 
-CONVERSA = ["Oi, segue a foto do meu cachorro", "Ficou R$ 149 com frete grátis", "achei caro"]
+# (direcao, texto) — o cliente manda a foto e reclama do preço; a Camu
+# apresenta o preço. Cada mensagem rotulada com quem falou de verdade, porque
+# a conferência de literalidade agora exige o lado certo (§2, direção).
+CONVERSA = [
+    ("in", "Oi, segue a foto do meu cachorro"),
+    ("out", "Ficou R$ 149 com frete grátis"),
+    ("in", "achei caro"),
+]
 
 
 class TesteExigenciaDeEvidencia(unittest.TestCase):
@@ -49,7 +56,7 @@ class TesteExigenciaDeEvidencia(unittest.TestCase):
         self.assertEqual(extracao.democoes[0].motivo, EVIDENCIA_NAO_LITERAL)
 
     def test_acento_e_espaco_nao_quebram_a_conferencia(self):
-        corpus = build_corpus(["Oi, segue a  foto do meu cachorro"])
+        corpus = build_corpus([("in", "Oi, segue a  foto do meu cachorro")])
         extracao = validar(
             {"foto_pet_recebida": True,
              "evidencias": {"foto_pet_recebida": "segue a foto do meu cachôrro"}},
@@ -61,9 +68,93 @@ class TesteExigenciaDeEvidencia(unittest.TestCase):
         extracao = validar(
             {"intencao_compra_explicita": True,
              "evidencias": {"intencao_compra_explicita": "ok"}},
-            corpus=build_corpus(["ok"]),
+            corpus=build_corpus([("in", "ok")]),
         )
         self.assertFalse(extracao["intencao_compra_explicita"])
+
+
+class TesteFronteiraEntreMensagens(unittest.TestCase):
+    """§2: `build_corpus` não pode deixar o fim de uma mensagem colar no
+    começo da seguinte — reprodução direta do achado que motivou este change.
+    """
+
+    def test_evidencia_que_so_existe_fundida_nao_valida_fato(self):
+        # Nenhuma mensagem, isolada, contém "mas nao vou fechar agora" — o
+        # trecho só existe se "...mas" (fim da primeira) colar em "nao vou
+        # fechar agora" (começo da segunda).
+        corpus = build_corpus(
+            [
+                ("in", "quero saber o preco, mas"),
+                ("in", "nao vou fechar agora"),
+            ]
+        )
+        extracao = validar(
+            {
+                "recusa_explicita": True,
+                "evidencias": {"recusa_explicita": "mas nao vou fechar agora"},
+            },
+            corpus=corpus,
+        )
+        self.assertFalse(extracao["recusa_explicita"])
+        self.assertEqual(extracao.democoes[0].motivo, EVIDENCIA_NAO_LITERAL)
+
+    def test_evidencia_contida_numa_unica_mensagem_continua_valida(self):
+        """A correção da fronteira não pode regredir literalidade válida
+        dentro de uma única mensagem."""
+        corpus = build_corpus([("in", "quero saber o preco, mas nao vou fechar agora")])
+        extracao = validar(
+            {
+                "recusa_explicita": True,
+                "evidencias": {"recusa_explicita": "mas nao vou fechar agora"},
+            },
+            corpus=corpus,
+        )
+        self.assertTrue(extracao["recusa_explicita"])
+
+
+class TesteDirecaoDaEvidencia(unittest.TestCase):
+    """§2: fato de cliente exige fala do cliente; fato da Camu exige fala da
+    Camu — um trecho do lado errado não sustenta o campo, mesmo literal."""
+
+    def test_evidencia_da_camu_nao_valida_fato_de_cliente(self):
+        corpus = build_corpus([("out", "Você não vai comprar hoje, certo?")])
+        extracao = validar(
+            {
+                "recusa_explicita": True,
+                "evidencias": {"recusa_explicita": "você não vai comprar hoje"},
+            },
+            corpus=corpus,
+        )
+        self.assertFalse(extracao["recusa_explicita"])
+        self.assertEqual(extracao.democoes[0].motivo, EVIDENCIA_NAO_LITERAL)
+
+    def test_evidencia_do_cliente_nao_valida_fato_da_camu(self):
+        corpus = build_corpus([("in", "voce ja mostrou a previa da arte do Thor?")])
+        extracao = validar(
+            {
+                "previa_enviada": True,
+                "evidencias": {"previa_enviada": "mostrou a previa da arte do Thor"},
+            },
+            corpus=corpus,
+        )
+        self.assertFalse(extracao["previa_enviada"])
+        self.assertEqual(extracao.democoes[0].motivo, EVIDENCIA_NAO_LITERAL)
+
+    def test_evidencia_do_lado_certo_continua_valida(self):
+        corpus = build_corpus(
+            [
+                ("in", "oi"),
+                ("out", "Ficou R$ 149 com frete grátis"),
+            ]
+        )
+        extracao = validar(
+            {
+                "preco_apresentado": True,
+                "evidencias": {"preco_apresentado": "ficou r$ 149 com frete gratis"},
+            },
+            corpus=corpus,
+        )
+        self.assertTrue(extracao["preco_apresentado"])
 
 
 class TesteObjecao(unittest.TestCase):
