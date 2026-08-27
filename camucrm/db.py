@@ -791,6 +791,30 @@ CREATE TABLE IF NOT EXISTS prospeccoes (
     atualizado_em   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS prospeccoes_zona_idx ON prospeccoes (zona, bairro);
+
+-- ADIÇÃO (change `backfill-cobertura-por-prompt`): até onde CADA versão de
+-- prompt de extração já leu uma conversa. Existe para `forcar=True`
+-- (backfill/`camucrm extrair --forcar`) não relere do zero uma conversa que
+-- a versão de prompt ATUAL já cobriu inteira — ver design.md do change para
+-- o porquê de ser por versão, não um watermark único: uma versão nova nunca
+-- pode "herdar" cobertura de uma versão antiga, ou uma releitura de verdade
+-- (o motivo de `forcar` existir) seria pulada por engano.
+--
+-- PK composta em vez de SERIAL: não existe "a linha de cobertura de uma
+-- conversa", só "a cobertura de uma conversa SOB uma versão" — a mesma
+-- lógica de `resumos_conversa_cursor_idx` acima, aqui como chave primária
+-- porque não há necessidade de mais de uma linha por par.
+CREATE TABLE IF NOT EXISTS cobertura_extracao (
+    conversa_id         INTEGER NOT NULL REFERENCES conversas(id) ON DELETE CASCADE,
+    prompt_versao       VARCHAR(16) NOT NULL,
+    -- Mesmo watermark de `conversas.ultima_mensagem_processada_id`, só que
+    -- por versão — `Database.registrar_cobertura_extracao` aplica o mesmo
+    -- `GREATEST` contra regressão que `atualizar_estado_conversa` já aplica
+    -- lá, pela mesma razão (processamento concorrente não pode regredir).
+    ultima_mensagem_id  INTEGER NOT NULL,
+    atualizado_em       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    PRIMARY KEY (conversa_id, prompt_versao)
+);
 """
 
 # §12, extensão da purga (change `rascunho-registrado`): texto escrito para
@@ -1305,6 +1329,59 @@ class Database:
                 cur.execute(
                     f"UPDATE conversas SET {', '.join(campos)} WHERE id = %s",
                     tuple(valores),
+                )
+
+    # -- cobertura de extração por versão de prompt (change
+    # `backfill-cobertura-por-prompt`) -------------------------------------
+
+    def cobertura_extracao(self, conversa_id: int, prompt_versao: str) -> int | None:
+        """Até qual mensagem a versão de prompt `prompt_versao` já leu nesta
+        conversa, ou `None` se essa versão nunca a tocou.
+
+        `None` é o sinal para `Extrator.processar_conversa` (com
+        `somente_desatualizados=True`) reler a conversa inteira desde o
+        início — não existe cobertura parcial "confiável o bastante": ou a
+        versão já viu até um ponto, ou não viu nada.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT ultima_mensagem_id FROM cobertura_extracao "
+                    "WHERE conversa_id = %s AND prompt_versao = %s",
+                    (conversa_id, prompt_versao),
+                )
+                linha = cur.fetchone()
+        return linha[0] if linha else None
+
+    def registrar_cobertura_extracao(
+        self,
+        conversa_id: int,
+        prompt_versao: str,
+        ultima_mensagem_id: int,
+        *,
+        conn=None,
+    ) -> None:
+        """Marca que `prompt_versao` já leu esta conversa até
+        `ultima_mensagem_id`.
+
+        `GREATEST` contra o valor já gravado — mesmo padrão e mesmo motivo de
+        `atualizar_estado_conversa` para `ultima_mensagem_processada_id`:
+        dois processamentos concorrentes da mesma conversa e versão (webhook
+        e `camucrm extrair` juntos, backfill retomado duas vezes) não podem
+        regredir a cobertura e fazer uma extração real de mensagem nova ser
+        pulada por engano na próxima consulta.
+        """
+        with self._conn_ou(conn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO cobertura_extracao "
+                    "(conversa_id, prompt_versao, ultima_mensagem_id) "
+                    "VALUES (%s, %s, %s) "
+                    "ON CONFLICT (conversa_id, prompt_versao) DO UPDATE SET "
+                    "ultima_mensagem_id = GREATEST("
+                    "cobertura_extracao.ultima_mensagem_id, excluded.ultima_mensagem_id"
+                    "), atualizado_em = now()",
+                    (conversa_id, prompt_versao, ultima_mensagem_id),
                 )
 
     # -- mensagens --------------------------------------------------------

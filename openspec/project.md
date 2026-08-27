@@ -191,6 +191,22 @@ indicados acima.
   contra documentação/comportamento real antes de decidir se vale
   desmembrar).
 
+## Auditoria de custo de LLM (2026-08-27)
+
+Pedido do usuário depois de observar picos de uso de tokens. Revisão dos três
+pontos onde o LLM é chamado (`extraction/`, `drafts.py`, `summaries.py`) e de
+tudo que os aciona (webhook, CLI, painel, backfill, eval). Dois problemas
+concretos, cada um virando change próprio:
+
+| Change | Achado | O que NÃO resolve |
+|---|---|---|
+| `backfill-cobertura-por-prompt` | `extrair_historico`/`camucrm extrair --forcar` sempre relê a conversa inteira (`forcar=True` ignora o watermark) — reexecutar `make backfill` custa 100% da base aberta de novo, mesmo sem o prompt ter mudado. Motivador direto do change `backfill-seguro-para-reexecucao`, que tornou reexecutar seguro, mas não barato | Não muda o que acontece na primeira vez que uma conversa é vista por uma versão de prompt nova — aí a releitura total continua sendo o comportamento certo |
+| `extracao-em-lote-por-janela` | `webhook.py::_extrair` dispara uma chamada de LLM por evento recebido, sem agrupar rajadas de mensagens fragmentadas do WhatsApp — cada chamada paga ~737 tokens fixos de `system_prompt()` contra ~65 tokens de conteúdo real numa mensagem só | Não muda a temperatura (já calculada ao vivo, direto dos timestamps de `mensagens`, sem depender de extração) nem os timestamps de estágio (já carimbados pelo momento da evidência, não do processamento) |
+
+Nenhum dos dois muda `rules/` nem a divisão de três lugares do LLM (§1). Ordem
+de implementação: `backfill-cobertura-por-prompt` primeiro (mais isolado,
+maior confiança de causa), `extracao-em-lote-por-janela` depois.
+
 ## Próximos changes candidatos
 
 `midia-foto-pet` continua à frente **em valor** — não depende do painel, e

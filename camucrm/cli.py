@@ -109,7 +109,13 @@ def cmd_extrair(args) -> int:
     banco = _db()
     extrator = Extrator(banco, criar_llm(args.provider))
     if args.conversa:
-        resultados = [extrator.processar_conversa(args.conversa, forcar=args.forcar)]
+        resultados = [
+            extrator.processar_conversa(
+                args.conversa,
+                forcar=args.forcar,
+                somente_desatualizados=args.somente_desatualizados,
+            )
+        ]
     else:
         resultados = extrator.processar_todas()
     for r in resultados:
@@ -368,7 +374,9 @@ def cmd_backfill(args) -> int:
         print(f"Importado: {resumo}")
     if args.extrair:
         extrator = Extrator(banco, criar_llm(args.provider))
-        resumo, _ = extrair_historico(banco, extrator)
+        resumo, _ = extrair_historico(
+            banco, extrator, somente_desatualizados=not args.forcar_tudo
+        )
         print(f"Extraído (origem=backfill): {resumo}")
         print("Lembrete (§8): estes eventos ficam fora de qualquer métrica de tempo.")
     return 0
@@ -653,6 +661,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("extrair", help="roda a extração sobre o bloco novo")
     p.add_argument("--conversa", type=int)
     p.add_argument("--forcar", action="store_true", help="reprocessa do início")
+    p.add_argument(
+        "--somente-desatualizados",
+        action="store_true",
+        help=(
+            "com --forcar: só relê de fato se a versão de prompt atual ainda "
+            "não cobrir a conversa inteira (change backfill-cobertura-por-prompt)"
+        ),
+    )
     p.add_argument("--provider")
     p.set_defaults(func=cmd_extrair)
 
@@ -718,6 +734,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("backfill", help="importa e extrai o histórico (§8)")
     p.add_argument("--arquivo", help="JSON com as conversas históricas")
     p.add_argument("--extrair", action="store_true")
+    p.add_argument(
+        "--forcar-tudo",
+        action="store_true",
+        help=(
+            "ignora a cobertura por versão de prompt e relê tudo "
+            "incondicionalmente (change backfill-cobertura-por-prompt; "
+            "sem a flag, conversas já cobertas pela versão atual não geram "
+            "chamada de LLM)"
+        ),
+    )
     p.add_argument("--provider")
     p.set_defaults(func=cmd_backfill)
 

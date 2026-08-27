@@ -132,12 +132,22 @@ def extrair_historico(
     *,
     limite: int = 1000,
     agora: datetime | None = None,
+    somente_desatualizados: bool = True,
 ) -> tuple[ResumoBackfill, list[ResultadoExtracao]]:
     """Roda a extração sobre tudo que já está no banco, marcando a origem.
 
     `forcar=True` porque o objetivo do backfill é justamente reler conversas
     inteiras, inclusive as que já têm `ultima_mensagem_processada_id` de uma
     importação anterior.
+
+    `somente_desatualizados=True` (default, change `backfill-cobertura-por-
+    prompt`): cada conversa só é relida de fato quando a versão de prompt
+    ATUAL ainda não a cobriu inteira — reexecutar `make backfill` sem o
+    prompt ter mudado não volta a chamar o LLM sobre o que já foi lido sob a
+    mesma versão. `somente_desatualizados=False` (`--forcar-tudo` na CLI)
+    ignora essa cobertura e relê tudo incondicionalmente, para quando o
+    operador genuinamente desconfia de um problema na mesma versão de
+    prompt. Ver `design.md` do change para o raciocínio completo.
     """
     agora = agora or datetime.now(timezone.utc)
     resumo = ResumoBackfill()
@@ -147,7 +157,11 @@ def extrair_historico(
         resumo.conversas += 1
         try:
             resultado = extrator.processar_conversa(
-                conversa.id, agora=agora, origem=ORIGEM_BACKFILL, forcar=True
+                conversa.id,
+                agora=agora,
+                origem=ORIGEM_BACKFILL,
+                forcar=True,
+                somente_desatualizados=somente_desatualizados,
             )
         except Exception as exc:  # noqa: BLE001 - uma conversa não derruba o lote
             logger.exception("Backfill falhou na conversa %s: %s", conversa.id, exc)

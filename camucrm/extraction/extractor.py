@@ -88,12 +88,25 @@ class Extrator:
         agora: datetime | None = None,
         origem: str = ORIGEM_LIVE,
         forcar: bool = False,
+        somente_desatualizados: bool = False,
     ) -> ResultadoExtracao:
         """Processa o bloco novo de uma conversa.
 
         `forcar=True` reprocessa desde o início — usado quando o prompt muda e
         se quer reextrair. Continua idempotente: os fatos já gravados não
         duplicam, e o estágio não regride.
+
+        `somente_desatualizados=True` (change `backfill-cobertura-por-
+        prompt`) só tem efeito junto de `forcar=True`: antes de relançar a
+        releitura total, consulta `db.cobertura_extracao` para a versão de
+        prompt ATUAL. Se essa versão já leu esta conversa até uma mensagem
+        X, o comportamento colapsa para o mesmo do caminho não-forçado — lê
+        só o que veio depois de X, com `estagio_referencia = conversa.estagio`
+        — em vez de reler tudo do zero. Sem cobertura para a versão atual
+        (nunca tocou esta conversa, ou é a primeira vez depois de um bump de
+        `PROMPT_VERSAO`), o comportamento é o de sempre: releitura total. Ver
+        `design.md` do change para o raciocínio completo, em especial por
+        que a cobertura é por VERSÃO e não um watermark único.
 
         Histórico grande (§8): o bloco novo é dividido em pedaços de até
         `TAMANHO_MAXIMO_BLOCO` mensagens, cada um sua própria chamada de LLM,
@@ -108,7 +121,21 @@ class Extrator:
         if conversa is None:
             raise ValueError(f"conversa {conversa_id} não existe")
 
-        desde = None if forcar else conversa.ultima_mensagem_processada_id
+        cobertura = (
+            self.db.cobertura_extracao(conversa_id, prompt_mod.PROMPT_VERSAO)
+            if forcar and somente_desatualizados
+            else None
+        )
+        # `reset_trilha` é o `forcar` "de verdade" — releitura total, trilha
+        # do zero. Vira falso quando a versão atual já cobre parte da
+        # conversa: nesse caso não há nada para "forçar", é a mesma pergunta
+        # que o caminho ao vivo já faz (o que há de novo desde o que esta
+        # versão já viu).
+        reset_trilha = forcar and cobertura is None
+        if forcar:
+            desde = cobertura  # None (releitura total) ou o watermark da versão atual
+        else:
+            desde = conversa.ultima_mensagem_processada_id
         novas = self.db.mensagens_novas(conversa_id, desde)
 
         if not novas:
@@ -121,27 +148,28 @@ class Extrator:
         fatos_antes = self.db.fatos_da_conversa(conversa_id)
         combinada = Extracao(fatos=dict(fatos_antes), evidencias={})
 
-        # Estágio atribuído à objeção (§4): fora de `forcar`, o estágio da
-        # conversa ANTES deste bloco chegar (`conversa.estagio`, o cache lido
-        # no topo do método) — é o que separa "objetou antes da prévia" de
-        # "objetou depois", e é exatamente o valor que
+        # Estágio atribuído à objeção (§4): fora de `reset_trilha`, o estágio
+        # da conversa ANTES deste bloco chegar (`conversa.estagio`, o cache
+        # lido no topo do método) — é o que separa "objetou antes da prévia"
+        # de "objetou depois", e é exatamente o valor que
         # `test_bloco_novo_avanca_e_registra_objecao` (tests/test_e2e.py)
         # prova.
         #
-        # Com `forcar=True` (backfill, ou `camucrm extrair --forcar`),
-        # `conversa.estagio` NÃO serve mais: cada rodada relê a conversa
-        # INTEIRA desde o início (`desde=None` acima), mas o cache já foi
-        # reescrito pela rodada anterior — a primeira execução parte de
-        # S0/P0, a segunda encontra o cache já em S4/SX e usa ISSO como "o
-        # estágio de antes". A mesma objeção, gravada de novo pela mesma
-        # releitura, ganharia um `estagio` diferente a cada rodada, e o
-        # `ON CONFLICT` de `objecoes_dedupe_idx` (que inclui `estagio` na
-        # chave, por especificação) nunca colidiria — a rodada duplicaria a
-        # linha do mesmo jeito que motivou este change. `forcar=True` sempre
-        # relê do zero, então "o estágio de antes" tem que ser sempre o
-        # mesmo zero: o estágio inicial do funil, do mesmo jeito que
-        # `pipeline._trilha_de_backfill` sempre reparte da origem, e não do
-        # cache, para a trilha de estágio em si.
+        # Com `reset_trilha=True` (releitura total de verdade — backfill sem
+        # cobertura para a versão atual, ou `camucrm extrair --forcar` sem
+        # `somente_desatualizados`), `conversa.estagio` NÃO serve mais: cada
+        # rodada relê a conversa INTEIRA desde o início (`desde=None` acima),
+        # mas o cache já foi reescrito pela rodada anterior — a primeira
+        # execução parte de S0/P0, a segunda encontra o cache já em S4/SX e
+        # usa ISSO como "o estágio de antes". A mesma objeção, gravada de
+        # novo pela mesma releitura, ganharia um `estagio` diferente a cada
+        # rodada, e o `ON CONFLICT` de `objecoes_dedupe_idx` (que inclui
+        # `estagio` na chave, por especificação) nunca colidiria — a rodada
+        # duplicaria a linha do mesmo jeito que motivou aquele change.
+        # Releitura total sempre relê do zero, então "o estágio de antes"
+        # tem que ser sempre o mesmo zero: o estágio inicial do funil, do
+        # mesmo jeito que `pipeline._trilha_de_backfill` sempre reparte da
+        # origem, e não do cache, para a trilha de estágio em si.
         #
         # Entre PEDAÇOS do mesmo bloco (chunking, §8): o estágio de
         # referência do pedaço seguinte é o estágio já recalculado depois do
@@ -149,7 +177,7 @@ class Extrator:
         # DENTRO desta mesma rodada continua valendo, só a rodada anterior
         # (cache stale de uma invocação passada) é que não serve.
         estagio_referencia = (
-            estagio_inicial(conversa.funil) if forcar else conversa.estagio
+            estagio_inicial(conversa.funil) if reset_trilha else conversa.estagio
         )
 
         total_processadas = 0
@@ -204,6 +232,14 @@ class Extrator:
             ultima_id = bloco[-1][0]
             self.db.atualizar_estado_conversa(
                 conversa_id, ultima_mensagem_processada_id=ultima_id
+            )
+            # Change `backfill-cobertura-por-prompt`: registra que a versão
+            # de prompt ATUAL leu até aqui, nos dois caminhos (ao vivo e
+            # forçado) — é o que permite uma passada de backfill futura
+            # pular o que já foi extraído ao vivo sob a mesma versão, sem
+            # depender de backfill já ter rodado antes.
+            self.db.registrar_cobertura_extracao(
+                conversa_id, prompt_mod.PROMPT_VERSAO, ultima_id
             )
 
             atualizada = self.db.get_conversa(conversa_id)

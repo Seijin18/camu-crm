@@ -209,6 +209,12 @@ class FakeDatabase:
         # índice único de dedupe que `prospeccoes_telefone_hash` garante no
         # banco real — reimportar a mesma planilha atualiza a mesma entrada.
         self.prospeccoes: dict[str, dict[str, Any]] = {}
+        # change `backfill-cobertura-por-prompt`: chave `(conversa_id,
+        # prompt_versao)`, mesma PK composta de `cobertura_extracao` — até
+        # onde CADA versão de prompt já leu a conversa. Prefixo `_` (em vez
+        # de `self.cobertura_extracao`) para não colidir com o método de
+        # mesmo nome que espelha `Database.cobertura_extracao` abaixo.
+        self._cobertura_extracao: dict[tuple[int, str], int] = {}
         self._proximo_id = 1
         # Proxy de `conversas.atualizado_em` para `token_de_mudanca` (change
         # `painel-tempo-real`): o fake não guarda timestamp de atualização
@@ -610,6 +616,23 @@ class FakeDatabase:
                 valor = valor if atual is None else max(atual, valor)
             setattr(conversa, nome, valor)
         self._toques_conversa += 1
+
+    def cobertura_extracao(self, conversa_id: int, prompt_versao: str) -> int | None:
+        """Espelha `db.Database.cobertura_extracao` (change
+        `backfill-cobertura-por-prompt`)."""
+        return self._cobertura_extracao.get((conversa_id, prompt_versao))
+
+    def registrar_cobertura_extracao(
+        self, conversa_id: int, prompt_versao: str, ultima_mensagem_id: int, *, conn=None
+    ) -> None:
+        """Espelha o `GREATEST` de `db.Database.registrar_cobertura_extracao`
+        — mesmo cuidado de `atualizar_estado_conversa` acima, contra
+        regressão por processamento concorrente/fora de ordem."""
+        chave = (conversa_id, prompt_versao)
+        atual = self._cobertura_extracao.get(chave)
+        self._cobertura_extracao[chave] = (
+            ultima_mensagem_id if atual is None else max(atual, ultima_mensagem_id)
+        )
 
     def token_de_mudanca(self) -> str:
         """Espelho pobre de `Database.token_de_mudanca` — três números que só

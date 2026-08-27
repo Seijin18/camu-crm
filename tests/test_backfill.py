@@ -257,5 +257,100 @@ class TesteOrdemDeLeituraBateComEnviadaEm(unittest.TestCase):
         self.assertLess(posicao["segunda"], posicao["terceira"])
 
 
+class TesteCoberturaPorVersaoDePrompt(unittest.TestCase):
+    """Change `backfill-cobertura-por-prompt`: `extrair_historico`
+    (`somente_desatualizados=True` por padrão) só relê de fato o que a
+    versão de prompt ATUAL ainda não cobriu."""
+
+    def test_segunda_execucao_sob_a_mesma_versao_nao_chama_llm(self):
+        db = FakeDatabase()
+        importar_conversas(db, DUMP)
+        extrator = Extrator(db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "aqui esta a foto do Thor"})
+        ]))
+
+        resumo1, _ = extrair_historico(db, extrator, agora=AGORA)
+        self.assertEqual(resumo1.extraidas, 1)
+        self.assertEqual(len(extrator.llm.chamadas), 1)
+
+        resumo2, _ = extrair_historico(db, extrator, agora=AGORA)
+        self.assertEqual(resumo2.extraidas, 1)  # ainda "extraída" (sem erro)
+        self.assertEqual(len(extrator.llm.chamadas), 1)  # nenhuma chamada nova
+
+    def test_bump_de_prompt_versao_forca_releitura_total(self):
+        import camucrm.extraction.prompt as prompt_mod
+
+        db = FakeDatabase()
+        importar_conversas(db, DUMP)
+        extrator = Extrator(db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "aqui esta a foto do Thor"})
+        ]))
+        extrair_historico(db, extrator, agora=AGORA)
+        self.assertEqual(len(extrator.llm.chamadas), 1)
+
+        versao_original = prompt_mod.PROMPT_VERSAO
+        try:
+            prompt_mod.PROMPT_VERSAO = "2"
+            extrator.llm.respostas.append(resposta(
+                foto_pet_recebida=True,
+                evidencias={"foto_pet_recebida": "aqui esta a foto do Thor"},
+            ))
+            extrair_historico(db, extrator, agora=AGORA)
+            # A versão "2" nunca tinha tocado esta conversa: releitura total,
+            # uma chamada de LLM a mais.
+            self.assertEqual(len(extrator.llm.chamadas), 2)
+        finally:
+            prompt_mod.PROMPT_VERSAO = versao_original
+
+    def test_forcar_tudo_ignora_cobertura_existente(self):
+        db = FakeDatabase()
+        importar_conversas(db, DUMP)
+        extrator = Extrator(db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "aqui esta a foto do Thor"}),
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "aqui esta a foto do Thor"}),
+        ]))
+        extrair_historico(db, extrator, agora=AGORA)
+        self.assertEqual(len(extrator.llm.chamadas), 1)
+
+        # `somente_desatualizados=False` (CLI: `--forcar-tudo`): relê mesmo
+        # com cobertura completa para a versão atual.
+        extrair_historico(db, extrator, agora=AGORA, somente_desatualizados=False)
+        self.assertEqual(len(extrator.llm.chamadas), 2)
+
+    def test_objecao_nao_duplica_com_bump_de_versao_e_reexecucao(self):
+        """Regressão sobre `backfill-seguro-para-reexecucao`: bump de versão
+        + reexecução continua sem duplicar objeção, agora também no caminho
+        que passa a reler (versão nova) e no que passa a pular (mesma
+        versão, segunda vez)."""
+        import camucrm.extraction.prompt as prompt_mod
+
+        db = FakeDatabase()
+        importar_conversas(db, DUMP_OBJECAO)
+        extrator = Extrator(
+            db, FakeLlm([_resposta_com_objecao(), _resposta_com_objecao()])
+        )
+        extrair_historico(db, extrator, agora=AGORA)
+        self.assertEqual(len(db.objecoes), 1)
+
+        # Mesma versão, segunda execução: pula, sem chance de duplicar.
+        extrair_historico(db, extrator, agora=AGORA)
+        self.assertEqual(len(db.objecoes), 1)
+
+        versao_original = prompt_mod.PROMPT_VERSAO
+        try:
+            prompt_mod.PROMPT_VERSAO = "2"
+            extrair_historico(db, extrator, agora=AGORA)
+            # Versão nova relê tudo, inclusive a objeção — mesmo texto,
+            # mesmo estágio de referência (releitura do zero), então o
+            # `ON CONFLICT` de `objecoes_dedupe_idx` ainda a reconhece.
+            self.assertEqual(len(db.objecoes), 1)
+        finally:
+            prompt_mod.PROMPT_VERSAO = versao_original
+
+
 if __name__ == "__main__":
     unittest.main()

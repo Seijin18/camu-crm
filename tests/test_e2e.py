@@ -642,3 +642,69 @@ class TesteReaberturaManualDeRecusa(unittest.TestCase):
         final = extrator3.processar_conversa(conversa.id, agora=AGORA)
         self.assertEqual(final.estado.estagio, "S5")
         self.assertNotEqual(final.estado.estagio, "SX")
+
+
+class TesteBackfillNaoReprocessaSobAMesmaVersao(unittest.TestCase):
+    """Change `backfill-cobertura-por-prompt`: estende o E2E único com o
+    cenário que motivou o change — reexecutar `forcar=True` sob a MESMA
+    versão de prompt não deve voltar a chamar o LLM sobre o que já foi lido,
+    seja essa primeira leitura ao vivo ou forçada.
+
+    Mora aqui, não num arquivo à parte, pela mesma regra já registrada para
+    `TesteReaberturaManualDeRecusa`/`TesteResumoNaoMudaEstado`: dois E2E
+    acabam testando versões diferentes do mesmo caminho de extração.
+    """
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.conversa = self.db.criar_conversa(nome="Bia")
+        self.db.registrar_mensagem(
+            self.conversa.id, "in", "oi, vi o insta de voces", AGORA - timedelta(hours=6)
+        )
+        self.db.registrar_mensagem(
+            self.conversa.id, "out", "Oi! Me manda uma foto do seu pet?",
+            AGORA - timedelta(hours=5),
+        )
+        self.db.registrar_mensagem(
+            self.conversa.id, "in", "aqui ele, o nome dele e Thor",
+            AGORA - timedelta(hours=4),
+        )
+
+    def test_extracao_ao_vivo_poupa_backfill_da_mesma_versao(self):
+        # Extração ao vivo cobre a conversa inteira sob a versão atual.
+        extrator = Extrator(self.db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "aqui ele, o nome dele e Thor"}),
+        ]))
+        resultado_vivo = extrator.processar_conversa(self.conversa.id, agora=AGORA)
+        self.assertEqual(resultado_vivo.estado.estagio, "S2")
+
+        # `extrair_historico` (backfill) sobre a MESMA versão: zero chamadas
+        # de LLM, porque a cobertura ao vivo já basta.
+        from camucrm.backfill import extrair_historico
+
+        llm_backfill = FakeLlm([])
+        extrator_backfill = Extrator(self.db, llm_backfill)
+        resumo, resultados = extrair_historico(
+            self.db, extrator_backfill, agora=AGORA
+        )
+        self.assertEqual(llm_backfill.chamadas, [])
+        self.assertEqual(resultados[0].estado.estagio, "S2")
+
+    def test_segunda_execucao_de_backfill_nao_chama_llm_de_novo(self):
+        from camucrm.backfill import extrair_historico
+
+        extracao = resposta(
+            foto_pet_recebida=True,
+            evidencias={"foto_pet_recebida": "aqui ele, o nome dele e Thor"},
+        )
+        extrator = Extrator(self.db, FakeLlm([extracao]))
+        extrair_historico(self.db, extrator, agora=AGORA)
+        self.assertEqual(len(extrator.llm.chamadas), 1)
+
+        # Mesma versão de prompt, nenhuma mensagem nova: a segunda execução
+        # não deve chamar o LLM — sem isso, `make backfill` reexecutado
+        # custaria a base inteira de novo, como o achado da auditoria de
+        # custo de LLM (2026-08-27, `openspec/project.md`) registrou.
+        extrair_historico(self.db, extrator, agora=AGORA)
+        self.assertEqual(len(extrator.llm.chamadas), 1)
