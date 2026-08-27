@@ -6,9 +6,10 @@ existir de `tests/integration/test_teto_followup.py` e
 - Índice único `(conversa_id, coalesce(ultima_mensagem_id, 0),
   prompt_versao)`: gerar duas vezes na mesma fronteira não duplica linha —
   vira `ON CONFLICT ... DO UPDATE` em `Database.gravar_resumo`.
-- A extensão da purga (§12): apaga `resumo`/`proximo_passo` de uma linha
-  vinculada a uma mensagem purgada, preservando a linha (contexto, estágio,
-  temperatura, timestamps).
+- A extensão da purga (§12, change `purga-cobre-rascunhos-sem-vinculo`):
+  apaga `resumo`/`proximo_passo` de TODO resumo de uma conversa encerrada
+  há mais de `meses` — com `ultima_mensagem_id` preenchido ou não —,
+  preservando a linha (contexto, estágio, temperatura, timestamps).
 
 Fora de `make test` de propósito. Apaga o que cria (padrão do commit
 `982ff31`).
@@ -109,6 +110,20 @@ class TesteIndiceUnicoDeCursor(CasoIntegracaoResumo):
 
 
 class TestePurgaApagaProseDoResumo(CasoIntegracaoResumo):
+    def _fechar_conversa(self, *, dias: int, resultado: str | None = "ganho") -> None:
+        """Encerra (ou não) e envelhece a conversa — mesmo critério de
+        `purgar_mensagens_antigas`: `resultado IS NOT NULL` e
+        `atualizado_em` mais velho que `meses`."""
+        if resultado is not None:
+            self.db.atualizar_estado_conversa(self.conversa.id, resultado=resultado)
+        with self.db._conn() as conn:  # noqa: SLF001
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE conversas SET atualizado_em = now() - (%s || ' days')::interval "
+                    "WHERE id = %s",
+                    (dias, self.conversa.id),
+                )
+
     def test_purga_apaga_resumo_mas_preserva_a_linha(self):
         mensagem_id = self.db.registrar_mensagem(
             self.conversa.id, "out", "texto pessoal do cliente",
@@ -119,14 +134,7 @@ class TestePurgaApagaProseDoResumo(CasoIntegracaoResumo):
             ultima_mensagem_id=mensagem_id, estagio="S1", temperatura="quente",
             prompt_versao="1",
         )
-        self.db.atualizar_estado_conversa(self.conversa.id, resultado="ganho")
-        with self.db._conn() as conn:  # noqa: SLF001
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE conversas SET atualizado_em = now() - interval '400 days' "
-                    "WHERE id = %s",
-                    (self.conversa.id,),
-                )
+        self._fechar_conversa(dias=400)
 
         self.db.purgar_mensagens_antigas(meses=12)
 
@@ -139,20 +147,52 @@ class TestePurgaApagaProseDoResumo(CasoIntegracaoResumo):
         # O FK (`ON DELETE SET NULL`) perde o vínculo com a mensagem apagada.
         self.assertIsNone(registro.ultima_mensagem_id)
 
-    def test_resumo_sem_mensagem_purgada_nao_e_tocado(self):
+    def test_resumo_sem_ultima_mensagem_e_anonimizado(self):
+        """Reconferência de `purga-cobre-rascunhos-sem-vinculo` (§12):
+        `resumos_conversa` tem o mesmo padrão de bug que `rascunhos` tinha —
+        confirmado aqui que, com a correção (join direto por
+        `r.conversa_id = c.id`), um resumo sem `ultima_mensagem_id` (nunca
+        apontou para mensagem alguma) é anonimizado do mesmo jeito que um
+        resumo vinculado."""
+        resumo_id = self.db.gravar_resumo(
+            self.conversa.id, resumo="resumo pessoal", proximo_passo="passo pessoal",
+            ultima_mensagem_id=None, estagio="S1", temperatura="quente",
+            prompt_versao="1",
+        )
+        self._fechar_conversa(dias=400)
+
+        self.db.purgar_mensagens_antigas(meses=12)
+
+        registro = self.db.resumo_vigente(self.conversa.id, "1")
+        self.assertIsNone(registro.resumo)
+        self.assertIsNone(registro.proximo_passo)
+        self.assertEqual(registro.id, resumo_id)
+        self.assertEqual(registro.estagio, "S1")
+
+    def test_resumo_de_conversa_aberta_nao_e_tocado(self):
+        """Conversa velha, mas sem `resultado` (ainda aberta) — não é
+        candidata da purga, por mais velha que esteja."""
         resumo_id = self.db.gravar_resumo(
             self.conversa.id, resumo="intacto", proximo_passo="também intacto",
             ultima_mensagem_id=None, estagio="S1", temperatura="quente",
             prompt_versao="1",
         )
-        self.db.atualizar_estado_conversa(self.conversa.id, resultado="ganho")
-        with self.db._conn() as conn:  # noqa: SLF001
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE conversas SET atualizado_em = now() - interval '400 days' "
-                    "WHERE id = %s",
-                    (self.conversa.id,),
-                )
+        self._fechar_conversa(dias=400, resultado=None)
+        self.db.purgar_mensagens_antigas(meses=12)
+        registro = self.db.resumo_vigente(self.conversa.id, "1")
+        self.assertEqual(registro.id, resumo_id)
+        self.assertEqual(registro.resumo, "intacto")
+        self.assertEqual(registro.proximo_passo, "também intacto")
+
+    def test_resumo_de_conversa_encerrada_recente_nao_e_tocado(self):
+        """Conversa encerrada, mas dentro do prazo de retenção — a purga
+        não deve alcançá-la ainda."""
+        resumo_id = self.db.gravar_resumo(
+            self.conversa.id, resumo="intacto", proximo_passo="também intacto",
+            ultima_mensagem_id=None, estagio="S1", temperatura="quente",
+            prompt_versao="1",
+        )
+        self._fechar_conversa(dias=10)
         self.db.purgar_mensagens_antigas(meses=12)
         registro = self.db.resumo_vigente(self.conversa.id, "1")
         self.assertEqual(registro.id, resumo_id)

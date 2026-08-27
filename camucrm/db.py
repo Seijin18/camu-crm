@@ -2398,20 +2398,30 @@ class Database:
         conversa encerrada há um ano não recebe envio.
 
         Extensão do change `rascunho-registrado`: `rascunhos.opcao_1`/
-        `opcao_2`/`texto_final` de rascunhos vinculados às mensagens que
-        serão purgadas também é conteúdo pessoal (texto escrito para aquele
-        cliente) e sai — a linha em si (contexto, escolha, timestamps)
-        permanece. O `UPDATE` roda ANTES do `DELETE`: depois que a mensagem
-        some, o `ON DELETE SET NULL` do FK já apagou o `mensagem_id` que
-        identifica qual rascunho anonimizar.
+        `opcao_2`/`texto_final` de todo rascunho de uma conversa encerrada
+        há mais de `meses` também é conteúdo pessoal (texto escrito para
+        aquele cliente) e sai — a linha em si (contexto, escolha,
+        timestamps) permanece. O `UPDATE` roda ANTES do `DELETE` de
+        `mensagens`, mas isso hoje é só sequência dentro da mesma
+        transação, não uma dependência de dado: ver `purga-cobre-
+        rascunhos-sem-vinculo` (§12) — o join é direto por
+        `r.conversa_id = c.id`, não mais via `mensagens`, porque a maioria
+        dos rascunhos reais nunca chega a ser vinculada a uma mensagem
+        (`mensagem_id IS NULL`: gerado e editado antes de enviar, ou
+        escolhido manualmente) e um join via `mensagens` simplesmente não
+        os alcança — o texto pessoal sobrevivia à purga em claro.
 
         Extensão do change `resumo-conversa`: `resumos_conversa.resumo`/
         `proximo_passo` é prosa DERIVADA das mensagens do cliente — mesmo
-        conteúdo pessoal, mesmo critério de idade, mesmo motivo de rodar
-        ANTES do `DELETE` (a FK de `ultima_mensagem_id` também é
-        `ON DELETE SET NULL`). Diferente de `rascunhos` não há constraint de
-        forma exigindo texto não-nulo aqui, então o valor vira `NULL` direto
-        — sem placeholder.
+        conteúdo pessoal, mesmo critério de idade. Mesma correção do
+        `purga-cobre-rascunhos-sem-vinculo` (§12): o join é direto por
+        `r.conversa_id = c.id`, não mais via `mensagens.ultima_mensagem_id`
+        — um resumo alcança a purga mesmo com `ultima_mensagem_id` `NULL`
+        ou já apontando para uma mensagem que uma purga anterior apagou
+        (o `ON DELETE SET NULL` do FK zera a coluna, mas o resumo em si
+        continua precisando ser anonimizado). Diferente de `rascunhos` não
+        há constraint de forma exigindo texto não-nulo aqui, então o valor
+        vira `NULL` direto — sem placeholder.
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -2424,9 +2434,8 @@ class Database:
                                           THEN %(marca)s ELSE NULL END,
                            texto_final = CASE WHEN r.texto_final IS NOT NULL
                                               THEN %(marca)s ELSE NULL END
-                      FROM mensagens m
-                      JOIN conversas c ON c.id = m.conversa_id
-                     WHERE r.mensagem_id = m.id
+                      FROM conversas c
+                     WHERE r.conversa_id = c.id
                        AND c.resultado IS NOT NULL
                        AND c.atualizado_em < now() - make_interval(months => %(meses)s)
                     """,
@@ -2437,9 +2446,8 @@ class Database:
                     UPDATE resumos_conversa r
                        SET resumo = NULL,
                            proximo_passo = NULL
-                      FROM mensagens m
-                      JOIN conversas c ON c.id = m.conversa_id
-                     WHERE r.ultima_mensagem_id = m.id
+                      FROM conversas c
+                     WHERE r.conversa_id = c.id
                        AND c.resultado IS NOT NULL
                        AND c.atualizado_em < now() - make_interval(months => %(meses)s)
                     """,

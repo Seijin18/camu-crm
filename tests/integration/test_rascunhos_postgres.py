@@ -6,8 +6,9 @@ de existir de `tests/integration/test_teto_followup.py`:
 - `rascunhos_escolha`: escolha registrada sempre tem `escolhido_em`.
 - Índice único parcial em `mensagem_id`: nenhuma mensagem reivindicada por
   dois rascunhos.
-- A extensão da purga (§12): apaga o texto do rascunho vinculado a uma
-  mensagem purgada, sem apagar a linha.
+- A extensão da purga (§12, change `purga-cobre-rascunhos-sem-vinculo`):
+  apaga o texto de TODO rascunho de uma conversa encerrada há mais de
+  `meses` — vinculado a uma mensagem purgada ou não —, sem apagar a linha.
 
 Fora de `make test` de propósito. Apaga o que cria (padrão do commit
 `982ff31`).
@@ -180,6 +181,20 @@ class TesteMensagemIdUnico(CasoIntegracaoRascunho):
 
 
 class TestePurgaApagaTextoDoRascunho(CasoIntegracaoRascunho):
+    def _fechar_conversa(self, *, dias: int, resultado: str | None = "ganho") -> None:
+        """Encerra (ou não) e envelhece a conversa — mesmo critério de
+        `purgar_mensagens_antigas`: `resultado IS NOT NULL` e
+        `atualizado_em` mais velho que `meses`."""
+        if resultado is not None:
+            self.db.atualizar_estado_conversa(self.conversa.id, resultado=resultado)
+        with self.db._conn() as conn:  # noqa: SLF001
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE conversas SET atualizado_em = now() - (%s || ' days')::interval "
+                    "WHERE id = %s",
+                    (dias, self.conversa.id),
+                )
+
     def test_purga_anonimiza_texto_mas_preserva_a_linha(self):
         mensagem_id = self.db.registrar_mensagem(
             self.conversa.id, "out", "texto pessoal do cliente",
@@ -196,14 +211,7 @@ class TestePurgaApagaTextoDoRascunho(CasoIntegracaoRascunho):
 
         # Conversa precisa estar encerrada e velha o bastante para a purga
         # (mesmo critério de `purgar_mensagens_antigas`).
-        self.db.atualizar_estado_conversa(self.conversa.id, resultado="ganho")
-        with self.db._conn() as conn:  # noqa: SLF001
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE conversas SET atualizado_em = now() - interval '400 days' "
-                    "WHERE id = %s",
-                    (self.conversa.id,),
-                )
+        self._fechar_conversa(dias=400)
 
         apagadas = self.db.purgar_mensagens_antigas(meses=12)
         self.assertGreaterEqual(apagadas, 1)
@@ -218,19 +226,52 @@ class TestePurgaApagaTextoDoRascunho(CasoIntegracaoRascunho):
         # O FK (`ON DELETE SET NULL`) perde o vínculo com a mensagem apagada.
         self.assertIsNone(registro.mensagem_id)
 
-    def test_rascunho_sem_mensagem_vinculada_nao_e_tocado(self):
+    def test_rascunho_sem_mensagem_vinculada_e_anonimizado(self):
+        """Reprodução do bug de `purga-cobre-rascunhos-sem-vinculo` (§12):
+        antes da correção, `purgar_mensagens_antigas` só alcançava
+        `rascunhos` via join com `mensagens` (`r.mensagem_id = m.id`) — um
+        rascunho nunca vinculado (`mensagem_id IS NULL`, o caso mais comum:
+        gerado e editado antes de enviar, ou escolhido manualmente)
+        sobrevivia intacto, com texto pessoal em claro. Corrigido: o join é
+        direto por `r.conversa_id = c.id`, alcança este rascunho mesmo sem
+        nunca ter sido vinculado a mensagem alguma."""
+        rascunho_id = self.db.gravar_rascunho(
+            self.conversa.id, estagio="S1", temperatura="quente", funil="b2c",
+            opcoes=("opção 1 pessoal", "opção 2 pessoal"),
+        )
+        self.assertIsNone(self.db.rascunho(rascunho_id).mensagem_id)
+
+        self._fechar_conversa(dias=400)
+        self.db.purgar_mensagens_antigas(meses=12)
+
+        registro = self.db.rascunho(rascunho_id)
+        self.assertEqual(registro.opcao_1, TEXTO_RASCUNHO_PURGADO)
+        self.assertEqual(registro.opcao_2, TEXTO_RASCUNHO_PURGADO)
+        # A linha em si — contexto, escolha, timestamps — não é removida.
+        self.assertEqual(registro.estagio, "S1")
+        self.assertIsNone(registro.mensagem_id)
+
+    def test_rascunho_de_conversa_aberta_nao_e_tocado(self):
+        """Conversa velha, mas sem `resultado` (ainda aberta) — não é
+        candidata da purga, por mais velha que esteja."""
         rascunho_id = self.db.gravar_rascunho(
             self.conversa.id, estagio="S1", temperatura="quente", funil="b2c",
             opcoes=("a", "b"),
         )
-        self.db.atualizar_estado_conversa(self.conversa.id, resultado="ganho")
-        with self.db._conn() as conn:  # noqa: SLF001
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE conversas SET atualizado_em = now() - interval '400 days' "
-                    "WHERE id = %s",
-                    (self.conversa.id,),
-                )
+        self._fechar_conversa(dias=400, resultado=None)
+        self.db.purgar_mensagens_antigas(meses=12)
+        registro = self.db.rascunho(rascunho_id)
+        self.assertEqual(registro.opcao_1, "a")
+        self.assertEqual(registro.opcao_2, "b")
+
+    def test_rascunho_de_conversa_encerrada_recente_nao_e_tocado(self):
+        """Conversa encerrada, mas dentro do prazo de retenção — a purga
+        não deve alcançá-la ainda."""
+        rascunho_id = self.db.gravar_rascunho(
+            self.conversa.id, estagio="S1", temperatura="quente", funil="b2c",
+            opcoes=("a", "b"),
+        )
+        self._fechar_conversa(dias=10)
         self.db.purgar_mensagens_antigas(meses=12)
         registro = self.db.rascunho(rascunho_id)
         self.assertEqual(registro.opcao_1, "a")
