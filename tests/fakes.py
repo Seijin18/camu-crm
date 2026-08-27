@@ -137,6 +137,12 @@ class FakeDatabase:
         # para `marcos_detalhados`, que `self.marcos` (só o set) não guarda.
         self.marcos_por: dict[int, dict[str, tuple[datetime, str | None]]] = {}
         self._proximo_id = 1
+        # Proxy de `conversas.atualizado_em` para `token_de_mudanca` (change
+        # `painel-tempo-real`): o fake não guarda timestamp de atualização
+        # por conversa, então usa um contador que só cresce, nos mesmos
+        # pontos que a `Database` real toca a coluna (registrar mensagem,
+        # atualizar estado, gravar evento de estágio).
+        self._toques_conversa = 0
 
     # -- helpers de montagem ---------------------------------------------
 
@@ -199,6 +205,7 @@ class FakeDatabase:
         else:
             conversa.ultimo_outbound = enviada_em
             conversa.bola_com = "cliente"
+        self._toques_conversa += 1
         return identificador
 
     def listar_mensagens(self, conversa_id: int) -> list[Mensagem]:
@@ -259,6 +266,7 @@ class FakeDatabase:
              "origem": origem, "motivo": motivo,
              "em": em or datetime.now(timezone.utc)}
         )
+        self._toques_conversa += 1
 
     def eventos_da_conversa(self, conversa_id: int) -> list[EventoRegistro]:
         eventos = [e for e in self.eventos if e["conversa_id"] == conversa_id]
@@ -323,6 +331,21 @@ class FakeDatabase:
         for nome, valor in campos.items():
             if valor is not None:
                 setattr(conversa, nome, valor)
+        self._toques_conversa += 1
+
+    def token_de_mudanca(self) -> str:
+        """Espelho pobre de `Database.token_de_mudanca` — três números que só
+        crescem, um por motivo de mudança (mensagem, evento de estágio,
+        toque em conversa). Não é a mesma fórmula da `Database` real (não há
+        `atualizado_em` guardado no fake), só a mesma propriedade que os
+        testes de `stream.py` precisam: muda sempre que um dos três motivos
+        acontece, nunca de outro jeito.
+        """
+        max_mensagem = 0
+        for linhas in self.mensagens.values():
+            for identificador, *_ in linhas:
+                max_mensagem = max(max_mensagem, identificador)
+        return f"{max_mensagem}:{len(self.eventos)}:{self._toques_conversa}"
 
     def registrar_followup(self, conversa_id, texto=None) -> int:
         enviados = self.followups.setdefault(conversa_id, [])

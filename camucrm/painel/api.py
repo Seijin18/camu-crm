@@ -22,6 +22,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
 
 from .. import metrics
 from ..db import Database
@@ -30,6 +31,7 @@ from ..rules.fila import Candidato, montar_fila
 from ..taxonomia import B2B, B2C, FUNIS
 from . import server, views
 from .server import exigir_token
+from .stream import gerador_sse
 
 router = APIRouter(dependencies=[Depends(exigir_token)])
 
@@ -188,6 +190,32 @@ def get_fila(limite: int = 10, db: Database = Depends(_db)):
     candidatos = [_candidato_de(c, e) for c, e in pares]
     itens = montar_fila(candidatos, limite=limite)
     return {"itens": [views.item_fila_para_json(i) for i in itens]}
+
+
+@router.get("/stream")
+async def stream(desde_id: int | None = None, db: Database = Depends(_db)):
+    """SSE do painel (change `painel-tempo-real`) — a única rota `async def`
+    deste módulo.
+
+    Único ponto de `camucrm/painel/` onde `psycopg` é chamado de dentro de
+    uma coroutine; toda leitura de banco fica dentro de `stream.gerador_sse`,
+    que despacha via `asyncio.to_thread` (ver docstring do módulo `stream`
+    para o motivo — bloquear o event loop aqui congelaria todos os clientes
+    conectados, não só este). O poller que alimenta o gerador é o único por
+    processo, criado em `server.poller`.
+
+    `desde_id` é o cursor de reconexão (`?desde_id=N`) — nunca o token de
+    autenticação, que continua indo só pelo header `X-Camu-Token` (requirement
+    "Token nunca na URL").
+    """
+    return StreamingResponse(
+        gerador_sse(db, server.poller, desde_id=desde_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/metricas")

@@ -1,12 +1,17 @@
 /*
  * Painel de leitura do camu-crm — JS puro, sem bundler, sem CDN.
  *
- * Regras que este arquivo não pode quebrar (CLAUDE.md / plano do change
- * `painel-leitura`):
+ * Regras que este arquivo não pode quebrar (CLAUDE.md / plano dos changes
+ * `painel-leitura` e `painel-tempo-real`):
  *   - textContent sempre, innerHTML nunca, para qualquer texto que venha de
  *     conversa/mensagem/nome (evita XSS a partir de conteúdo de cliente).
- *   - token em localStorage, nunca em querystring.
- *   - botão "Atualizar" manual — sem SSE neste change.
+ *   - token em localStorage, nunca em querystring — inclusive no stream:
+ *     `EventSource` não aceita header customizado, então o cliente de
+ *     tempo real é `fetch()` + `ReadableStream` com um parser SSE manual
+ *     (ver "Tempo real" abaixo), não `EventSource`.
+ *   - botão "Atualizar" manual continua existindo — o stream é reforço, não
+ *     substituição; se a conexão SSE cair, a tela não fica presa no estado
+ *     velho sem jeito de atualizar.
  *   - a fila é a tela inicial ("#/"), o kanban é aba secundária (§6).
  */
 
@@ -370,6 +375,79 @@ function marcarAbaAtiva(rota) {
   if (link) link.classList.add("ativa");
 }
 
+// -- Tempo real (SSE via fetch + ReadableStream, change `painel-tempo-real`)
+
+// `desde_id` é o cursor de reconexão (design.md): o id da última mensagem
+// já recebida do stream. Guardado em memória só — perder isso num reload de
+// página não é perda de evento, é o mesmo que abrir o painel de novo.
+let ultimoIdStream = null;
+
+const ATRASO_INICIAL_MS = 1000;
+const ATRASO_MAXIMO_MS = 10000;
+let atrasoReconexaoMs = ATRASO_INICIAL_MS;
+
+/**
+ * Parser SSE manual (~25 linhas, como o plano pede): um bloco é tudo entre
+ * duas quebras de linha duplas, com linhas `id:`/`event:`/`data:`. O
+ * heartbeat (`: ping`) não tem `data:` e é ignorado aqui — ele só existe
+ * para o proxy não fechar a conexão por inatividade.
+ */
+function processarBlocoSse(bloco) {
+  let evento = "message";
+  let temDados = false;
+  bloco.split("\n").forEach((linha) => {
+    if (linha.startsWith("id:")) {
+      ultimoIdStream = Number(linha.slice(3).trim());
+    } else if (linha.startsWith("event:")) {
+      evento = linha.slice(6).trim();
+    } else if (linha.startsWith("data:")) {
+      temDados = true;
+    }
+  });
+  if (!temDados) return; // heartbeat
+  if (evento === "mensagem" || evento === "mudanca") {
+    // Recarrega a tela atual com os mesmos dados que "Atualizar" busca —
+    // o stream só avisa que algo mudou, não tenta atualizar o DOM à mão
+    // por cima do que `renderizarRota` já sabe montar.
+    renderizarRota();
+  }
+}
+
+async function conectarStream() {
+  const params = new URLSearchParams();
+  if (ultimoIdStream !== null) params.set("desde_id", String(ultimoIdStream));
+  try {
+    const resposta = await fetch(`/api/stream?${params.toString()}`, {
+      headers: { "X-Camu-Token": obterToken() },
+    });
+    if (!resposta.ok || !resposta.body) {
+      throw new Error(`stream HTTP ${resposta.status}`);
+    }
+    atrasoReconexaoMs = ATRASO_INICIAL_MS; // conectou: zera o backoff
+    const leitor = resposta.body.getReader();
+    const decodificador = new TextDecoder();
+    let bufer = "";
+    while (true) {
+      const { value, done } = await leitor.read();
+      if (done) break;
+      bufer += decodificador.decode(value, { stream: true });
+      let indiceFimBloco;
+      while ((indiceFimBloco = bufer.indexOf("\n\n")) !== -1) {
+        processarBlocoSse(bufer.slice(0, indiceFimBloco));
+        bufer = bufer.slice(indiceFimBloco + 2);
+      }
+    }
+  } catch (e) {
+    // Rede caiu, servidor reiniciou, token mudou — qualquer motivo cai aqui
+    // e reconecta com backoff abaixo, nunca desiste de vez.
+  }
+  await new Promise((resolve) => setTimeout(resolve, atrasoReconexaoMs));
+  atrasoReconexaoMs = Math.min(atrasoReconexaoMs * 2, ATRASO_MAXIMO_MS);
+  conectarStream();
+}
+
+// -- Início --------------------------------------------------------------
+
 function iniciar() {
   document.getElementById("campo-token").value = obterToken();
   document.getElementById("botao-salvar-token").addEventListener("click", () => {
@@ -379,6 +457,7 @@ function iniciar() {
   document.getElementById("botao-atualizar").addEventListener("click", renderizarRota);
   window.addEventListener("hashchange", renderizarRota);
   renderizarRota();
+  conectarStream();
 }
 
 document.addEventListener("DOMContentLoaded", iniciar);

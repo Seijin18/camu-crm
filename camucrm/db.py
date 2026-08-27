@@ -561,6 +561,34 @@ class Database:
                 )
                 return [Conversa(*row) for row in cur.fetchall()]
 
+    def token_de_mudanca(self) -> str:
+        """Cursor barato de "algo mudou" para o SSE do painel (change
+        `painel-tempo-real`, design.md).
+
+        Três subselects escalares — `MAX(mensagens.id)`,
+        `MAX(eventos_estagio.id)`, `epoch(MAX(conversas.atualizado_em))` —
+        concatenados em `"m:e:c"`. Três partes porque são três motivos
+        distintos de a tela estar desatualizada, e só o primeiro move
+        `mensagens.id`: uma correção manual ou uma mudança de resultado pode
+        tocar `conversas.atualizado_em` sem gerar mensagem nem evento de
+        estágio novo.
+
+        O mesmo valor serve de cursor de reconexão (`?desde_id=N` no stream):
+        comparar strings anteriores/posteriores é suficiente para o poller de
+        `painel/stream.py` decidir se dispara o evento — nenhuma parte deste
+        método interpreta o conteúdo do token além de igualdade.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT "
+                    "(SELECT MAX(id) FROM mensagens), "
+                    "(SELECT MAX(id) FROM eventos_estagio), "
+                    "(SELECT extract(epoch FROM MAX(atualizado_em)) FROM conversas)"
+                )
+                max_mensagem, max_evento, max_atualizado = cur.fetchone()
+        return f"{max_mensagem or 0}:{max_evento or 0}:{max_atualizado or 0}"
+
     def atualizar_estado_conversa(
         self,
         conversa_id: int,

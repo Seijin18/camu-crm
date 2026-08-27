@@ -70,7 +70,7 @@ class TesteSemRotaDeEnvio(unittest.TestCase):
     def test_nenhum_modulo_do_painel_importa_transport(self):
         """Checagem por AST — não por grep — de que `camucrm.transport` não
         é importado por nenhum módulo de `camucrm/painel/`."""
-        for arquivo in ("__init__.py", "server.py", "api.py", "views.py"):
+        for arquivo in ("__init__.py", "server.py", "api.py", "views.py", "stream.py"):
             caminho = PAINEL_DIR / arquivo
             with self.subTest(arquivo=arquivo):
                 arvore = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))

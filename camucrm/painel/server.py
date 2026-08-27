@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .. import config
 from ..db import Database
+from .stream import PollerMudanca
 
 logger = logging.getLogger("camucrm.painel")
 
@@ -62,6 +63,22 @@ def get_db() -> Database:
         _db = Database(config.dsn(), max_size=_MAX_SIZE_PAINEL)
         _db.init_pool()
     return _db
+
+
+# Poller único por processo (change `painel-tempo-real`, `stream.py`): todos
+# os geradores SSE de `/api/stream` aguardam o mesmo `PollerMudanca`, nunca
+# criam um consultando o banco por conta própria.
+poller = PollerMudanca(lambda: get_db().token_de_mudanca())
+
+
+@app.on_event("startup")
+async def _iniciar_poller() -> None:
+    poller.iniciar()
+
+
+@app.on_event("shutdown")
+async def _parar_poller() -> None:
+    await poller.parar()
 
 
 def _autorizado(token_recebido: str | None) -> bool:
