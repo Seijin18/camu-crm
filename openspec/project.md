@@ -126,10 +126,21 @@ podem ser exibidos, porque não dependem do eval.
 
 Nesta ordem de dependência:
 
-1. **`ground-truth-marcos`** — as 30 conversas rotuladas (§7). Bloqueia
+1. **`mensagem-sem-texto-preservada`** — sem dependência, sem bloqueio a
+   ninguém. Auditoria pedida pelo usuário antes de operar com petshops e
+   consumidores de verdade encontrou que `audioMessage`, `stickerMessage`,
+   `contactMessage` e `locationMessage`/`liveLocationMessage` são descartados
+   inteiros na recepção (`transport/evolution.py::_texto_da_mensagem`
+   devolve `None`) — nenhuma linha em `mensagens`, `bola_com` não muda. Não
+   é decisão deliberada como a de mídia em `midia-foto-pet`: é o sistema se
+   comportando como se o cliente não tivesse dito nada, o que corrompe
+   silenciosamente a temperatura (§5) de qualquer conversa em que isso
+   acontece. Prioridade alta por ser barato e por já ter acontecido de
+   verdade num teste manual do usuário.
+2. **`ground-truth-marcos`** — as 30 conversas rotuladas (§7). Bloqueia
    qualquer afirmação sobre qualidade de extração, incluindo a tela
    `/funciona` do painel.
-2. **`midia-foto-pet`** — S2 é o estágio-chave e hoje depende de o cliente
+3. **`midia-foto-pet`** — S2 é o estágio-chave e hoje depende de o cliente
    escrever algo junto da foto. Tratar mídia traz retenção e LGPD (§12) junto,
    e por isso é capability própria.
 
