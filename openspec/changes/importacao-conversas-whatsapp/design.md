@@ -1,45 +1,69 @@
 # Design — importação de conversas via exportação do WhatsApp
 
-## Decisão 1: reaproveitar `origem='backfill'`, não criar um terceiro valor
+## Decisão 1: extração usa `origem='live'`, não `'backfill'`
 
-A tentação óbvia é achar que uma conversa importada do `.txt` merece uma
-origem própria (`'importado'`?), já que — diferente do backfill histórico
-original — cada mensagem carrega um timestamp real do WhatsApp, não um
-timestamp inventado. Investigação no código mostra que essa distinção não
-existe onde importa:
+**Revisão de 2026-08-27**: a primeira versão deste `design.md` propunha
+reaproveitar `origem='backfill'` (raciocínio abaixo, riscado, mantido para
+não apagar o porquê da mudança). Releitura mais cuidadosa de `pipeline.py`
+mostrou que a premissa estava errada.
 
-- `extraction/extractor.py::processar_conversa` chama
-  `rules.estagio.recalcular(..., agora=agora, ...)`, e `agora` é o momento
-  em que o processamento roda — **não** o timestamp da mensagem que causou
-  a transição. Isso vale igualmente para o backfill original (que roda em
-  lote, via `trilha()`, que deriva o estágio final a partir dos fatos
-  acumulados) e para esta importação (mesma chamada, mesmo `forcar=True`).
-- `eventos_estagio.em`, portanto, é sempre "quando processamos", nunca
-  "quando aconteceu de verdade" — para as duas origens. A garantia que
-  `metrics.py` já aplica a `origem='backfill'` ("fora de métrica de tempo")
-  é exatamente a garantia certa aqui: se incluíssemos essas conversas em
-  métrica de tempo por estágio, a duração medida seria "tempo até alguém
-  exportar e importar o `.txt`", não "tempo até o cliente responder" —
-  ruído idêntico ao que backfill já existe para excluir.
-- `conversas.ultimo_inbound`/`ultimo_outbound` **não** vêm de
-  `eventos_estagio` — vêm direto de `mensagens.enviada_em` via
-  `db.registrar_mensagem` (`camucrm/db.py:1305`). Como o parser preserva o
-  timestamp real de cada linha do `.txt`, temperatura (§5) e fila (§6)
-  continuam corretas mesmo para conversa importada — não dependem de
-  `origem`.
+~~`extraction/extractor.py::processar_conversa` chama `rules.estagio.
+recalcular(..., agora=agora, ...)`, e `agora` é o momento em que o
+processamento roda — não o timestamp da mensagem que causou a transição.
+Isso vale igualmente para as duas origens.~~ **Falso.** `pipeline.py::
+recalcular` trata as duas origens de forma bem diferente:
 
-Conclusão: criar um terceiro valor de `origem` mudaria uma constraint de
-schema (`CHECK (origem IN ('live', 'backfill'))`, `camucrm/db.py:556`) e um
-enum em `rules/estagio.py` para representar uma distinção que não afeta
-nenhum comportamento — todo o código que lê `origem` já trata os dois casos
-de forma correta e idêntica. É complexidade sem consequência observável,
-exatamente o que `CLAUDE.md` pede pra evitar. Reaproveitar `'backfill'` é o
-desenho certo, não um atalho.
+- **`origem='live'`** (`_avanco_ao_vivo` + `momentos_de_estagio`): cada
+  `eventos_estagio.em` recebe o momento REAL do fato que disparou a
+  transição — `sinais.primeiro_inbound`, `db.fato_registrado_em(...,
+  "foto_pet_recebida")` etc., que por sua vez vêm de `fatos.mensagem_em`
+  (o timestamp da MENSAGEM real, sempre gravado por `extractor.
+  _persistir`/`momento_da_evidencia`, independente de origem). Só cai em
+  `agora` quando não há timestamp de fato disponível.
+- **`origem='backfill'`** (`_trilha_de_backfill`): `momentos = {}` **é
+  fixado vazio de propósito** em `recalcular` — o backfill descarta
+  timestamp real mesmo quando ele existiria, e grava `em=None` sempre. Essa
+  é a causa raiz do "fora de métrica de tempo", não uma limitação técnica
+  inevitável: é uma postura defensiva deliberada, adequada para um dump
+  histórico de origem desconhecida (planilha antiga, export de outro CRM)
+  onde a acurácia por mensagem não é confiável a ponto de virar métrica.
 
-**Se essa premissa mudar** (por exemplo, se `recalcular` passar a aceitar
-timestamp por transição em vez de `agora` — mudança que nenhum change ativo
-propõe hoje), a distinção volta a fazer sentido e merece revisão nova.
-Registrado aqui para não se perder.
+O `.txt` exportado do WhatsApp **não é esse caso**: cada linha carrega
+timestamp real, com precisão de minuto, do próprio WhatsApp — a mesma
+qualidade de dado que uma mensagem chegando ao vivo pelo webhook. Usar
+`origem='backfill'` aqui jogaria fora informação real disponível, e pior:
+excluiria essas conversas de métrica de tempo por estágio **para sempre**,
+mesmo quando elas passam a ser o canal principal de contato com aquele
+cliente (exatamente o cenário que motivou o change — "atualizar conforme o
+que estamos fazendo além do número da Camu").
+
+**Decisão corrigida: `Extrator.processar_conversa(conversa_id)` roda sem
+`forcar`, com `origem='live'` (o padrão do método) — a mesma chamada que a
+rota já existente `POST /conversas/{id}/extrair` (change
+`extracao-em-lote-por-janela`) já faz.** Consequências:
+
+- `eventos_estagio` desta conversa entra em métrica de tempo por estágio
+  normalmente, com timestamp real — correto, porque o dado é real.
+- **Zero rota nova para extração.** A importação chama a rota que já
+  existe; o botão "extrair" do painel, nesta aba nova, é literalmente o
+  mesmo `POST /conversas/{conversa_id}/extrair` que a aba de conversas já
+  usa.
+- **Reimportação incremental funciona de graça.** Se o operador reexportar
+  a mesma conversa do WhatsApp semanas depois (mais mensagens acumuladas) e
+  reimportar, a extração processa só o bloco novo
+  (`conversa.ultima_mensagem_processada_id` como watermark) — o mesmo
+  comportamento que uma conversa alimentada por webhook já tem. Isso não
+  seria verdade com `forcar=True`/`origem='backfill'`: cada reimportação
+  releria a conversa inteira e continuaria gravando timestamp fabricado.
+- Chunking de histórico grande (`TAMANHO_MAXIMO_BLOCO`, §8) é ortogonal a
+  `origem` — continua se aplicando igual, então uma primeira importação
+  com centenas de mensagens é processada em blocos do mesmo jeito que o
+  backfill original processaria.
+
+Consequência prática (revisada): **nenhuma mudança em `camucrm/db.py`
+(schema), `camucrm/rules/`, nem em `camucrm/pipeline.py`.** O trabalho novo
+continua sendo só (1) o parser puro do `.txt`, e (2) a rota de upload — a
+extração reaproveita uma rota que já existe, sem modificação.
 
 ## Decisão 2: parser separado do transporte, sem tocar `camucrm/transport/`
 
@@ -109,13 +133,13 @@ resposta: resumo (mensagens novas, mídia preservada, linhas ignoradas),
           conversa_id (pra habilitar o botão "extrair" no painel)
 
 
-POST /api/importacao-whatsapp/{conversa_id}/extrair   ← passo separado, opcional
+POST /conversas/{conversa_id}/extrair   ← rota JÁ EXISTENTE (change
+                                           `extracao-em-lote-por-janela`),
+                                           reaproveitada sem nenhuma mudança
     ▼
-Extrator(db, criar_llm()).processar_conversa(
-    conversa_id, origem=ORIGEM_BACKFILL, forcar=True
-)   ← mesma chamada que `camucrm backfill --extrair` já faz, escopada a
-      UMA conversa em vez de todas as abertas (`extrair_historico` itera até
-      `limite=1000`; aqui o operador já sabe qual conversa acabou de importar)
+Extrator(db, criar_llm()).processar_conversa(conversa_id)
+    ← origem='live' (padrão), sem forcar — processa só o bloco pendente
+      (tudo, na primeira vez; só o delta numa reimportação depois)
 ```
 
 ## Formato reconhecido do `.txt` (v1)

@@ -1684,6 +1684,157 @@ async function renderizarProspeccao(container) {
   await carregar();
 }
 
+/*
+ * Change `importacao-conversas-whatsapp`: contato que deixou de acontecer
+ * só pelo número da Camu (número pessoal, outro número comercial) entra no
+ * CRM via ".txt" que o próprio WhatsApp exporta ("Exportar conversa").
+ *
+ * Duas chamadas de servidor, nunca uma só:
+ *   1. `POST /importacao-whatsapp` (multipart) — grava as mensagens, nunca
+ *      chama LLM. Devolve `conversa_id` e o resumo do parse.
+ *   2. `POST /conversas/{conversa_id}/extrair` — a rota que JÁ EXISTE
+ *      (change `extracao-em-lote-por-janela`, mesma que o botão "Extrair
+ *      agora" do detalhe de conversa usa) — só depois que o operador
+ *      revisou o resumo e decidiu gastar a chamada de LLM.
+ */
+
+async function renderizarImportarConversaWhatsapp(container) {
+  container.appendChild(el("h2", { texto: "Importar conversa (fora do número Camu)" }));
+  container.appendChild(
+    el("p", {
+      class: "aviso",
+      texto:
+        "No WhatsApp: abra a conversa → ⋮ → Mais → Exportar conversa → " +
+        "\"sem mídia\". Envie o .txt pra você e selecione abaixo. Conversa " +
+        "de grupo não é aceita — só 1:1.",
+    })
+  );
+
+  const campoArquivo = el("input", { type: "file", accept: ".txt,text/plain" });
+
+  const campoTelefone = el("input", {
+    type: "text",
+    placeholder: "telefone do contato (com DDD)",
+  });
+  const campoTipo = el("select");
+  campoTipo.appendChild(el("option", { value: "b2c", texto: "B2C (consumidor)" }));
+  campoTipo.appendChild(el("option", { value: "b2b", texto: "B2B (petshop)" }));
+
+  const campoNomeOperador = el("input", {
+    type: "text",
+    placeholder: "seu nome, exatamente como aparece no arquivo exportado",
+  });
+  campoNomeOperador.value = obterOperador();
+
+  const campoNomeContato = el("input", {
+    type: "text",
+    placeholder: "nome do contato (opcional — senão usa o nome do arquivo)",
+  });
+  const campoOrigem = el("input", {
+    type: "text",
+    placeholder: "origem (opcional — padrão \"whatsapp-manual\")",
+  });
+
+  const botaoImportar = el("button", { texto: "Importar" });
+  const areaResultado = el("div", { class: "prospeccao-resultado" });
+
+  botaoImportar.addEventListener("click", async () => {
+    areaResultado.textContent = "";
+    if (!campoArquivo.files || campoArquivo.files.length === 0) {
+      areaResultado.textContent = "Selecione o .txt exportado primeiro.";
+      return;
+    }
+    if (!campoTelefone.value.trim()) {
+      areaResultado.textContent = "Telefone é obrigatório.";
+      return;
+    }
+    if (!campoNomeOperador.value.trim()) {
+      areaResultado.textContent = "Seu nome (como aparece no arquivo) é obrigatório.";
+      return;
+    }
+    botaoImportar.disabled = true;
+    areaResultado.textContent = "Importando…";
+    try {
+      const form = new FormData();
+      form.append("arquivo", campoArquivo.files[0]);
+      form.append("telefone", campoTelefone.value.trim());
+      form.append("tipo", campoTipo.value);
+      form.append("nome_operador", campoNomeOperador.value.trim());
+      if (campoNomeContato.value.trim()) form.append("nome", campoNomeContato.value.trim());
+      if (campoOrigem.value.trim()) form.append("origem", campoOrigem.value.trim());
+
+      const resposta = await fetch("/api/importacao-whatsapp", {
+        method: "POST",
+        headers: { "X-Camu-Token": obterToken() },
+        body: form,
+      });
+      const dados = await resposta.json();
+      if (!resposta.ok) {
+        throw new Error(dados.erro || `erro HTTP ${resposta.status}`);
+      }
+
+      areaResultado.textContent = "";
+      areaResultado.appendChild(
+        el("p", {
+          texto:
+            `${dados.mensagens_novas} mensagem(ns) nova(s)` +
+            (dados.nome_contato ? ` — contato: ${dados.nome_contato}` : "") +
+            (dados.midia_preservada
+              ? ` — ${dados.midia_preservada} mídia(s) preservada(s)`
+              : ""),
+        })
+      );
+      if (dados.ignoradas && dados.ignoradas.length > 0) {
+        areaResultado.appendChild(
+          el("p", {
+            class: "aviso",
+            texto: `${dados.ignoradas.length} linha(s) não reconhecida(s) do arquivo:`,
+          })
+        );
+        dados.ignoradas.slice(0, 20).forEach((linha) => {
+          areaResultado.appendChild(el("p", { class: "aviso", texto: `  ${linha}` }));
+        });
+      }
+
+      const botaoExtrair = el("button", { class: "secundario", texto: "Extrair agora" });
+      botaoExtrair.addEventListener("click", async () => {
+        botaoExtrair.disabled = true;
+        const rotuloOriginal = botaoExtrair.textContent;
+        botaoExtrair.textContent = "Extraindo (chama o LLM)…";
+        try {
+          await chamarApiEscrever(`/conversas/${dados.conversa_id}/extrair`);
+          botaoExtrair.textContent = "Extraído — ver na aba Conversas";
+        } catch (erro) {
+          areaResultado.appendChild(
+            el("p", { class: "aviso", texto: `Erro na extração: ${erro.message}` })
+          );
+          botaoExtrair.disabled = false;
+          botaoExtrair.textContent = rotuloOriginal;
+        }
+      });
+      areaResultado.appendChild(botaoExtrair);
+
+      const linkConversa = el("a", { texto: "Abrir conversa" });
+      linkConversa.href = `#/conversas/${dados.conversa_id}`;
+      areaResultado.appendChild(document.createTextNode(" "));
+      areaResultado.appendChild(linkConversa);
+    } catch (erro) {
+      areaResultado.textContent = `Erro: ${erro.message}`;
+    } finally {
+      botaoImportar.disabled = false;
+    }
+  });
+
+  container.appendChild(campoArquivo);
+  container.appendChild(campoTelefone);
+  container.appendChild(campoTipo);
+  container.appendChild(campoNomeOperador);
+  container.appendChild(campoNomeContato);
+  container.appendChild(campoOrigem);
+  container.appendChild(botaoImportar);
+  container.appendChild(areaResultado);
+}
+
 // -- Roteador ----------------------------------------------------------------
 
 // Cada render limpa o container e só faz `appendChild` depois de um `await`
@@ -1755,6 +1906,9 @@ async function renderizarRota() {
     } else if (partes[0] === "prospeccao") {
       marcarAbaAtiva("/prospeccao");
       await renderizarProspeccao(conteudo);
+    } else if (partes[0] === "importar-whatsapp") {
+      marcarAbaAtiva("/importar-whatsapp");
+      await renderizarImportarConversaWhatsapp(conteudo);
     } else {
       conteudo.appendChild(el("p", { class: "aviso", texto: "rota desconhecida" }));
     }

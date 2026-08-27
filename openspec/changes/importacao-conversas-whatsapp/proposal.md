@@ -16,26 +16,26 @@ disparar isso pelo painel.
 
 ## Decisão de arquitetura (ver `design.md` para o raciocínio completo)
 
-**Reaproveitar a máquina de backfill inteira, sem tocar em schema nem em
-`rules/`.** `eventos_estagio.em` já é gravado como o momento do
-*processamento* (`agora`), não da mensagem — verdade tanto para o backfill
-original quanto para esta importação, porque as duas rodam pela mesma
-`trilha()` de `rules/estagio.py`, que deriva estágio final a partir dos
-fatos acumulados, não replay mensagem-a-mensagem. Por isso a importação usa
-`origem='backfill'` sem criar um terceiro valor: a garantia que já existe
-("backfill fica fora de métrica de tempo") é exatamente a garantia que esta
-importação precisa, não uma aproximação dela. `conversas.ultimo_inbound`/
-`ultimo_outbound` continuam vindo do timestamp real de cada mensagem
-(`registrar_mensagem`), então temperatura e fila enxergam a data real da
-última troca, não a data do upload.
+**Extração usa `origem='live'`, não `'backfill'` — o `.txt` do WhatsApp
+carrega timestamp real por mensagem, e `pipeline.py` só descarta timestamp
+real (`em=None`, fora de métrica de tempo) para `origem='backfill'`; para
+`'live'`, `eventos_estagio.em` recebe o momento real do fato
+(`fatos.mensagem_em`, já gravado independente de origem). Descartar isso
+para um dado que é real seria perder informação sem necessidade — e
+excluiria pra sempre do §14 exatamente as conversas que motivaram este
+change.** Consequência prática: a extração reaproveita a rota que **já
+existe**, `POST /conversas/{conversa_id}/extrair` (change
+`extracao-em-lote-por-janela`), sem tocar nela — nenhuma rota nova de
+extração, e reimportar a mesma conversa depois processa só o bloco novo
+(mesmo comportamento incremental de uma conversa alimentada por webhook).
 
 Consequência prática: **nenhuma mudança em `camucrm/db.py` (schema),
-`camucrm/rules/`, nem no CHECK de `eventos_estagio.origem`.** O trabalho
-novo é só: (1) um parser puro do `.txt` exportado → mesmo formato de
-`registro` que `importar_conversas` já consome; (2) uma rota no painel que
-faz upload → parse → `importar_conversas` → opcionalmente
-`Extrator.processar_conversa(..., origem=ORIGEM_BACKFILL, forcar=True)` na
-conversa afetada.
+`camucrm/rules/`, nem em `camucrm/pipeline.py`.** O trabalho novo é só:
+(1) um parser puro do `.txt` exportado → mesmo formato de `registro` que
+`importar_conversas` já consome; (2) uma rota no painel que faz upload →
+parse → `backfill.importar_conversas` (reaproveitado sem mudança). A
+extração em si é a rota de extração que já existe, chamada pelo painel
+depois do upload — nenhum código novo para isso.
 
 ## What Changes
 
@@ -57,12 +57,11 @@ conversa afetada.
   upload de CSV de `prospeccao-b2b-shortlist`), monta o `registro` e chama
   `backfill.importar_conversas`. Retorna resumo (mensagens novas, mídia
   preservada, linhas não reconhecidas) — nunca um número só de "sucesso".
-- `POST /api/importacao-whatsapp/{conversa_id}/extrair` (painel): dispara
-  `Extrator.processar_conversa(conversa_id, origem=ORIGEM_BACKFILL,
-  forcar=True)` para a conversa recém-importada — passo separado do
-  upload, mesma divisão que `camucrm backfill --arquivo` / `--extrair` já
-  tem na CLI, porque é a chamada de LLM (pode demorar) e o operador deve
-  poder revisar o resumo da importação antes de gastar uma chamada.
+- Extração continua sendo um passo separado do upload — mas usa a rota que
+  **já existe**, `POST /conversas/{conversa_id}/extrair`, sem nenhuma rota
+  nova: o operador revisa o resumo do parse primeiro (é a chamada de LLM
+  que pode demorar/custar), depois clica "extrair" e o painel chama essa
+  mesma rota, com o `conversa_id` devolvido pela importação.
 - Painel — aba nova "Importar conversa (fora do número Camu)": formulário
   de upload + campos acima, relatório do resultado, botão "extrair" pós-
   importação. Nunca aparece fundida com kanban/fila/conversas.
@@ -78,8 +77,9 @@ conversa afetada.
 - Código alterado: `camucrm/painel/api.py`, `camucrm/painel/views.py`,
   `camucrm/painel/static/*`
 - Código reaproveitado, sem alteração: `camucrm/backfill.py`
-  (`importar_conversas`), `camucrm/extraction/extractor.py` (`Extrator`),
-  `camucrm/rules/estagio.py` (`ORIGEM_BACKFILL`, `trilha`)
+  (`importar_conversas`), rota já existente `POST
+  /conversas/{conversa_id}/extrair` em `camucrm/painel/api.py` (change
+  `extracao-em-lote-por-janela`)
 - Testes novos: `tests/test_whatsapp_export.py` (parser puro, sem DB/LLM),
   extensão de `tests/test_painel_api.py`
 - Bloqueado por: nenhum

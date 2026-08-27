@@ -14,6 +14,7 @@ from __future__ import annotations
 import shlex
 from typing import Any, Iterable
 
+from ..backfill import ResumoBackfill
 from ..db import (
     ContatoResumido,
     Conversa,
@@ -35,6 +36,7 @@ from ..evaluation.runner import META_FALSOS_POSITIVOS, META_FATOS, META_OBJECAO,
 from ..pipeline import EstadoConversa
 from ..rules.estagio import ORIGEM_BACKFILL
 from ..rules.fila import ItemFila
+from ..whatsapp_export import ParseResultado
 from ..taxonomia import (
     ESTAGIOS_MANUAIS,
     ESTAGIOS_POR_FUNIL,
@@ -815,4 +817,30 @@ def prospeccao_para_json(
         "conversa_id": registro.conversa_id,
         "mensagem": mensagem,
         "link_whatsapp": link,
+    }
+
+
+# --------------------------------------------------------------------------
+# Importação de conversa via exportação do WhatsApp (change
+# `importacao-conversas-whatsapp`) — resumo de `POST /importacao-whatsapp`.
+# --------------------------------------------------------------------------
+
+
+def resumo_importacao_whatsapp_para_json(
+    resumo: ResumoBackfill, parse_resultado: ParseResultado, conversa_id: int
+) -> dict[str, Any]:
+    """Payload de `POST /importacao-whatsapp` — nunca só um número de
+    sucesso: mensagens novas, mídia preservada e linhas não reconhecidas do
+    `.txt` sempre juntas (requirement "Linha não reconhecida é reportada,
+    nunca descartada em silêncio"). `conversa_id` habilita o botão
+    "extrair" do painel, que chama a rota já existente `POST
+    /conversas/{conversa_id}/extrair` — nenhum campo aqui promete extração,
+    só importação de mensagem.
+    """
+    return {
+        "conversa_id": conversa_id,
+        "nome_contato": parse_resultado.nome_contato,
+        "mensagens_novas": resumo.mensagens,
+        "midia_preservada": parse_resultado.midia_preservada,
+        "ignoradas": list(parse_resultado.ignoradas),
     }

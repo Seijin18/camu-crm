@@ -42,11 +42,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, UploadFile
+from fastapi import APIRouter, Depends, Form, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .. import acoes, config, metrics, summaries
+from ..backfill import importar_conversas
 from ..db import Database
 from ..drafts import PROMPT_VERSAO, RascunhoInvalidoError
 from ..drafts import gerar as gerar_rascunho
@@ -57,6 +58,11 @@ from ..llm import LlmIndisponivelError, criar_llm
 from ..pipeline import recalcular
 from ..rules.fila import Candidato, montar_fila
 from ..taxonomia import B2B, B2C, FUNIS
+from ..whatsapp_export import (
+    ExportacaoDeGrupoError,
+    NomeOperadorNaoEncontradoError,
+)
+from ..whatsapp_export import parse as parse_whatsapp_export
 from . import server, views
 from .server import exigir_token
 from .stream import gerador_sse
@@ -807,6 +813,93 @@ def abrir_prospeccao(
     outra aba antes desta chamada acontecer (front-end)."""
     db.marcar_prospeccao_aberta(prospeccao_id, por=corpo.por)
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Importação de conversa via exportação do WhatsApp (change
+# `importacao-conversas-whatsapp`) — parte do contato deixou de acontecer
+# só pelo número da Camu (a única porta de entrada automática, via
+# `camucrm/webhook.py`); esta rota é o lado de importação do `.txt` que o
+# próprio WhatsApp exporta ("Exportar conversa").
+#
+# Parse em memória (`whatsapp_export.parse`, sem I/O), nunca grava o
+# arquivo bruto em disco — mesmo padrão do upload de CSV de prospecção
+# acima. `backfill.importar_conversas` é reaproveitado sem nenhuma
+# alteração para gravar as mensagens.
+#
+# Extração é passo separado desta rota, de propósito: o operador revisa o
+# resumo do parse primeiro (mídia preservada, linhas não reconhecidas)
+# antes de gastar uma chamada de LLM. O front chama a rota que JÁ EXISTE,
+# `POST /conversas/{conversa_id}/extrair` (change
+# `extracao-em-lote-por-janela`, acima) — nenhuma rota nova para isso, e a
+# extração roda com `origem='live'` (o padrão do método, sem `forcar`),
+# não `'backfill'`: o `.txt` carrega timestamp real por mensagem, e só
+# `origem='backfill'` descarta isso (`design.md` do change, Decisão 1) —
+# usar `'live'` é o que deixa estas conversas entrarem em métrica de tempo
+# por estágio como qualquer outra.
+# --------------------------------------------------------------------------
+
+
+@router.post("/importacao-whatsapp")
+def importar_conversa_whatsapp(
+    arquivo: UploadFile,
+    telefone: str = Form(...),
+    tipo: str = Form(...),
+    nome_operador: str = Form(...),
+    nome: str | None = Form(None),
+    origem: str | None = Form(None),
+    db: Database = Depends(_db),
+):
+    """Upload do `.txt` exportado do WhatsApp — parse, depois
+    `backfill.importar_conversas`. `nome_operador` é o nome que aparece no
+    export do lado de quem responde pela Camu (decide direção por
+    correspondência de nome — `whatsapp_export.parse`, obrigatório, sem
+    fallback silencioso). `tipo` precisa ser `b2b`/`b2c` explícito: erro de
+    digitação num campo preenchido à mão não deve virar B2C por padrão em
+    silêncio, diferente do dump JSON de `camucrm backfill`.
+    """
+    telefone_normalizado = (telefone or "").strip()
+    if not telefone_normalizado:
+        return JSONResponse(
+            status_code=422, content=views.erro("telefone é obrigatório", None)
+        )
+    tipo_normalizado = (tipo or "").strip().lower()
+    if tipo_normalizado not in (B2B, B2C):
+        return JSONResponse(
+            status_code=422,
+            content=views.erro(f"tipo inválido: {tipo!r} (use 'b2b' ou 'b2c')", None),
+        )
+
+    bruto = arquivo.file.read().decode("utf-8-sig")
+    try:
+        resultado = parse_whatsapp_export(bruto, nosso_nome=nome_operador)
+    except (ExportacaoDeGrupoError, NomeOperadorNaoEncontradoError) as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), None))
+
+    nome_final = (nome or resultado.nome_contato or "").strip() or None
+    origem_final = (origem or "").strip() or "whatsapp-manual"
+    registro = {
+        "telefone": telefone_normalizado,
+        "nome": nome_final,
+        "tipo": tipo_normalizado,
+        "origem": origem_final,
+        "mensagens": resultado.mensagens,
+    }
+    resumo = importar_conversas(db, [registro])
+
+    # Mesmas chamadas que `importar_conversas` já fez internamente —
+    # idempotentes (`upsert_contato`/`get_or_create_conversa`), só para
+    # obter o `conversa_id` que a função não devolve (contrato dela não
+    # muda por causa desta rota).
+    contato = db.upsert_contato(
+        telefone_normalizado,
+        nome=nome_final,
+        tipo=tipo_normalizado,
+        origem=origem_final,
+    )
+    conversa = db.get_or_create_conversa(contato.id, funil=tipo_normalizado)
+
+    return views.resumo_importacao_whatsapp_para_json(resumo, resultado, conversa.id)
 
 
 # --------------------------------------------------------------------------

@@ -70,20 +70,32 @@ erro explícito — nunca importado parcialmente.
 - **THEN** a importação é recusada com erro explícito, e nenhuma mensagem
   desse arquivo é gravada
 
-### Requirement: Importação reaproveita `origem='backfill'`, sem novo valor de schema
+### Requirement: Extração usa `origem='live'`, com timestamp real por transição
 
-Toda conversa importada por este caminho DEVE gerar `eventos_estagio` com
-`origem='backfill'` — a mesma origem e a mesma exclusão de métrica de tempo
-que o backfill de dump JSON já tem, sem introduzir um terceiro valor no
-CHECK de `eventos_estagio.origem`.
+A extração de uma conversa importada por este caminho DEVE rodar com
+`origem='live'` (o padrão de `Extrator.processar_conversa`, sem `forcar`),
+reaproveitando a rota já existente `POST /conversas/{conversa_id}/extrair`
+— nunca `origem='backfill'`. O `.txt` exportado carrega timestamp real por
+mensagem; descartar isso excluiria essas conversas de métrica de tempo por
+estágio permanentemente, o que não reflete a natureza do dado.
 
-#### Scenario: Métrica de tempo por estágio ignora conversa importada
+#### Scenario: Conversa importada entra em métrica de tempo por estágio
 
-- **WHEN** uma conversa é importada por este caminho e extraída
-  (`origem=ORIGEM_BACKFILL`)
-- **THEN** os eventos de estágio dessa conversa não entram no cálculo de
-  duração média por estágio de `metrics.py`, do mesmo jeito que eventos de
-  backfill de dump JSON já não entram
+- **WHEN** uma conversa é importada por este caminho e depois extraída
+  (via `POST /conversas/{conversa_id}/extrair`)
+- **THEN** os eventos de estágio dessa conversa entram no cálculo de
+  duração média por estágio de `metrics.py`, do mesmo jeito que qualquer
+  outra conversa `origem='live'`
+
+#### Scenario: Reimportação processa só o bloco novo
+
+- **WHEN** a mesma conversa é reexportada do WhatsApp (com mensagens novas
+  desde a última importação) e reimportada, e a extração é disparada de
+  novo
+- **THEN** só as mensagens novas (posteriores a
+  `conversa.ultima_mensagem_processada_id`) são processadas pelo LLM — a
+  mesma extração incremental que uma conversa alimentada por webhook já
+  tem
 
 ### Requirement: Upload não persiste o arquivo bruto em disco
 

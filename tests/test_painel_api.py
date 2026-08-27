@@ -6,11 +6,13 @@ import ast
 import json
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from camucrm import metrics
 from camucrm.llm import FakeLlm
 from camucrm.painel import api, server
 from tests.fakes import FakeDatabase
@@ -985,6 +987,161 @@ class TesteProspeccaoNuncaAparecEmTelasDeConversa(unittest.TestCase):
 
         funciona = self.cliente.get("/api/o-que-funciona").json()
         self.assertEqual(funciona["funil"]["onde_morrem"]["n"], 0)
+
+
+class TesteRotaDeImportacaoWhatsapp(unittest.TestCase):
+    """Change `importacao-conversas-whatsapp`: upload do `.txt` exportado
+    pelo próprio WhatsApp — parse em memória + `backfill.
+    importar_conversas` reaproveitado. Extração continua sendo a rota que
+    já existe (`TesteRotaDeExtracaoManual` acima), nunca uma rota nova."""
+
+    def setUp(self):
+        self.cliente = TestClient(server.app)
+        contexto = patch.dict("os.environ", {}, clear=False)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        os.environ.pop(server.ENV_TOKEN, None)
+        self.fake = FakeDatabase()
+        patcher = patch.object(server, "get_db", return_value=self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _upload(self, texto: str, **campos):
+        dados = {
+            "telefone": "5512999990099",
+            "tipo": "b2c",
+            "nome_operador": "Camu",
+            **campos,
+        }
+        return self.cliente.post(
+            "/api/importacao-whatsapp",
+            files={"arquivo": ("conversa.txt", texto.encode("utf-8"), "text/plain")},
+            data=dados,
+        )
+
+    def test_upload_feliz_cria_mensagens_e_devolve_resumo(self):
+        texto = (
+            "17/03/24, 14:32 - Ana Petshop: oi, vocês fazem porta-chaves?\n"
+            "17/03/24, 14:35 - Camu: fazemos sim! manda a foto do pet\n"
+            "17/03/24, 14:36 - Ana Petshop: <Mídia oculta>\n"
+            "17/03/24, 14:37 - alguma coisa sem remetente reconhecido"
+        )
+        resposta = self._upload(texto)
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertIn("conversa_id", corpo)
+        self.assertEqual(corpo["nome_contato"], "Ana Petshop")
+        self.assertEqual(corpo["mensagens_novas"], 3)
+        self.assertEqual(corpo["midia_preservada"], 1)
+        self.assertEqual(len(corpo["ignoradas"]), 1)
+
+        conversa_id = corpo["conversa_id"]
+        mensagens = self.fake.listar_mensagens(conversa_id)
+        self.assertEqual(len(mensagens), 3)
+
+    def test_reimportar_mesmo_arquivo_nao_duplica(self):
+        texto = "17/03/24, 14:32 - Ana Petshop: oi\n17/03/24, 14:35 - Camu: oi"
+        primeira = self._upload(texto).json()
+        segunda = self._upload(texto).json()
+        self.assertEqual(primeira["conversa_id"], segunda["conversa_id"])
+        self.assertEqual(segunda["mensagens_novas"], 0)
+        mensagens = self.fake.listar_mensagens(primeira["conversa_id"])
+        self.assertEqual(len(mensagens), 2)
+
+    def test_grupo_retorna_422_sem_gravar_nada(self):
+        texto = (
+            "17/03/24, 14:32 - Ana: oi\n"
+            "17/03/24, 14:33 - Bruno: fala\n"
+            "17/03/24, 14:34 - Camu: oi pessoal"
+        )
+        resposta = self._upload(texto)
+        self.assertEqual(resposta.status_code, 422)
+        self.assertIn("erro", resposta.json())
+        self.assertEqual(self.fake.contatos, {})
+        self.assertEqual(self.fake.mensagens, {})
+
+    def test_nome_operador_sem_correspondencia_retorna_422_sem_gravar_nada(self):
+        texto = "17/03/24, 14:32 - Ana Petshop: oi"
+        resposta = self._upload(texto, nome_operador="Ninguém Com Esse Nome")
+        self.assertEqual(resposta.status_code, 422)
+        self.assertEqual(self.fake.contatos, {})
+        self.assertEqual(self.fake.mensagens, {})
+
+    def test_tipo_invalido_retorna_422(self):
+        resposta = self._upload("17/03/24, 14:32 - Ana: oi", tipo="pessoa-fisica")
+        self.assertEqual(resposta.status_code, 422)
+        self.assertEqual(self.fake.contatos, {})
+
+    def test_telefone_vazio_retorna_422(self):
+        resposta = self._upload("17/03/24, 14:32 - Ana: oi", telefone="   ")
+        self.assertEqual(resposta.status_code, 422)
+        self.assertEqual(self.fake.contatos, {})
+
+    def test_upload_sozinho_nao_chama_llm(self):
+        """Upload só grava mensagem — extração é passo separado (a rota já
+        existente `POST /conversas/{id}/extrair`, `TesteRotaDeExtracaoManual`
+        acima). Nenhuma chamada a `criar_llm` acontece nesta rota."""
+        texto = "17/03/24, 14:32 - Ana Petshop: oi\n17/03/24, 14:35 - Camu: oi"
+        with patch.object(api, "criar_llm") as llm_mock:
+            resposta = self._upload(texto)
+        self.assertEqual(resposta.status_code, 200)
+        llm_mock.assert_not_called()
+
+    def test_extracao_da_conversa_importada_entra_em_metrica_de_tempo(self):
+        """Requirement "Extração usa origem='live', com timestamp real por
+        transição" (`design.md`, Decisão 1 revisada): nunca
+        `origem='backfill'` aqui, então o evento fica de pé em
+        `metrics.tempo_por_estagio` como qualquer conversa ao vivo — a rota
+        de extração é a que já existe, sem nenhuma mudança nela."""
+        # Datas relativas a "agora", não fixas: §3 deriva SX (perdido) para
+        # B2C sem resposta há >=14 dias (DIAS_ATE_PERDIDO_B2C) — uma data
+        # fixa antiga faria o teste depender de quando ele roda.
+        ontem = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%d/%m/%y")
+        texto = (
+            f"{ontem}, 08:00 - Ana Petshop: oi, tudo bem?\n"
+            f"{ontem}, 08:05 - Camu: tudo, manda a foto do pet\n"
+            f"{ontem}, 09:00 - Ana Petshop: aqui esta a foto do meu pet"
+        )
+        conversa_id = self._upload(texto).json()["conversa_id"]
+
+        resposta_llm = json.dumps({
+            "foto_pet_recebida": True,
+            "objecao": None,
+            "evidencias": {"foto_pet_recebida": "aqui esta a foto do meu pet"},
+        })
+        with patch.object(api, "criar_llm", return_value=FakeLlm([resposta_llm])):
+            extracao = self.cliente.post(f"/api/conversas/{conversa_id}/extrair")
+        self.assertEqual(extracao.status_code, 200)
+        self.assertEqual(extracao.json()["card"]["estagio"], "S2")
+
+        eventos = [e for e in self.fake.eventos if e["conversa_id"] == conversa_id]
+        self.assertTrue(eventos)
+        for evento in eventos:
+            self.assertEqual(evento["origem"], "live")
+
+        linhas = {t.estagio: t for t in metrics.tempo_por_estagio(self.fake)}
+        self.assertIn("S1", linhas)
+        self.assertGreaterEqual(linhas["S1"].conversas, 1)
+
+    def test_rota_de_importacao_nao_escreve_arquivo_em_disco(self):
+        """Requirement "Upload não persiste o arquivo bruto em disco" —
+        verificação estrutural por AST (mesmo padrão de
+        `test_nenhum_modulo_do_painel_importa_transport`): a função da rota
+        nunca chama `open(...)` nem `Path(...).write_*`."""
+        caminho = Path(api.__file__)
+        arvore = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        funcao = next(
+            no
+            for no in ast.walk(arvore)
+            if isinstance(no, ast.FunctionDef) and no.name == "importar_conversa_whatsapp"
+        )
+        for no in ast.walk(funcao):
+            if isinstance(no, ast.Call):
+                alvo = no.func
+                if isinstance(alvo, ast.Name):
+                    self.assertNotEqual(alvo.id, "open")
+                if isinstance(alvo, ast.Attribute):
+                    self.assertNotIn(alvo.attr, {"write_bytes", "write_text", "write"})
 
 
 if __name__ == "__main__":
