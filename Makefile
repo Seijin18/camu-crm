@@ -1,10 +1,19 @@
-.PHONY: help db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint painel servir acompanhar
+.PHONY: help up down status db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint painel servir acompanhar
 
 PY = ./.venv/bin/python
 COMPOSE = docker compose
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
+
+up:  ## sobe o sistema inteiro (banco, transporte, receptor, painel)
+	./start.sh
+
+down:  ## para receptor e painel
+	./stop.sh
+
+status:  ## mostra o que está no ar
+	./status.sh
 
 db-up:  ## sobe o Postgres
 	$(COMPOSE) up -d db

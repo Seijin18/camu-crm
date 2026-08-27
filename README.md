@@ -18,10 +18,32 @@ reinterpretar conversa antiga.
 ## Começar
 
 ```bash
-make db-up && make init
 cp .env.example .env   # defina CAMU_TELEFONE_SALT e GEMINI_API_KEY
-make fila
+./start.sh
 ```
+
+`start.sh` sobe tudo na ordem de dependência e verifica cada etapa em vez de
+assumi-la: Postgres, schema, o banco da Evolution, a Evolution API, o
+pareamento do chip, para onde o webhook aponta, o receptor e o painel. É
+idempotente — rodar duas vezes não duplica processo.
+
+Se alguma peça faltar, ele diz qual e sai com código 2. Subir metade do
+sistema em silêncio é pior que não subir nada, porque a fila parece vazia em
+vez de parecer quebrada.
+
+| Script | O que faz |
+|---|---|
+| `./start.sh` | Sobe tudo (`--sem-painel` para servidor sem UI) |
+| `./stop.sh` | Para receptor e painel; preserva banco e pareamento |
+| `./status.sh` | Uma tela dizendo o que está no ar e o que falta |
+| `./scripts/parear.py` | Página local com o QR, renovado sozinho |
+| `./scripts/apontar_webhook.sh` | Aponta o webhook da Evolution para o CRM |
+
+Os mesmos comandos estão no Makefile: `make up`, `make down`, `make status`.
+
+`stop.sh` não derruba a Evolution de propósito: ela segura o pareamento do
+chip, e §11 já avisa que essa é a parte frágil. Derrubá-la a cada parada do
+CRM significaria repareamento frequente.
 
 ## Comandos
 
