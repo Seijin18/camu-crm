@@ -1710,30 +1710,54 @@ async function renderizarImportarConversaWhatsapp(container) {
     })
   );
 
+  // Mesmo padrão visual de `.gt-form` (formulário de ground truth) — linhas
+  // empilhadas, cada uma com `<label>` própria e input em largura cheia, em
+  // vez de espremer tudo numa única linha (`.filtros`, feito para campo
+  // curto de filtro, não para um formulário de upload).
+  const form = el("div", { class: "gt-form" });
+
   const campoArquivo = el("input", { type: "file", accept: ".txt,text/plain" });
+  form.appendChild(
+    el("div", {}, [el("label", { texto: "Arquivo (.txt exportado):" }), campoArquivo])
+  );
 
   const campoTelefone = el("input", {
     type: "text",
-    placeholder: "telefone do contato (com DDD)",
+    placeholder: "com DDD, ex.: 12988887777",
   });
+  form.appendChild(
+    el("div", {}, [el("label", { texto: "Telefone do contato:" }), campoTelefone])
+  );
+
   const campoTipo = el("select");
   campoTipo.appendChild(el("option", { value: "b2c", texto: "B2C (consumidor)" }));
   campoTipo.appendChild(el("option", { value: "b2b", texto: "B2B (petshop)" }));
+  form.appendChild(el("div", {}, [el("label", { texto: "Tipo:" }), campoTipo]));
 
   const campoNomeOperador = el("input", {
     type: "text",
-    placeholder: "seu nome, exatamente como aparece no arquivo exportado",
+    placeholder: "ex.: Camu",
   });
   campoNomeOperador.value = obterOperador();
+  form.appendChild(
+    el("div", {}, [
+      el("label", { texto: "Seu nome, exatamente como aparece no arquivo exportado:" }),
+      campoNomeOperador,
+    ])
+  );
 
-  const campoNomeContato = el("input", {
-    type: "text",
-    placeholder: "nome do contato (opcional — senão usa o nome do arquivo)",
-  });
-  const campoOrigem = el("input", {
-    type: "text",
-    placeholder: "origem (opcional — padrão \"whatsapp-manual\")",
-  });
+  const campoNomeContato = el("input", { type: "text" });
+  form.appendChild(
+    el("div", {}, [
+      el("label", { texto: "Nome do contato (opcional — senão usa o do arquivo):" }),
+      campoNomeContato,
+    ])
+  );
+
+  const campoOrigem = el("input", { type: "text", placeholder: "whatsapp-manual" });
+  form.appendChild(
+    el("div", {}, [el("label", { texto: "Origem (opcional):" }), campoOrigem])
+  );
 
   const botaoImportar = el("button", { texto: "Importar" });
   const areaResultado = el("div", { class: "prospeccao-resultado" });
@@ -1825,13 +1849,8 @@ async function renderizarImportarConversaWhatsapp(container) {
     }
   });
 
-  container.appendChild(campoArquivo);
-  container.appendChild(campoTelefone);
-  container.appendChild(campoTipo);
-  container.appendChild(campoNomeOperador);
-  container.appendChild(campoNomeContato);
-  container.appendChild(campoOrigem);
-  container.appendChild(botaoImportar);
+  form.appendChild(botaoImportar);
+  container.appendChild(form);
   container.appendChild(areaResultado);
 }
 
