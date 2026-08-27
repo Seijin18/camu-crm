@@ -344,6 +344,10 @@ class ContatoTesteBody(BaseModel):
     por: str | None = None
 
 
+class DesconsiderarRecusaBody(BaseModel):
+    por: str | None = None
+
+
 @router.post("/conversas/{conversa_id}/marcos")
 def marcar_marco(conversa_id: int, corpo: MarcoBody, db: Database = Depends(_db)):
     """Drop numa coluna de marco do kanban (S6/SX/P5/P6/PX).
@@ -398,6 +402,28 @@ def marcar_contato_teste(
     except ValueError as exc:
         return JSONResponse(status_code=422, content=views.erro(str(exc), None))
     return {"ok": True, "contato_id": conversa.contato_id, "e_teste": corpo.e_teste}
+
+
+@router.post("/conversas/{conversa_id}/desconsiderar-recusa")
+def desconsiderar_recusa(
+    conversa_id: int, corpo: DesconsiderarRecusaBody, db: Database = Depends(_db)
+):
+    """Botão "desconsiderar recusa explícita (falso positivo)" no detalhe da
+    conversa (design.md, change `estagio-reabertura-manual-e-relogio`).
+
+    Delega inteiro a `acoes.desconsiderar_recusa` — mesma função que
+    `cli.cmd_desconsiderar_recusa` chama, para os dois caminhos nunca
+    produzirem estados diferentes. O fato `recusa_explicita` em `fatos`
+    nunca é tocado; só a interpretação da regra de estágio muda, registrada
+    em `correcoes` com `por` obrigatório.
+    """
+    try:
+        estado = acoes.desconsiderar_recusa(db, conversa_id, por=corpo.por)
+    except acoes.AcaoInvalidaError as exc:
+        regra = getattr(exc, "regra", None)
+        return JSONResponse(status_code=422, content=views.erro(str(exc), regra))
+    conversa = db.get_conversa(conversa_id)
+    return {"ok": True, "card": views.card_conversa(conversa, estado)}
 
 
 @router.post("/conversas/{conversa_id}/correcoes")

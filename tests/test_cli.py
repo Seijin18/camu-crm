@@ -156,5 +156,40 @@ class TesteReprocessarFalhas(unittest.TestCase):
         self.assertEqual(registro.tentativas, 1)
 
 
+class TesteCmdDesconsiderarRecusa(unittest.TestCase):
+    """`camucrm desconsiderar-recusa` (change
+    `estagio-reabertura-manual-e-relogio`, design.md — comando dedicado, não
+    reaproveita `camucrm corrigir`)."""
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        contexto = patch.object(cli, "_db", return_value=self.db)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+
+    def test_exige_por(self):
+        conversa = self.db.criar_conversa(funil="b2c", estagio="SX")
+        self.db.fatos.append((conversa.id, "recusa_explicita", "não quero", None, None))
+        with patch.object(cli.config, "operador", return_value=""):
+            with self.assertRaises(SystemExit):
+                _rodar(["desconsiderar-recusa", str(conversa.id)])
+
+    def test_desconsidera_e_grava_correcao(self):
+        conversa = self.db.criar_conversa(funil="b2c", estagio="SX")
+        self.db.fatos.append((conversa.id, "recusa_explicita", "não quero", None, None))
+        codigo = _rodar(
+            ["desconsiderar-recusa", str(conversa.id), "--por", "marcos"]
+        )
+        self.assertEqual(codigo, 0)
+        self.assertTrue(self.db.recusa_desconsiderada(conversa.id))
+        # O fato original continua íntegro (design.md).
+        self.assertTrue(self.db.fatos_da_conversa(conversa.id).get("recusa_explicita"))
+
+    def test_conversa_sem_recusa_sai_com_erro(self):
+        conversa = self.db.criar_conversa(funil="b2c", estagio="S2")
+        with self.assertRaises(SystemExit):
+            _rodar(["desconsiderar-recusa", str(conversa.id), "--por", "marcos"])
+
+
 if __name__ == "__main__":
     unittest.main()

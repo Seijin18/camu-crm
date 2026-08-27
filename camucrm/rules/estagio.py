@@ -21,6 +21,8 @@ from ..taxonomia import (
     B2B,
     B2C,
     funil_do_estagio,
+    CAUSADA_POR_CAMU,
+    CAUSADA_POR_CLIENTE,
     DIAS_ATE_PERDIDO_B2C,
     ESTAGIO_TERMINAL_B2B,
     ESTAGIO_TERMINAL_B2C,
@@ -42,10 +44,19 @@ class Derivacao:
     O motivo não é enfeite: §5 exige que a classificação seja auditável, e a
     mesma exigência vale aqui — quando o Marcos discordar do estágio, ele
     precisa ver qual campo disparou, não reconstruir a regra de cabeça.
+
+    `causada_por` (change `estagio-reabertura-manual-e-relogio`, design.md):
+    formaliza o mapa que já era implícito nas condições abaixo — se quem
+    produziu o avanço foi o CLIENTE (respondeu, mandou foto, autorizou,
+    pagou) ou a própria CAMU (mandou prévia, apresentou preço, entregou
+    proposta B2B sem resposta ainda). `rules/temperatura.py::classificar`
+    consulta este campo para não confundir atividade nossa com reciprocidade
+    do cliente (§5) — nenhuma segunda implementação da mesma regra.
     """
 
     estagio: str
     motivo: str
+    causada_por: str = CAUSADA_POR_CLIENTE
 
     def __str__(self) -> str:
         return f"{self.estagio} ({self.motivo})"
@@ -59,6 +70,7 @@ class Transicao:
     para: str
     motivo: str
     origem: str = ORIGEM_LIVE
+    causada_por: str = CAUSADA_POR_CLIENTE
 
 
 def derive(fatos: Mapping[str, bool], sinais: SinaisConversa) -> Derivacao:
@@ -79,7 +91,12 @@ def _derive_b2c(fatos: Mapping[str, bool], sinais: SinaisConversa) -> Derivacao:
     if sinais.ganho:
         return Derivacao("S6", "ganho manual (pagamento confirmado)")
 
-    if fatos.get("recusa_explicita"):
+    # Change `estagio-reabertura-manual-e-relogio`, design.md: uma
+    # desconsideração ativa (registrada em `correcoes`, nunca apagando o
+    # fato) faz a derivação pular esta condição, caindo para o que os
+    # demais fatos sustentam — é o que permite reabrir um falso positivo
+    # de extração sem jamais reescrever `fatos.recusa_explicita`.
+    if fatos.get("recusa_explicita") and not sinais.recusa_desconsiderada:
         return Derivacao(ESTAGIO_TERMINAL_B2C, "recusa_explicita")
     dias = sinais.dias_sem_resposta
     if dias is not None and dias >= DIAS_ATE_PERDIDO_B2C:
@@ -92,9 +109,11 @@ def _derive_b2c(fatos: Mapping[str, bool], sinais: SinaisConversa) -> Derivacao:
     if fatos.get("preco_apresentado") and sinais.inbound_apos_preco:
         return Derivacao("S5", "respondeu ao preço sem recusar")
     if fatos.get("preco_apresentado"):
-        return Derivacao("S4", "preco_apresentado")
+        # Camu que apresentou o preço, sem resposta ainda — não é
+        # reciprocidade do cliente (§5), ver `Derivacao.causada_por`.
+        return Derivacao("S4", "preco_apresentado", causada_por=CAUSADA_POR_CAMU)
     if fatos.get("previa_enviada"):
-        return Derivacao("S3", "previa_enviada")
+        return Derivacao("S3", "previa_enviada", causada_por=CAUSADA_POR_CAMU)
     # S2 é o estágio-chave (§3): quem manda a foto do pet já se comprometeu.
     if fatos.get("foto_pet_recebida"):
         return Derivacao("S2", "foto_pet_recebida")
@@ -111,7 +130,9 @@ def _derive_b2b(fatos: Mapping[str, bool], sinais: SinaisConversa) -> Derivacao:
     if sinais.consignacao_assinada:
         return Derivacao("P5", "consignação assinada (manual)")
 
-    if fatos.get("recusa_explicita"):
+    # Ver comentário equivalente em `_derive_b2c`: desconsideração ativa
+    # pula esta condição sem tocar no fato.
+    if fatos.get("recusa_explicita") and not sinais.recusa_desconsiderada:
         return Derivacao(ESTAGIO_TERMINAL_B2B, "recusa_explicita")
     if sinais.followups_sem_retorno >= MAX_FOLLOWUPS:
         return Derivacao(
@@ -121,11 +142,15 @@ def _derive_b2b(fatos: Mapping[str, bool], sinais: SinaisConversa) -> Derivacao:
     if fatos.get("visita_aceita"):
         return Derivacao("P4", "visita_aceita")
     if sinais.proposta_apresentada:
-        return Derivacao("P3", "msg 2 entregue após autorização")
+        # Msg 2 entregue pela Camu, ainda sem resposta do lojista.
+        return Derivacao(
+            "P3", "msg 2 entregue após autorização", causada_por=CAUSADA_POR_CAMU
+        )
     if fatos.get("autorizou_envio_material"):
         return Derivacao("P2", "autorizou_envio_material")
     if sinais.total_outbound >= 1:
-        return Derivacao("P1", "msg 1 enviada")
+        # Msg 1 é a Camu abordando — nenhuma resposta do lojista ainda.
+        return Derivacao("P1", "msg 1 enviada", causada_por=CAUSADA_POR_CAMU)
     return Derivacao("P0", "na shortlist, não abordado")
 
 
@@ -156,7 +181,7 @@ def transicao(
         return None
 
     if estagio_atual is None:
-        return Transicao(None, novo, derivacao.motivo, origem)
+        return Transicao(None, novo, derivacao.motivo, origem, derivacao.causada_por)
 
     # Ganho/consignação/reposição reabrem uma conversa dada como encerrada:
     # o cliente que voltou e pagou não fica "perdido" no histórico.
@@ -164,16 +189,22 @@ def transicao(
         if is_terminal(novo):
             return None
         if _e_marco_manual(novo):
-            return Transicao(estagio_atual, novo, derivacao.motivo, origem)
+            return Transicao(
+                estagio_atual, novo, derivacao.motivo, origem, derivacao.causada_por
+            )
         return None
 
     if is_terminal(novo):
-        return Transicao(estagio_atual, novo, derivacao.motivo, origem)
+        return Transicao(
+            estagio_atual, novo, derivacao.motivo, origem, derivacao.causada_por
+        )
 
     if rank_estagio(novo) <= rank_estagio(estagio_atual):
         return None
 
-    return Transicao(estagio_atual, novo, derivacao.motivo, origem)
+    return Transicao(
+        estagio_atual, novo, derivacao.motivo, origem, derivacao.causada_por
+    )
 
 
 def _e_marco_manual(estagio: str) -> bool:
@@ -182,27 +213,47 @@ def _e_marco_manual(estagio: str) -> bool:
     return estagio in ESTAGIOS_MANUAIS
 
 
-def reabrir(estagio_terminal: str, estagio_maximo_alcancado: str | None) -> Transicao | None:
-    """Reabre uma conversa que fechou por silêncio e voltou a falar.
+def reabrir(
+    estagio_terminal: str,
+    estagio_maximo_alcancado: str | None,
+    *,
+    recusa_explicita: bool = False,
+    recusa_desconsiderada: bool = False,
+) -> Transicao | None:
+    """Reabre uma conversa que fechou por silêncio (ou por recusa
+    desconsiderada) e voltou a falar.
 
     Chamada explicitamente quando chega um inbound numa conversa terminal.
     Volta ao **maior estágio já alcançado**, não a S1: o cliente que mandou a
     foto, sumiu 14 dias e voltou continua sendo alguém que mandou a foto —
     tratá-lo como lead novo apagaria o compromisso que ele já tinha assumido.
 
-    Só vale para fechamento por timeout. Recusa explícita é fechamento duro e
-    não é reaberta por esta função — quem quiser reabrir uma recusa registra
-    o marco manual, deixando rastro de quem decidiu.
+    Vale para fechamento por timeout (`recusa_explicita=False`, o padrão) OU
+    para uma recusa explícita que um operador já desconsiderou
+    (`recusa_explicita=True, recusa_desconsiderada=True`) — change
+    `estagio-reabertura-manual-e-relogio`, exceção explícita e auditada ao
+    invariante #2/§3 do CLAUDE.md ("estágio nunca regride"), nunca uma
+    reabertura automática.
+
+    A checagem é feita AQUI, não só pelo chamador (design.md: "reabrir()
+    valida a checagem sozinha, não confia no chamador") — uma recusa
+    explícita sem desconsideração ativa nunca reabre, mesmo que quem chamou
+    esta função tenha esquecido de filtrar isso antes.
     """
     if not is_terminal(estagio_terminal):
+        return None
+    if recusa_explicita and not recusa_desconsiderada:
         return None
     if not estagio_maximo_alcancado or is_terminal(estagio_maximo_alcancado):
         return None
     return Transicao(
         estagio_terminal,
         estagio_maximo_alcancado,
-        "cliente voltou a responder após timeout",
+        "cliente voltou a responder após timeout"
+        if not recusa_explicita
+        else "recusa_explicita desconsiderada — cliente voltou a responder",
         ORIGEM_LIVE,
+        CAUSADA_POR_CLIENTE,
     )
 
 
@@ -247,9 +298,11 @@ def _gatilhos_b2c(fatos: Mapping[str, bool], sinais: SinaisConversa) -> list[Der
     if fatos.get("foto_pet_recebida"):
         marcos.append(Derivacao("S2", "foto_pet_recebida"))
     if fatos.get("previa_enviada"):
-        marcos.append(Derivacao("S3", "previa_enviada"))
+        marcos.append(Derivacao("S3", "previa_enviada", causada_por=CAUSADA_POR_CAMU))
     if fatos.get("preco_apresentado"):
-        marcos.append(Derivacao("S4", "preco_apresentado"))
+        marcos.append(
+            Derivacao("S4", "preco_apresentado", causada_por=CAUSADA_POR_CAMU)
+        )
     if fatos.get("preco_apresentado") and sinais.inbound_apos_preco:
         marcos.append(Derivacao("S5", "respondeu ao preço sem recusar"))
     if sinais.ganho:
@@ -260,11 +313,15 @@ def _gatilhos_b2c(fatos: Mapping[str, bool], sinais: SinaisConversa) -> list[Der
 def _gatilhos_b2b(fatos: Mapping[str, bool], sinais: SinaisConversa) -> list[Derivacao]:
     marcos: list[Derivacao] = []
     if sinais.total_outbound >= 1:
-        marcos.append(Derivacao("P1", "msg 1 enviada"))
+        marcos.append(Derivacao("P1", "msg 1 enviada", causada_por=CAUSADA_POR_CAMU))
     if fatos.get("autorizou_envio_material"):
         marcos.append(Derivacao("P2", "autorizou_envio_material"))
     if sinais.proposta_apresentada:
-        marcos.append(Derivacao("P3", "msg 2 entregue após autorização"))
+        marcos.append(
+            Derivacao(
+                "P3", "msg 2 entregue após autorização", causada_por=CAUSADA_POR_CAMU
+            )
+        )
     if fatos.get("visita_aceita"):
         marcos.append(Derivacao("P4", "visita_aceita"))
     if sinais.consignacao_assinada:
@@ -303,6 +360,7 @@ def mudar_funil(
         derivado.estagio,
         f"reclassificado de {origem_funil.upper()} para {sinais.funil.upper()}",
         ORIGEM_LIVE,
+        derivado.causada_por,
     )
 
 
@@ -334,6 +392,8 @@ def estagio_inicial(funil: str) -> str:
 __all__ = [
     "B2B",
     "B2C",
+    "CAUSADA_POR_CAMU",
+    "CAUSADA_POR_CLIENTE",
     "Derivacao",
     "ORIGEM_BACKFILL",
     "ORIGEM_LIVE",

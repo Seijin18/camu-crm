@@ -56,10 +56,12 @@ def carregar_sinais(
         followups_enviados=conversa.followups_enviados,
         ultimo_followup_em=db.ultimo_followup_em(conversa.id),
         avancou_estagio_em=db.ultimo_avanco_em(conversa.id),
+        avancou_causada_por=db.ultimo_avanco_causada_por(conversa.id),
         estagio_maximo_alcancado=db.estagio_maximo_alcancado(conversa.id),
         ganho="ganho" in marcos,
         consignacao_assinada="consignacao_assinada" in marcos,
         primeira_reposicao="primeira_reposicao" in marcos,
+        recusa_desconsiderada=db.recusa_desconsiderada(conversa.id),
     )
 
 
@@ -113,6 +115,7 @@ def recalcular(
         sinais = replace(
             sinais,
             avancou_estagio_hoje=_avanco_recente(transicoes, momentos, agora),
+            avancou_causada_por=transicoes[-1].causada_por,
         )
 
     classificacao = classificar(sinais, fatos)
@@ -125,6 +128,7 @@ def recalcular(
                 movimento.para,
                 origem=movimento.origem,
                 motivo=movimento.motivo,
+                causada_por=movimento.causada_por,
                 em=(
                     momentos.get(movimento.para, agora)
                     if movimento.origem == regras_estagio.ORIGEM_LIVE
@@ -166,7 +170,7 @@ def _avanco_recente(
     return (agora - quando) < timedelta(hours=24)
 
 
-def _estagio_de_partida(db: Database, conversa: Conversa) -> str:
+def estagio_de_partida(db: Database, conversa: Conversa) -> str:
     """De onde a derivação parte: o histórico, não o cache.
 
     `conversas.estagio` é conveniência para a fila não reprocessar tudo a cada
@@ -174,6 +178,11 @@ def _estagio_de_partida(db: Database, conversa: Conversa) -> str:
     histórico ganha — é o que torna verdadeira a promessa de que o estado é
     recalculável, e o que permite consertar um estágio inflado apagando o
     evento que não devia existir.
+
+    Público (não `_estagio_de_partida`) desde o change
+    `estagio-reabertura-manual-e-relogio`: `acoes.mudar_funil_conversa`
+    reconcilia contra o histórico do mesmo jeito, em vez de ler
+    `conversas.estagio` cru — nenhuma segunda implementação da mesma regra.
     """
     return db.estagio_corrente(conversa.id) or conversa.estagio
 
@@ -182,7 +191,7 @@ def _avanco_ao_vivo(db, conversa, fatos, sinais):
     """O avanço observado — a trilha inteira, não só o estágio final.
 
     Parte do estágio que o histórico de eventos registra, não do cache em
-    `conversas.estagio` (ver `_estagio_de_partida`).
+    `conversas.estagio` (ver `estagio_de_partida`).
 
     Um bloco de mensagens pode cruzar vários estágios de uma vez: a cliente
     manda a foto, recebe a prévia e o preço, e responde, tudo antes de a
@@ -196,18 +205,20 @@ def _avanco_ao_vivo(db, conversa, fatos, sinais):
     processamento. É o que mantém `metrics.tempo_por_estagio` medindo tempo de
     verdade mesmo quando a extração roda em lote.
     """
-    estagio_atual = _estagio_de_partida(db, conversa)
+    estagio_atual = estagio_de_partida(db, conversa)
     transicoes: list[regras_estagio.Transicao] = []
 
-    # Conversa encerrada por silêncio que voltou a falar reabre no maior
-    # estágio já alcançado — não vira lead novo (§3, `reabrir`).
-    if (
-        is_terminal(estagio_atual)
-        and not fatos.get("recusa_explicita")
-        and sinais.bola_com == "camu"
-    ):
+    # Conversa encerrada por silêncio (ou por recusa já desconsiderada) que
+    # voltou a falar reabre no maior estágio já alcançado — não vira lead
+    # novo (§3, `reabrir`). A checagem "recusa não reabre sem desconsideração"
+    # não precisa mais ser replicada aqui — `reabrir()` a faz sozinha (change
+    # `estagio-reabertura-manual-e-relogio`, design.md).
+    if is_terminal(estagio_atual) and sinais.bola_com == "camu":
         reabertura = regras_estagio.reabrir(
-            estagio_atual, sinais.estagio_maximo_alcancado
+            estagio_atual,
+            sinais.estagio_maximo_alcancado,
+            recusa_explicita=bool(fatos.get("recusa_explicita")),
+            recusa_desconsiderada=sinais.recusa_desconsiderada,
         )
         if reabertura:
             transicoes.append(reabertura)

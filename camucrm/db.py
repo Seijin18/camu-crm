@@ -208,6 +208,10 @@ class EventoRegistro:
     em: datetime
     origem: str
     motivo: str | None
+    # ADIÇÃO (change `estagio-reabertura-manual-e-relogio`): quem causou o
+    # avanço — "cliente" ou "camu" (`rules.estagio.Transicao.causada_por`).
+    # Default preserva a assinatura posicional já usada em testes existentes.
+    causada_por: str = "cliente"
 
 
 @dataclass
@@ -472,7 +476,15 @@ CREATE TABLE IF NOT EXISTS eventos_estagio (
     -- origem = 'live'; métricas de conversão podem usar as duas.
     origem          VARCHAR(16) NOT NULL DEFAULT 'live'
                     CHECK (origem IN ('live', 'backfill')),
-    motivo          VARCHAR(120)
+    motivo          VARCHAR(120),
+    -- ADIÇÃO (change `estagio-reabertura-manual-e-relogio`): quem causou o
+    -- avanço — "cliente" (respondeu, mandou foto, autorizou, pagou) ou
+    -- "camu" (mandou prévia, apresentou preço, entregou proposta B2B sem
+    -- resposta ainda). §5: "avançou hoje" só esquenta quando é reciprocidade
+    -- do cliente, não atividade nossa — `metrics`/`rules.temperatura`
+    -- consultam esta coluna via `ultimo_avanco_causada_por`.
+    causada_por     VARCHAR(16) NOT NULL DEFAULT 'cliente'
+                    CHECK (causada_por IN ('cliente', 'camu'))
 );
 CREATE INDEX IF NOT EXISTS eventos_estagio_conversa_idx
     ON eventos_estagio (conversa_id, em);
@@ -733,6 +745,14 @@ class Database:
                 cur.execute(
                     "ALTER TABLE contatos ADD COLUMN IF NOT EXISTS "
                     "e_teste BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+                # Mesma divergência registrada acima, agora para
+                # `eventos_estagio.causada_por` (change
+                # `estagio-reabertura-manual-e-relogio`): `ADD COLUMN IF NOT
+                # EXISTS` idempotente, sem apagar histórico já gravado.
+                cur.execute(
+                    "ALTER TABLE eventos_estagio ADD COLUMN IF NOT EXISTS "
+                    "causada_por VARCHAR(16) NOT NULL DEFAULT 'cliente'"
                 )
 
     def _conn_ou(self, conn):
@@ -1222,16 +1242,18 @@ class Database:
         origem: str = ORIGEM_LIVE,
         motivo: str | None = None,
         em: datetime | None = None,
+        causada_por: str = "cliente",
     ) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO eventos_estagio (conversa_id, de, para, em, origem, motivo)
-                    VALUES (%s, %s, %s, COALESCE(%s, now()), %s, %s)
+                    INSERT INTO eventos_estagio
+                        (conversa_id, de, para, em, origem, motivo, causada_por)
+                    VALUES (%s, %s, %s, COALESCE(%s, now()), %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     """,
-                    (conversa_id, de, para, em, origem, motivo),
+                    (conversa_id, de, para, em, origem, motivo, causada_por),
                 )
 
     def estagio_maximo_alcancado(self, conversa_id: int) -> str | None:
@@ -1324,14 +1346,34 @@ class Database:
         backfill, não o do avanço, e o trataria como se tivesse acabado de
         acontecer — deixando quente uma conversa parada há meses.
         """
+        row = self._ultimo_evento_estagio_live(conversa_id)
+        return row[0] if row else None
+
+    def ultimo_avanco_causada_por(self, conversa_id: int) -> str | None:
+        """Quem causou o último avanço ao vivo — "cliente" ou "camu".
+
+        Change `estagio-reabertura-manual-e-relogio`: mesma linha que
+        `ultimo_avanco_em` (por isso a query compartilhada em
+        `_ultimo_evento_estagio_live`) — sem isto, `rules.temperatura.
+        classificar` não teria como saber, numa passada em que nada avançou
+        AGORA, se o avanço de <24h que ainda conta veio do cliente ou da
+        própria Camu.
+        """
+        row = self._ultimo_evento_estagio_live(conversa_id)
+        return row[1] if row else None
+
+    def _ultimo_evento_estagio_live(
+        self, conversa_id: int
+    ) -> tuple[datetime, str] | None:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT MAX(em) FROM eventos_estagio "
-                    "WHERE conversa_id = %s AND origem = 'live'",
+                    "SELECT em, causada_por FROM eventos_estagio "
+                    "WHERE conversa_id = %s AND origem = 'live' "
+                    "ORDER BY em DESC LIMIT 1",
                     (conversa_id,),
                 )
-                return cur.fetchone()[0]
+                return cur.fetchone()
 
     # -- objeções ---------------------------------------------------------
 
@@ -1574,6 +1616,48 @@ class Database:
                     (conversa_id, campo, _texto(antes), _texto(depois), por),
                 )
 
+    # -- reabertura manual de recusa (change
+    #    `estagio-reabertura-manual-e-relogio`) -----------------------------
+
+    def registrar_desconsideracao_recusa(self, conversa_id: int, *, por: str) -> None:
+        """Registra que um `recusa_explicita=true` está sendo desconsiderado
+        para fins de decisão de estágio (design.md, change
+        `estagio-reabertura-manual-e-relogio`).
+
+        NÃO apaga nem reescreve `fatos.recusa_explicita` — grava em
+        `correcoes` (campo `"recusa_explicita"`, `antes="true"`,
+        `depois="desconsiderado"`), a mesma tabela e o mesmo padrão que
+        qualquer outra correção humana (§7). `rules.estagio._derive_b2c`/
+        `_derive_b2b` (via `SinaisConversa.recusa_desconsiderada`) passam a
+        ignorar o fato como terminal para esta conversa, sem que a linha
+        original em `fatos` mude uma vírgula — preserva a evidência de que a
+        extração errou ali, sinal que `make eval` precisa.
+        """
+        if not por or not por.strip():
+            raise ValueError(
+                "desconsiderar recusa exige identificação de quem decidiu (por)"
+            )
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO correcoes (conversa_id, campo, antes, depois, por) "
+                    "VALUES (%s, 'recusa_explicita', 'true', 'desconsiderado', %s)",
+                    (conversa_id, por),
+                )
+
+    def recusa_desconsiderada(self, conversa_id: int) -> bool:
+        """Se existe desconsideração ativa de `recusa_explicita` para a
+        conversa — consultado por `rules.estagio` a cada recálculo."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM correcoes WHERE conversa_id = %s "
+                    "AND campo = 'recusa_explicita' AND depois = 'desconsiderado' "
+                    "LIMIT 1",
+                    (conversa_id,),
+                )
+                return cur.fetchone() is not None
+
     def listar_correcoes(self, limite: int = 200) -> list[tuple[int, str, str, str, datetime]]:
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -1657,8 +1741,8 @@ class Database:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT de, para, em, origem, motivo FROM eventos_estagio "
-                    "WHERE conversa_id = %s ORDER BY id",
+                    "SELECT de, para, em, origem, motivo, causada_por "
+                    "FROM eventos_estagio WHERE conversa_id = %s ORDER BY id",
                     (conversa_id,),
                 )
                 return [EventoRegistro(*row) for row in cur.fetchall()]

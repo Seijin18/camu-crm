@@ -323,6 +323,33 @@ def cmd_tipo(args) -> int:
     return 0
 
 
+def cmd_desconsiderar_recusa(args) -> int:
+    """Desconsidera um `recusa_explicita` falso positivo (design.md, change
+    `estagio-reabertura-manual-e-relogio`).
+
+    Comando dedicado, não reaproveita `camucrm corrigir`: desconsiderar uma
+    recusa não é "trocar um valor de campo" — é uma decisão com efeito
+    estrutural sobre a máquina de estados (permite avanço hoje proibido).
+    Nomear o comando explicitamente deixa essa intenção visível no
+    histórico, em vez de parecer uma correção de rotina qualquer.
+
+    O fato `recusa_explicita=true` continua gravado em `fatos`, íntegro —
+    só a interpretação da regra de estágio muda a partir daqui
+    (`acoes.desconsiderar_recusa`), sempre com `por` identificado (§7).
+    """
+    quem = _operador(args)
+    banco = _db()
+    try:
+        estado = acoes.desconsiderar_recusa(banco, args.conversa, por=quem)
+    except AcaoInvalidaError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(
+        f"#{args.conversa}: recusa_explicita desconsiderada por {quem} "
+        f"-> estágio {estado.estagio}"
+    )
+    return 0
+
+
 def cmd_corrigir(args) -> int:
     """Grava uma correção humana (§7). Toda correção passa por aqui."""
     quem = _operador(args)
@@ -671,6 +698,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("tipo", choices=["b2b", "b2c"])
     p.add_argument("--por")
     p.set_defaults(func=cmd_tipo)
+
+    p = sub.add_parser(
+        "desconsiderar-recusa",
+        help="desconsidera um recusa_explicita falso positivo (reabre no maior estágio já alcançado)",
+    )
+    p.add_argument("conversa", type=int)
+    p.add_argument("--por")
+    p.set_defaults(func=cmd_desconsiderar_recusa)
 
     p = sub.add_parser("corrigir", help="grava uma correção humana (§7)")
     p.add_argument("conversa", type=int)

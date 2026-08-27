@@ -16,6 +16,7 @@ from typing import Mapping
 from ..taxonomia import (
     BOLA_CAMU,
     BOLA_CLIENTE,
+    CAUSADA_POR_CAMU,
     DIAS_ESFRIANDO,
     ENCERRADO,
     ESFRIANDO,
@@ -67,7 +68,12 @@ def classificar(
     horas = sinais.horas_desde_inbound
     if horas is not None and horas < HORAS_QUENTE:
         return Classificacao(QUENTE, f"cliente respondeu há {horas:.1f}h")
-    if sinais.avancou_estagio_hoje:
+    # Change `estagio-reabertura-manual-e-relogio`: "avançou hoje" só esquenta
+    # quando o gatilho foi do CLIENTE — avanço 100% causado pela Camu (prévia
+    # enviada, preço apresentado, proposta B2B sem resposta) não é
+    # reciprocidade (§5), e `avancou_causada_por` vem de
+    # `rules.estagio.Derivacao.causada_por` via `Transicao`.
+    if sinais.avancou_estagio_hoje and sinais.avancou_causada_por != CAUSADA_POR_CAMU:
         return Classificacao(QUENTE, "avançou de estágio nas últimas 24h")
 
     # --- MORNO / ESFRIANDO / FRIO ----------------------------------------

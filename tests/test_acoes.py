@@ -11,6 +11,7 @@ import unittest
 from camucrm.acoes import (
     AcaoInvalidaError,
     MarcoNaoPermitidoError,
+    desconsiderar_recusa,
     marcar_marco,
     marco_permitido,
     mudar_funil_conversa,
@@ -133,6 +134,96 @@ class TesteMudarFunilConversa(unittest.TestCase):
         conversa = self.db.criar_conversa(funil="b2c", estagio="S0")
         with self.assertRaises(AcaoInvalidaError):
             mudar_funil_conversa(self.db, conversa.id, "xis", por="marcos")
+
+    def test_estagio_divergente_do_cache_usa_o_reconciliado(self):
+        """Requirement "mudar_funil_conversa reconcilia contra o histórico":
+        `conversas.estagio` (cache) fica em S4, mas o histórico
+        (`eventos_estagio`) só registra S2 — o evento gravado por esta ação
+        precisa usar S2 (reconciliado), não S4 (cache cru)."""
+        conversa = self.db.criar_conversa(funil="b2c", estagio="S4")
+        # Nenhum evento em `eventos_estagio` aponta para S4 — só para S2,
+        # simulando um cache inflado/desalinhado em relação ao histórico
+        # real (ex. a regressão de watermark que `literalidade-e-
+        # idempotencia-da-extracao` corrigiu).
+        self.db.gravar_evento_estagio(conversa.id, "S1", "S2", motivo="foto_pet_recebida")
+
+        resultado = mudar_funil_conversa(self.db, conversa.id, "b2b", por="marcos")
+
+        self.assertIsNotNone(resultado.movimento)
+        self.assertEqual(resultado.movimento.de, "S2")
+        self.assertNotEqual(resultado.movimento.de, "S4")
+
+
+class TesteDesconsiderarRecusa(unittest.TestCase):
+    def setUp(self):
+        self.db = FakeDatabase()
+
+    def test_exige_por(self):
+        conversa = self.db.criar_conversa(funil="b2c", estagio="SX")
+        self.db.fatos.append((conversa.id, "recusa_explicita", None, None, None))
+        with self.assertRaises(AcaoInvalidaError):
+            desconsiderar_recusa(self.db, conversa.id, por=None)
+        with self.assertRaises(AcaoInvalidaError):
+            desconsiderar_recusa(self.db, conversa.id, por="   ")
+
+    def test_conversa_inexistente_levanta(self):
+        with self.assertRaises(AcaoInvalidaError):
+            desconsiderar_recusa(self.db, 999, por="marcos")
+
+    def test_sem_recusa_explicita_registrada_levanta(self):
+        conversa = self.db.criar_conversa(funil="b2c", estagio="S2")
+        with self.assertRaises(AcaoInvalidaError):
+            desconsiderar_recusa(self.db, conversa.id, por="marcos")
+
+    def test_desconsiderar_grava_correcao_sem_apagar_o_fato(self):
+        conversa = self.db.criar_conversa(funil="b2c", estagio="SX")
+        self.db.fatos.append((conversa.id, "recusa_explicita", "não quero mais", None, None))
+        self.db.gravar_evento_estagio(conversa.id, "S2", "SX", motivo="recusa_explicita")
+
+        desconsiderar_recusa(self.db, conversa.id, por="marcos")
+
+        # O fato original continua íntegro.
+        self.assertTrue(self.db.fatos_da_conversa(conversa.id).get("recusa_explicita"))
+        # E a correção foi registrada (§7), não uma reescrita do fato.
+        correcao = [c for c in self.db.correcoes if c["conversa_id"] == conversa.id][0]
+        self.assertEqual(correcao["campo"], "recusa_explicita")
+        self.assertEqual(correcao["depois"], "desconsiderado")
+        self.assertEqual(correcao["por"], "marcos")
+        self.assertTrue(self.db.recusa_desconsiderada(conversa.id))
+
+    def test_desconsiderar_reabre_conversa_presa_em_sx(self):
+        """Requirement "Recusa desconsiderada permite avanço de novo": a
+        conversa estava presa em SX por `recusa_explicita`, tinha chegado a
+        S2 antes disso, e o cliente já respondeu de novo (bola com a Camu) —
+        desconsiderar a recusa deve reabrir para o maior estágio já
+        alcançado, sem esperar mensagem nova nenhuma."""
+        conversa = self.db.criar_conversa(funil="b2c", estagio="SX")
+        self.db.registrar_mensagem(conversa.id, "in", "oi de novo, mudei de ideia")
+        self.db.fatos.append((conversa.id, "foto_pet_recebida", "manda foto", None, None))
+        self.db.fatos.append((conversa.id, "recusa_explicita", "não quero mais", None, None))
+        self.db.gravar_evento_estagio(conversa.id, "S1", "S2", motivo="foto_pet_recebida")
+        self.db.gravar_evento_estagio(conversa.id, "S2", "SX", motivo="recusa_explicita")
+
+        estado = desconsiderar_recusa(self.db, conversa.id, por="marcos")
+
+        self.assertEqual(estado.estagio, "S2")
+        self.assertNotEqual(estado.estagio, "S1")
+
+    def test_sem_desconsideracao_conversa_continua_presa(self):
+        """Regressão: sem a ação nova, `recalcular` sozinho continua
+        respeitando "recusa é fechamento duro e não reabre"."""
+        from camucrm.pipeline import recalcular
+
+        conversa = self.db.criar_conversa(funil="b2c", estagio="SX")
+        self.db.registrar_mensagem(conversa.id, "in", "oi de novo")
+        self.db.fatos.append((conversa.id, "foto_pet_recebida", "manda foto", None, None))
+        self.db.fatos.append((conversa.id, "recusa_explicita", "não quero mais", None, None))
+        self.db.gravar_evento_estagio(conversa.id, "S1", "S2", motivo="foto_pet_recebida")
+        self.db.gravar_evento_estagio(conversa.id, "S2", "SX", motivo="recusa_explicita")
+
+        estado = recalcular(self.db, self.db.get_conversa(conversa.id))
+
+        self.assertEqual(estado.estagio, "SX")
 
 
 if __name__ == "__main__":

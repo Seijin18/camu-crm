@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 
 from camucrm.rules.estagio import (
     ORIGEM_BACKFILL,
+    CAUSADA_POR_CAMU,
+    CAUSADA_POR_CLIENTE,
     Derivacao,
     derive,
     reabrir,
@@ -135,6 +137,91 @@ class TesteReabertura(unittest.TestCase):
 
     def test_conversa_nao_terminal_nao_reabre(self):
         self.assertIsNone(reabrir("S2", "S3"))
+
+    def test_recusa_explicita_nao_desconsiderada_nao_reabre_mesmo_chamada_direta(self):
+        """Requirement "reabrir() recusa reabertura de recusa não-
+        desconsiderada sozinha" — a checagem é da própria função, não só do
+        chamador (design.md, change `estagio-reabertura-manual-e-relogio`)."""
+        self.assertIsNone(
+            reabrir("SX", "S3", recusa_explicita=True, recusa_desconsiderada=False)
+        )
+
+    def test_recusa_explicita_desconsiderada_reabre_no_maior_estagio(self):
+        t = reabrir("SX", "S3", recusa_explicita=True, recusa_desconsiderada=True)
+        self.assertEqual((t.de, t.para), ("SX", "S3"))
+        self.assertEqual(t.causada_por, CAUSADA_POR_CLIENTE)
+
+    def test_timeout_sem_recusa_continua_reabrindo_normalmente(self):
+        """Regressão: o caminho de timeout (sem recusa_explicita nenhuma)
+        não pode ser afetado pelos novos parâmetros, que nascem com
+        default `False`."""
+        t = reabrir("SX", "S2")
+        self.assertEqual((t.de, t.para), ("SX", "S2"))
+
+
+class TesteCausadaPor(unittest.TestCase):
+    """Change `estagio-reabertura-manual-e-relogio`: `causada_por` distingue
+    avanço do cliente do avanço da própria Camu (§5)."""
+
+    def test_previa_enviada_e_causada_pela_camu(self):
+        s = sinais([Mensagem("out", AGORA - timedelta(hours=1))])
+        d = derive({"previa_enviada": True}, s)
+        self.assertEqual(d.estagio, "S3")
+        self.assertEqual(d.causada_por, CAUSADA_POR_CAMU)
+
+    def test_preco_apresentado_sem_resposta_e_causado_pela_camu(self):
+        s = sinais([Mensagem("out", AGORA - timedelta(hours=1))])
+        d = derive({"previa_enviada": True, "preco_apresentado": True}, s)
+        self.assertEqual(d.estagio, "S4")
+        self.assertEqual(d.causada_por, CAUSADA_POR_CAMU)
+
+    def test_foto_pet_recebida_e_causada_pelo_cliente(self):
+        s = sinais([Mensagem("in", AGORA - timedelta(hours=1))])
+        d = derive({"foto_pet_recebida": True}, s)
+        self.assertEqual(d.causada_por, CAUSADA_POR_CLIENTE)
+
+    def test_msg1_enviada_b2b_e_causada_pela_camu(self):
+        s = sinais([Mensagem("out", AGORA - timedelta(days=1))], funil="b2b")
+        d = derive({}, s)
+        self.assertEqual(d.estagio, "P1")
+        self.assertEqual(d.causada_por, CAUSADA_POR_CAMU)
+
+    def test_autorizou_envio_material_e_causado_pelo_lojista(self):
+        s = sinais([Mensagem("out", AGORA - timedelta(days=1)),
+                    Mensagem("in", AGORA - timedelta(hours=20))], funil="b2b")
+        d = derive({"autorizou_envio_material": True}, s)
+        self.assertEqual(d.causada_por, CAUSADA_POR_CLIENTE)
+
+    def test_transicao_propaga_causada_por_da_derivacao(self):
+        t = transicao("S2", Derivacao("S4", "preco_apresentado", causada_por=CAUSADA_POR_CAMU))
+        self.assertEqual(t.causada_por, CAUSADA_POR_CAMU)
+
+
+class TesteRecusaDesconsiderada(unittest.TestCase):
+    """Requirement "Recusa desconsiderada permite avanço de novo"."""
+
+    def test_recusa_explicita_desconsiderada_nao_e_mais_terminal(self):
+        s = sinais(
+            [Mensagem("in", AGORA - timedelta(hours=1))],
+            recusa_desconsiderada=True,
+        )
+        d = derive({"recusa_explicita": True, "foto_pet_recebida": True}, s)
+        self.assertEqual(d.estagio, "S2")
+
+    def test_recusa_explicita_sem_desconsideracao_continua_terminal(self):
+        s = sinais([Mensagem("in", AGORA - timedelta(hours=1))])
+        d = derive({"recusa_explicita": True, "foto_pet_recebida": True}, s)
+        self.assertEqual(d.estagio, "SX")
+
+    def test_recusa_explicita_desconsiderada_b2b_nao_e_mais_terminal(self):
+        s = sinais(
+            [Mensagem("out", AGORA - timedelta(days=1)),
+             Mensagem("in", AGORA - timedelta(hours=20))],
+            funil="b2b",
+            recusa_desconsiderada=True,
+        )
+        d = derive({"recusa_explicita": True, "autorizou_envio_material": True}, s)
+        self.assertEqual(d.estagio, "P2")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,15 @@ from datetime import datetime, timedelta, timezone
 
 from camucrm.rules.sinais import Mensagem, construir_sinais
 from camucrm.rules.temperatura import classificar
-from camucrm.taxonomia import ENCERRADO, ESFRIANDO, FRIO, MORNO, QUENTE
+from camucrm.taxonomia import (
+    CAUSADA_POR_CAMU,
+    CAUSADA_POR_CLIENTE,
+    ENCERRADO,
+    ESFRIANDO,
+    FRIO,
+    MORNO,
+    QUENTE,
+)
 
 AGORA = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
 
@@ -91,6 +99,40 @@ class TesteReciprocidadeAcimaDeSimpatia(unittest.TestCase):
     def test_cliente_seco_e_rapido_e_quente(self):
         s = sinais([Mensagem("out", AGORA - timedelta(hours=3)),
                     Mensagem("in", AGORA - timedelta(minutes=2), "qnt")])
+        self.assertEqual(classificar(s).temperatura, QUENTE)
+
+
+class TesteAvancoCausadaPor(unittest.TestCase):
+    """Change `estagio-reabertura-manual-e-relogio`: "avançou hoje" só
+    esquenta quando o gatilho foi do cliente (§5)."""
+
+    def test_avanco_causado_pela_camu_nao_vira_quente(self):
+        s = sinais(
+            [Mensagem("in", AGORA - timedelta(hours=30)),
+             Mensagem("out", AGORA - timedelta(hours=20))],
+            avancou_estagio_em=AGORA - timedelta(hours=2),
+            avancou_causada_por=CAUSADA_POR_CAMU,
+        )
+        self.assertNotEqual(classificar(s).temperatura, QUENTE)
+
+    def test_avanco_causado_pelo_cliente_continua_quente(self):
+        s = sinais(
+            [Mensagem("in", AGORA - timedelta(hours=30)),
+             Mensagem("out", AGORA - timedelta(hours=20))],
+            avancou_estagio_em=AGORA - timedelta(hours=2),
+            avancou_causada_por=CAUSADA_POR_CLIENTE,
+        )
+        self.assertEqual(classificar(s).temperatura, QUENTE)
+
+    def test_avanco_sem_causada_por_informada_continua_quente(self):
+        """Regressão: chamadores antigos que não sabem de `causada_por`
+        (`avancou_causada_por=None`, o default) preservam o comportamento
+        anterior a este change."""
+        s = sinais(
+            [Mensagem("in", AGORA - timedelta(hours=30)),
+             Mensagem("out", AGORA - timedelta(hours=20))],
+            avancou_estagio_em=AGORA - timedelta(hours=2),
+        )
         self.assertEqual(classificar(s).temperatura, QUENTE)
 
 

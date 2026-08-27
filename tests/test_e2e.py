@@ -553,3 +553,92 @@ class TesteResumoNaoMudaEstado(unittest.TestCase):
         # Apagar `resumos_conversa` inteira também não muda nada — é cache.
         db.resumos.clear()
         self.assertEqual(self._estado_e_fila(db, conversa), depois)
+
+
+class TesteReaberturaManualDeRecusa(unittest.TestCase):
+    """Change `estagio-reabertura-manual-e-relogio`: estende o E2E único com
+    o ciclo completo de recusa falso-positiva.
+
+        ... -> S2 -> (recusa_explicita, falso positivo) -> SX
+            -> desconsideração manual (acoes.desconsiderar_recusa)
+            -> reabre em S2 -> mensagem nova do cliente -> S5
+
+    Mora aqui, não num `test_reabertura_e2e.py` à parte, pela mesma regra já
+    registrada para `TesteCicloAteVinculoDoRascunho`/`TesteResumoNaoMudaEstado`:
+    dois E2E acabam testando versões diferentes do mesmo caminho.
+    """
+
+    def test_ciclo_completo_de_recusa_falso_positiva_ate_reabertura(self):
+        db = FakeDatabase()
+        conversa = db.criar_conversa(nome="Ana")
+
+        db.registrar_mensagem(
+            conversa.id, "in", "oi, vi o insta de voces", AGORA - timedelta(hours=10)
+        )
+        db.registrar_mensagem(
+            conversa.id, "out", "Oi! Me manda uma foto do seu pet?",
+            AGORA - timedelta(hours=9),
+        )
+        db.registrar_mensagem(
+            conversa.id, "in", "aqui ele, o nome dele e Thor", AGORA - timedelta(hours=8)
+        )
+        extrator = Extrator(db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "aqui ele, o nome dele e Thor"}),
+        ]))
+        resultado = extrator.processar_conversa(conversa.id, agora=AGORA)
+        self.assertEqual(resultado.estado.estagio, "S2")
+
+        # Bloco novo: a extração erra e marca recusa_explicita — falso
+        # positivo (§7: o pior caso, lead quente abandonado por engano).
+        db.registrar_mensagem(
+            conversa.id, "in", "ah, esquece, nao quero mais nao",
+            AGORA - timedelta(hours=7),
+        )
+        extrator2 = Extrator(db, FakeLlm([
+            resposta(recusa_explicita=True,
+                     evidencias={"recusa_explicita": "nao quero mais nao"}),
+        ]))
+        resultado = extrator2.processar_conversa(conversa.id, agora=AGORA)
+        self.assertEqual(resultado.estado.estagio, "SX")
+        # O fato de recusa_explicita agora é o que trava a conversa —
+        # confirmando que o teste está testando o caminho certo.
+        self.assertTrue(db.fatos_da_conversa(conversa.id)["recusa_explicita"])
+
+        # Sem desconsiderar, um recálculo simples (sem LLM) confirma que a
+        # conversa continua travada (regressão: "recusa é fechamento duro").
+        preso = recalcular(db, db.get_conversa(conversa.id), agora=AGORA)
+        self.assertEqual(preso.estagio, "SX")
+
+        # Operador desconsidera a recusa (design.md) — o fato original
+        # continua intacto em `fatos`.
+        estado_apos_desconsiderar = acoes.desconsiderar_recusa(
+            db, conversa.id, por="marcos"
+        )
+        self.assertTrue(db.recusa_desconsiderada(conversa.id))
+        self.assertTrue(db.fatos_da_conversa(conversa.id)["recusa_explicita"])
+        # Reabre no maior estágio já alcançado (S2), nunca em S0/S1.
+        self.assertEqual(estado_apos_desconsiderar.estagio, "S2")
+
+        # Mensagem nova do cliente: a Camu manda prévia e preço, e o cliente
+        # responde sem recusar — a conversa volta a avançar de verdade.
+        db.registrar_mensagem(
+            conversa.id, "out", "Aqui esta a previa do produto!",
+            AGORA - timedelta(hours=2),
+        )
+        db.registrar_mensagem(
+            conversa.id, "out", "Fica R$ 149 com frete gratis",
+            AGORA - timedelta(hours=1, minutes=30),
+        )
+        db.registrar_mensagem(
+            conversa.id, "in", "fechado, pode mandar!",
+            AGORA - timedelta(hours=1),
+        )
+        extrator3 = Extrator(db, FakeLlm([
+            resposta(previa_enviada=True, preco_apresentado=True,
+                     evidencias={"previa_enviada": "Aqui esta a previa do produto!",
+                                 "preco_apresentado": "Fica R$ 149 com frete gratis"}),
+        ]))
+        final = extrator3.processar_conversa(conversa.id, agora=AGORA)
+        self.assertEqual(final.estado.estagio, "S5")
+        self.assertNotEqual(final.estado.estagio, "SX")

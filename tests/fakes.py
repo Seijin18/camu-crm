@@ -379,10 +379,13 @@ class FakeDatabase:
         ]
         return sorted(linhas, key=lambda f: f.extraido_em)
 
-    def gravar_evento_estagio(self, conversa_id, de, para, *, origem="live", motivo=None, em=None):
+    def gravar_evento_estagio(
+        self, conversa_id, de, para, *, origem="live", motivo=None, em=None,
+        causada_por="cliente",
+    ):
         self.eventos.append(
             {"conversa_id": conversa_id, "de": de, "para": para,
-             "origem": origem, "motivo": motivo,
+             "origem": origem, "motivo": motivo, "causada_por": causada_por,
              "em": em or datetime.now(timezone.utc)}
         )
         self._toques_conversa += 1
@@ -390,7 +393,10 @@ class FakeDatabase:
     def eventos_da_conversa(self, conversa_id: int) -> list[EventoRegistro]:
         eventos = [e for e in self.eventos if e["conversa_id"] == conversa_id]
         return [
-            EventoRegistro(e["de"], e["para"], e["em"], e["origem"], e["motivo"])
+            EventoRegistro(
+                e["de"], e["para"], e["em"], e["origem"], e["motivo"],
+                e.get("causada_por", "cliente"),
+            )
             for e in eventos
         ]
 
@@ -426,11 +432,19 @@ class FakeDatabase:
         return {e["para"] for e in self.eventos if e["conversa_id"] == conversa_id}
 
     def ultimo_avanco_em(self, conversa_id: int) -> datetime | None:
-        momentos = [
-            e["em"] for e in self.eventos
+        evento = self._ultimo_evento_estagio_live(conversa_id)
+        return evento["em"] if evento else None
+
+    def ultimo_avanco_causada_por(self, conversa_id: int) -> str | None:
+        evento = self._ultimo_evento_estagio_live(conversa_id)
+        return evento.get("causada_por", "cliente") if evento else None
+
+    def _ultimo_evento_estagio_live(self, conversa_id: int) -> dict | None:
+        candidatos = [
+            e for e in self.eventos
             if e["conversa_id"] == conversa_id and e["origem"] == "live"
         ]
-        return max(momentos) if momentos else None
+        return max(candidatos, key=lambda e: e["em"]) if candidatos else None
 
     def gravar_objecao(self, conversa_id, categoria, *, estagio=None, trecho=None, em=None):
         # Espelha `objecoes_dedupe_idx` + `ON CONFLICT DO NOTHING`: mesma
@@ -598,6 +612,26 @@ class FakeDatabase:
             {"id": self._novo_id(), "conversa_id": conversa_id, "campo": campo,
              "antes": antes, "depois": depois, "por": por,
              "em": datetime.now(timezone.utc)}
+        )
+
+    def registrar_desconsideracao_recusa(self, conversa_id: int, *, por: str) -> None:
+        """Espelha `db.Database.registrar_desconsideracao_recusa`: grava em
+        `correcoes` (via `self.registrar_correcao`, nenhuma tabela nova no
+        fake), nunca em `self.fatos` — o fato original nunca é tocado."""
+        if not por or not por.strip():
+            raise ValueError(
+                "desconsiderar recusa exige identificação de quem decidiu (por)"
+            )
+        self.registrar_correcao(
+            conversa_id, "recusa_explicita", "true", "desconsiderado", por=por
+        )
+
+    def recusa_desconsiderada(self, conversa_id: int) -> bool:
+        return any(
+            c["conversa_id"] == conversa_id
+            and c["campo"] == "recusa_explicita"
+            and c["depois"] == "desconsiderado"
+            for c in self.correcoes
         )
 
     def correcoes_da_conversa(self, conversa_id: int) -> list[CorrecaoRegistro]:

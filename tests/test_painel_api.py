@@ -325,6 +325,39 @@ class TesteRotasDeAcao(unittest.TestCase):
         self.assertEqual(resposta.status_code, 422)
         self.assertEqual(self.fake.correcoes, [])
 
+    def test_desconsiderar_recusa_reabre_e_grava_correcao(self):
+        """Change `estagio-reabertura-manual-e-relogio`: botão no detalhe da
+        conversa, mesma sequência de efeitos que a CLI (`acoes.
+        desconsiderar_recusa`)."""
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="SX")
+        self.fake.fatos.append((conversa.id, "recusa_explicita", "não quero", None, None))
+        resposta = self.cliente.post(
+            f"/api/conversas/{conversa.id}/desconsiderar-recusa",
+            json={"por": "marcos"},
+        )
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertTrue(corpo["ok"])
+        self.assertTrue(self.fake.recusa_desconsiderada(conversa.id))
+        self.assertTrue(self.fake.fatos_da_conversa(conversa.id).get("recusa_explicita"))
+
+    def test_desconsiderar_recusa_sem_por_devolve_422(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="SX")
+        self.fake.fatos.append((conversa.id, "recusa_explicita", "não quero", None, None))
+        resposta = self.cliente.post(
+            f"/api/conversas/{conversa.id}/desconsiderar-recusa", json={}
+        )
+        self.assertEqual(resposta.status_code, 422)
+        self.assertFalse(self.fake.recusa_desconsiderada(conversa.id))
+
+    def test_desconsiderar_recusa_sem_fato_devolve_422(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S2")
+        resposta = self.cliente.post(
+            f"/api/conversas/{conversa.id}/desconsiderar-recusa",
+            json={"por": "marcos"},
+        )
+        self.assertEqual(resposta.status_code, 422)
+
 
 class TesteRotasDeRascunho(unittest.TestCase):
     """Change `rascunho-registrado`: gerar/ler histórico/escolha — sempre

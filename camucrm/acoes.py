@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 from .db import Database, MARCOS_MANUAIS
 from .db import _normalizar_texto as _normalizar
-from .pipeline import EstadoConversa, carregar_sinais, recalcular
+from .pipeline import EstadoConversa, carregar_sinais, estagio_de_partida, recalcular
 from .rules.estagio import Transicao, mudar_funil
 from .taxonomia import B2B, B2C
 
@@ -140,6 +140,14 @@ def mudar_funil_conversa(
     chamado sempre que o funil de fato muda, incluindo quando `mudar_funil`
     (§3) não produz nenhuma transição de estágio (a reclassificação sozinha
     já é a correção que importa registrar).
+
+    Change `estagio-reabertura-manual-e-relogio`: o estágio de partida vem de
+    `pipeline.estagio_de_partida` (reconciliado contra `eventos_estagio`), não
+    de `conversas.estagio` cru — mesma reconciliação que
+    `pipeline.recalcular`/`_avanco_ao_vivo` já fazem. Sem isto, um cache
+    desalinhado (a regressão de watermark que `literalidade-e-idempotencia-
+    da-extracao` corrigiu é um jeito real de chegar lá) gravaria um `de`
+    errado no evento desta reclassificação.
     """
     conversa = db.get_conversa(conversa_id)
     if conversa is None:
@@ -161,14 +169,61 @@ def mudar_funil_conversa(
     assert atualizada is not None
     fatos = db.fatos_da_conversa(conversa_id)
     sinais = carregar_sinais(db, atualizada)
-    movimento = mudar_funil(atualizada.estagio, fatos, sinais)
+    estagio_atual = estagio_de_partida(db, atualizada)
+    movimento = mudar_funil(estagio_atual, fatos, sinais)
     if movimento:
         db.gravar_evento_estagio(
-            conversa_id, movimento.de, movimento.para, motivo=movimento.motivo
+            conversa_id,
+            movimento.de,
+            movimento.para,
+            motivo=movimento.motivo,
+            causada_por=movimento.causada_por,
         )
         db.atualizar_estado_conversa(conversa_id, estagio=movimento.para)
 
     return ResultadoFunil(conversa_id, anterior, novo_funil, movimento=movimento)
+
+
+def desconsiderar_recusa(
+    db: Database, conversa_id: int, *, por: str | None
+) -> EstadoConversa:
+    """Desconsidera um `recusa_explicita=true` tratado como falso positivo
+    de extração (design.md, change `estagio-reabertura-manual-e-relogio`).
+
+    Exceção explícita e auditada ao invariante #2/§3 do CLAUDE.md ("estágio
+    nunca regride") — não uma violação silenciosa: o fato `recusa_explicita`
+    em `fatos` continua intacto, só a INTERPRETAÇÃO dele pela regra de
+    estágio muda a partir daqui (`db.registrar_desconsideracao_recusa`, que
+    grava em `correcoes`, nunca reescreve `fatos`).
+
+    `por` é exigido (nunca ação anônima) ANTES de tocar no banco — mesmo
+    padrão de `marcar_marco`/`mudar_funil_conversa`: recusado com
+    `AcaoInvalidaError`, nada é gravado.
+
+    Recalcula a conversa em seguida: se a bola já estiver com a Camu (o
+    cliente falou por último — o que costuma já ser o caso, já que a própria
+    recusa costuma ter sido a última mensagem dele), a conversa reabre no
+    mesmo instante, no maior estágio já alcançado (nunca S1/P0, mesmo padrão
+    de `rules.estagio.reabrir`). Sem uma mensagem nova do cliente ainda, a
+    reabertura acontece na próxima vez que ele responder.
+    """
+    if not por or not por.strip():
+        raise AcaoInvalidaError(
+            "desconsiderar recusa exige identificação de quem decidiu (--por)"
+        )
+    conversa = db.get_conversa(conversa_id)
+    if conversa is None:
+        raise AcaoInvalidaError(f"conversa {conversa_id} não existe")
+
+    fatos = db.fatos_da_conversa(conversa_id)
+    if not fatos.get("recusa_explicita"):
+        raise AcaoInvalidaError(
+            f"conversa {conversa_id} não tem recusa_explicita registrada — "
+            "nada a desconsiderar"
+        )
+
+    db.registrar_desconsideracao_recusa(conversa_id, por=por)
+    return recalcular(db, conversa)
 
 
 def reconciliar_rascunho(

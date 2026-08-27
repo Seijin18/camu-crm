@@ -197,6 +197,22 @@ BOLAS = (BOLA_CAMU, BOLA_CLIENTE)
 
 
 # --------------------------------------------------------------------------
+# Causa do avanço de estágio (§5) — change `estagio-reabertura-manual-e-relogio`
+# --------------------------------------------------------------------------
+#
+# "Avançou de estágio hoje" só deveria esquentar a conversa quando quem
+# avançou foi o CLIENTE (respondeu, mandou foto, autorizou, pagou) — não
+# quando foi a própria Camu (mandou prévia, apresentou preço, entregou
+# proposta B2B ainda sem resposta). §5 é explícito: "reciprocidade, não
+# atividade nossa". Ver `rules.estagio.Derivacao.causada_por` e
+# `rules.temperatura.classificar`.
+
+CAUSADA_POR_CLIENTE = "cliente"
+CAUSADA_POR_CAMU = "camu"
+CAUSAS_AVANCO = (CAUSADA_POR_CLIENTE, CAUSADA_POR_CAMU)
+
+
+# --------------------------------------------------------------------------
 # Limites operacionais
 # --------------------------------------------------------------------------
 

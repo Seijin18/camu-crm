@@ -73,6 +73,19 @@ class SinaisConversa:
     consignacao_assinada: bool = False
     primeira_reposicao: bool = False
 
+    # Change `estagio-reabertura-manual-e-relogio`: quem causou o avanço
+    # contado por `avancou_estagio_hoje` — "cliente" ou "camu" — consultado
+    # por `rules.temperatura.classificar` para não confundir atividade nossa
+    # com reciprocidade do cliente (§5). `None` quando não há avanço a
+    # atribuir (ex. `avancou_estagio_hoje=False`).
+    avancou_causada_por: str | None = None
+
+    # Se existe desconsideração ativa (registrada em `correcoes`, nunca
+    # apagando o fato) para o `recusa_explicita` desta conversa — consultado
+    # por `rules.estagio._derive_b2c`/`_derive_b2b` antes de tratar o fato
+    # como terminal (design.md, `estagio-reabertura-manual-e-relogio`).
+    recusa_desconsiderada: bool = False
+
     @property
     def bola_com(self) -> str:
         """Quem deve a próxima mensagem — o sinal de maior peso da §5.
@@ -136,10 +149,12 @@ def construir_sinais(
     followups_enviados: int = 0,
     ultimo_followup_em: datetime | None = None,
     avancou_estagio_em: datetime | None = None,
+    avancou_causada_por: str | None = None,
     estagio_maximo_alcancado: str | None = None,
     ganho: bool = False,
     consignacao_assinada: bool = False,
     primeira_reposicao: bool = False,
+    recusa_desconsiderada: bool = False,
 ) -> SinaisConversa:
     """Deriva os sinais de uma conversa a partir das mensagens dela.
 
@@ -149,9 +164,19 @@ def construir_sinais(
     o delta logo depois) e não muda nenhuma decisão. No backfill a diferença é
     arbitrária, e é exatamente por isso que §8 manda excluir eventos de
     backfill de qualquer métrica de tempo.
+
+    Change `estagio-reabertura-manual-e-relogio`: `enviada_em` de cada
+    mensagem é clampado a `min(timestamp, agora())` antes de qualquer
+    ordenação — um relógio de celular adiantado não pode virar "a última
+    mensagem" para sempre e travar `bola_com` à frente de mensagens reais
+    subsequentes (mesma política de clamp já aplicada na recepção pelo
+    change `identificacao-e-relogio-confiaveis`).
     """
     agora = _aware(agora or datetime.now(timezone.utc))
-    ordenadas = sorted(mensagens, key=lambda m: _aware(m.enviada_em))
+    ordenadas = sorted(
+        (Mensagem(m.direcao, min(_aware(m.enviada_em), agora), m.texto) for m in mensagens),
+        key=lambda m: m.enviada_em,
+    )
 
     inbounds = [m for m in ordenadas if m.is_inbound]
     outbounds = [m for m in ordenadas if not m.is_inbound]
@@ -197,10 +222,12 @@ def construir_sinais(
         proposta_apresentada=proposta_apresentada,
         proposta_em=proposta_em,
         avancou_estagio_hoje=avancou_hoje,
+        avancou_causada_por=avancou_causada_por,
         estagio_maximo_alcancado=estagio_maximo_alcancado,
         followups_enviados=followups_enviados,
         followups_sem_retorno=followups_sem_retorno,
         ganho=ganho,
         consignacao_assinada=consignacao_assinada,
         primeira_reposicao=primeira_reposicao,
+        recusa_desconsiderada=recusa_desconsiderada,
     )

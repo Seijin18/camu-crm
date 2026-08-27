@@ -201,6 +201,7 @@ def _evento_para_json(evento: EventoRegistro) -> dict[str, Any]:
         "em": evento.em.isoformat(),
         "origem": evento.origem,
         "motivo": evento.motivo,
+        "causada_por": evento.causada_por,
     }
     if evento.origem == ORIGEM_BACKFILL:
         item["aviso"] = AVISO_BACKFILL

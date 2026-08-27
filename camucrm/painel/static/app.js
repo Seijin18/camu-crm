@@ -443,6 +443,35 @@ async function renderizarDetalhe(container, id) {
     container.appendChild(botaoTeste);
   }
 
+  // Change `estagio-reabertura-manual-e-relogio`: botão só aparece quando
+  // há um `recusa_explicita=true` gravado E ele ainda não foi desconsiderado
+  // — evita oferecer a ação de novo depois de já ter sido feita. O fato em
+  // si nunca é apagado (design.md); só a interpretação da regra de estágio
+  // muda, registrada em `correcoes` com `por` obrigatório.
+  const temRecusa = detalhe.fatos.some((f) => f.chave === "recusa_explicita");
+  const jaDesconsiderada = detalhe.correcoes.some(
+    (c) => c.campo === "recusa_explicita" && c.depois === "desconsiderado"
+  );
+  if (temRecusa && !jaDesconsiderada) {
+    const botaoDesconsiderarRecusa = el("button", {
+      class: "secundario",
+      texto: "Desconsiderar recusa explícita (falso positivo)",
+    });
+    botaoDesconsiderarRecusa.addEventListener("click", async () => {
+      try {
+        await chamarApiEscrever(`/conversas/${id}/desconsiderar-recusa`, {
+          por: obterOperador(),
+        });
+        await renderizarRotaSegura();
+      } catch (erro) {
+        container.appendChild(
+          el("p", { class: "aviso", texto: `Erro: ${erro.message}` })
+        );
+      }
+    });
+    container.appendChild(botaoDesconsiderarRecusa);
+  }
+
   const secaoFatos = el("div", { class: "secao" }, [el("h3", { texto: "Fatos (com evidência)" })]);
   if (detalhe.fatos.length === 0) {
     secaoFatos.appendChild(el("p", { class: "aviso", texto: "nenhum fato extraído ainda" }));
