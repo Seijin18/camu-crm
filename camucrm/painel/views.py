@@ -11,6 +11,7 @@ de `pipeline.recalcular(persistir=False)` e das consultas de `db.py`.
 
 from __future__ import annotations
 
+import shlex
 from typing import Any, Iterable
 
 from ..db import (
@@ -23,6 +24,7 @@ from ..db import (
     MarcoRegistro,
     MensagemRegistro,
     ObjecaoRegistro,
+    RascunhoRegistro,
 )
 from ..pipeline import EstadoConversa
 from ..rules.estagio import ORIGEM_BACKFILL
@@ -305,6 +307,63 @@ def item_fila_para_json(item: ItemFila) -> dict[str, Any]:
         "acao": item.acao,
         "motivo": item.motivo,
         "horas_esperando": item.horas_esperando,
+    }
+
+
+def comando_enviar(rascunho: RascunhoRegistro, opcao: int, texto: str | None) -> str:
+    """O comando que o botão "copiar" mostra ao lado do texto (design.md:
+    "o painel não envia, mas entrega o comando que carrega o vínculo").
+
+    `shlex.quote` protege o `--texto` de aspas/quebras que o texto da opção
+    possa conter — o operador cola e roda, sem editar escapes à mão.
+    """
+    return (
+        f"camucrm enviar {rascunho.conversa_id} --texto {shlex.quote(texto or '')} "
+        f"--rascunho {rascunho.id} --opcao {opcao}"
+    )
+
+
+def rascunho_para_json(rascunho: RascunhoRegistro) -> dict[str, Any]:
+    """Payload de um rascunho — geração recusada ou com as duas opções.
+
+    §12: nunca telefone (este payload nem carrega contato); os textos
+    (`opcao_1`/`opcao_2`/`texto_final`) são exatamente o que o LLM produziu
+    ou o humano escreveu, e podem já estar anonimizados pela purga
+    (`TEXTO_RASCUNHO_PURGADO`) se a mensagem vinculada tiver saído há tempo
+    demais (§12).
+    """
+    opcoes = None
+    comandos = None
+    if not rascunho.encerrar:
+        opcoes = [rascunho.opcao_1, rascunho.opcao_2]
+        comandos = {
+            "1": comando_enviar(rascunho, 1, rascunho.opcao_1),
+            "2": comando_enviar(rascunho, 2, rascunho.opcao_2),
+        }
+    return {
+        "id": rascunho.id,
+        "conversa_id": rascunho.conversa_id,
+        "estagio": rascunho.estagio,
+        "estagio_label": estagio_label(rascunho.estagio),
+        "temperatura": rascunho.temperatura,
+        "funil": rascunho.funil,
+        "objecao": rascunho.objecao,
+        "followups_enviados": rascunho.followups_enviados,
+        "opcoes": opcoes,
+        "avisos": rascunho.avisos.split("; ") if rascunho.avisos else [],
+        "encerrar": rascunho.encerrar,
+        "motivo": rascunho.motivo,
+        "modelo": rascunho.modelo,
+        "prompt_versao": rascunho.prompt_versao,
+        "gerado_em": rascunho.gerado_em.isoformat(),
+        "gerado_por": rascunho.gerado_por,
+        "escolhida": rascunho.escolhida,
+        "texto_final": rascunho.texto_final,
+        "escolhido_em": rascunho.escolhido_em.isoformat() if rascunho.escolhido_em else None,
+        "escolhido_por": rascunho.escolhido_por,
+        "mensagem_id": rascunho.mensagem_id,
+        "estagio_no_envio": rascunho.estagio_no_envio,
+        "comandos": comandos,
     }
 
 

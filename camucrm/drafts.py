@@ -36,6 +36,12 @@ logger = logging.getLogger("camucrm.rascunhos")
 MIN_LINHAS = 2
 MAX_LINHAS = 4
 
+# Change `rascunho-registrado`: gravada junto com cada linha de `rascunhos`
+# para o histórico saber sob qual versão de prompt cada opção foi gerada.
+# Bump quando `system_prompt`/`user_prompt` mudar de forma que afete o
+# resultado — mesma disciplina do `PROMPT_VERSAO` de `extraction/prompt.py`.
+PROMPT_VERSAO = "1"
+
 # Estágios em que abrir com preço queima o lead (§10): o cliente ainda não viu
 # o resultado, então o número chega sem nada que o justifique.
 ESTAGIOS_SEM_PRECO = frozenset({"S1", "S2"})

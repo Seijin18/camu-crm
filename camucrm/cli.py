@@ -155,12 +155,34 @@ def cmd_rascunho(args) -> int:
 
 
 def cmd_enviar(args) -> int:
-    """Envia um texto por um contato. Exige nome de quem aprovou (§1, §10)."""
+    """Envia um texto por um contato. Exige nome de quem aprovou (§1, §10).
+
+    `--rascunho <id> --opcao {1,2}` (change `rascunho-registrado`, design.md
+    caminho 1 — o mais confiável dos três caminhos de vínculo) diz
+    explicitamente qual rascunho gerou este envio: depois que
+    `registrar_mensagem` devolve o id, `db.vincular_rascunho` grava o
+    vínculo, e a escolha (opção 1 ou 2) é registrada junto, se a linha ainda
+    não tinha escolha (não sobrescreve uma escolha manual já feita).
+    """
     quem = _operador(args)
     banco = _db()
     conversa = banco.get_conversa(args.conversa)
     if conversa is None:
         raise SystemExit(f"conversa {args.conversa} não existe")
+
+    rascunho = None
+    if args.rascunho is not None or args.opcao is not None:
+        if args.rascunho is None or args.opcao is None:
+            raise SystemExit("--rascunho e --opcao só fazem sentido juntos")
+        rascunho = banco.rascunho(args.rascunho)
+        if rascunho is None or rascunho.conversa_id != conversa.id:
+            # Erro claro, não silencioso (CLAUDE.md/instrução do change): um
+            # id de rascunho de outra conversa não deve vincular nada.
+            raise SystemExit(
+                f"rascunho {args.rascunho} não existe ou não pertence à "
+                f"conversa {conversa.id}"
+            )
+
     with banco._conn() as conn:  # noqa: SLF001
         with conn.cursor() as cur:
             cur.execute(
@@ -175,10 +197,19 @@ def cmd_enviar(args) -> int:
         Destinatario(linha[0], linha[1]), args.texto, aprovado_por=quem
     )
     if resultado.entregue:
-        banco.registrar_mensagem(
+        mensagem_id = banco.registrar_mensagem(
             conversa.id, "out", args.texto, externa_id=resultado.externa_id
         )
         print(f"Enviado por {transporte.nome} (aprovado por {quem}).")
+        if rascunho is not None and mensagem_id is not None:
+            banco.vincular_rascunho(
+                rascunho.id, mensagem_id, estagio_no_envio=conversa.estagio
+            )
+            if rascunho.escolhida is None and rascunho.texto_final is None:
+                banco.registrar_escolha_rascunho(
+                    rascunho.id, escolhida=args.opcao, por=quem
+                )
+            print(f"Rascunho #{rascunho.id} vinculado à mensagem #{mensagem_id}.")
     else:
         print(f"Não enviado: {resultado.detalhe}")
     if args.followup:
@@ -480,6 +511,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--por", help="quem aprovou o envio")
     p.add_argument("--transporte")
     p.add_argument("--followup", action="store_true", help="conta como follow-up")
+    p.add_argument("--rascunho", type=int, help="id do rascunho usado (change rascunho-registrado)")
+    p.add_argument("--opcao", type=int, choices=[1, 2], help="qual opção do rascunho foi enviada")
     p.set_defaults(func=cmd_enviar)
 
     p = sub.add_parser("followup", help="registra um follow-up enviado (teto de 2)")

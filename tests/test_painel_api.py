@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import unittest
 from pathlib import Path
@@ -10,7 +11,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from camucrm.painel import server
+from camucrm.llm import FakeLlm
+from camucrm.painel import api, server
 from tests.fakes import FakeDatabase
 
 PAINEL_DIR = Path(server.__file__).resolve().parent
@@ -296,6 +298,153 @@ class TesteRotasDeAcao(unittest.TestCase):
         )
         self.assertEqual(resposta.status_code, 422)
         self.assertEqual(self.fake.correcoes, [])
+
+
+class TesteRotasDeRascunho(unittest.TestCase):
+    """Change `rascunho-registrado`: gerar/ler histórico/escolha — sempre
+    `POST` para gerar e escolher (§10/§7: gastam cota de LLM ou gravam
+    linha); nunca envia (o painel não tem rota de envio)."""
+
+    def setUp(self):
+        self.cliente = TestClient(server.app)
+        contexto = patch.dict("os.environ", {}, clear=False)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        os.environ.pop(server.ENV_TOKEN, None)
+        self.fake = FakeDatabase()
+        patcher = patch.object(server, "get_db", return_value=self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_gerar_rascunho_persiste_e_devolve_comando_pronto(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "oi, vi o insta de voces")
+        resposta_llm = json.dumps({"opcoes": [
+            "Manda uma foto do seu pet?\nTe mostro como fica.",
+            "Consegue mandar uma foto dele?\nJá te envio a prévia.",
+        ]})
+        with patch.object(api, "criar_llm", return_value=FakeLlm([resposta_llm])):
+            resposta = self.cliente.post(
+                f"/api/conversas/{conversa.id}/rascunho", json={"por": "marcos"}
+            )
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertEqual(len(corpo["opcoes"]), 2)
+        self.assertFalse(corpo["encerrar"])
+        self.assertIn(f"--rascunho {corpo['id']} --opcao 1", corpo["comandos"]["1"])
+        self.assertIn(f"--rascunho {corpo['id']} --opcao 2", corpo["comandos"]["2"])
+        self.assertIn(str(conversa.id), corpo["comandos"]["1"])
+        # E persistiu de fato — não só devolveu na resposta.
+        self.assertIsNotNone(self.fake.rascunho(corpo["id"]))
+
+    def test_gerar_rascunho_conversa_inexistente_devolve_422(self):
+        resposta = self.cliente.post("/api/conversas/999/rascunho", json={"por": "marcos"})
+        self.assertEqual(resposta.status_code, 422)
+        self.assertIn("erro", resposta.json())
+
+    def test_gerar_rascunho_encerrar_grava_recusa_com_motivo(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.followups.setdefault(conversa.id, [])
+        conversa.followups_enviados = 2  # teto atingido (§6) -> drafts.gerar recusa
+        with patch.object(api, "criar_llm", return_value=FakeLlm()):
+            resposta = self.cliente.post(
+                f"/api/conversas/{conversa.id}/rascunho", json={"por": "marcos"}
+            )
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertTrue(corpo["encerrar"])
+        self.assertIsNotNone(corpo["motivo"])
+        self.assertIsNone(corpo["opcoes"])
+        self.assertIsNone(corpo["comandos"])
+
+    def test_gerar_rascunho_llm_indisponivel_devolve_422(self):
+        from camucrm.llm import LlmIndisponivelError
+
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+
+        class LlmQuebrado:
+            nome = "quebrado"
+
+            def completar(self, system, user, *, json_estrito=False):
+                raise LlmIndisponivelError("cota esgotada")
+
+        with patch.object(api, "criar_llm", return_value=LlmQuebrado()):
+            resposta = self.cliente.post(
+                f"/api/conversas/{conversa.id}/rascunho", json={"por": "marcos"}
+            )
+        self.assertEqual(resposta.status_code, 422)
+        corpo = resposta.json()
+        self.assertIn("erro", corpo)
+        self.assertEqual(corpo["regra"], "§10")
+
+    def test_historico_de_rascunhos_nao_chama_llm(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        rascunho_id = self.fake.gravar_rascunho(
+            conversa.id, estagio="S1", temperatura="quente", funil="b2c",
+            opcoes=("a", "b"),
+        )
+        resposta = self.cliente.get(f"/api/conversas/{conversa.id}/rascunhos")
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertEqual(len(corpo["rascunhos"]), 1)
+        self.assertEqual(corpo["rascunhos"][0]["id"], rascunho_id)
+
+    def test_historico_conversa_inexistente(self):
+        resposta = self.cliente.get("/api/conversas/999/rascunhos")
+        self.assertIn("erro", resposta.json())
+
+    def test_registrar_escolha_por_opcao(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        rascunho_id = self.fake.gravar_rascunho(
+            conversa.id, estagio="S1", temperatura="quente", funil="b2c",
+            opcoes=("a", "b"),
+        )
+        resposta = self.cliente.post(
+            f"/api/rascunhos/{rascunho_id}/escolha",
+            json={"opcao": 1, "por": "marcos"},
+        )
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertEqual(corpo["escolhida"], 1)
+        self.assertIsNone(corpo["mensagem_id"])  # caminho 3: sem vínculo com mensagem
+
+    def test_registrar_escolha_texto_final_do_zero(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        rascunho_id = self.fake.gravar_rascunho(
+            conversa.id, estagio="S1", temperatura="quente", funil="b2c",
+            opcoes=("a", "b"),
+        )
+        resposta = self.cliente.post(
+            f"/api/rascunhos/{rascunho_id}/escolha",
+            json={"texto_final": "Escrevi do zero", "por": "marcos"},
+        )
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertIsNone(corpo["escolhida"])
+        self.assertEqual(corpo["texto_final"], "Escrevi do zero")
+
+    def test_registrar_escolha_sem_opcao_nem_texto_final_devolve_422(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        rascunho_id = self.fake.gravar_rascunho(
+            conversa.id, estagio="S1", temperatura="quente", funil="b2c",
+            opcoes=("a", "b"),
+        )
+        resposta = self.cliente.post(
+            f"/api/rascunhos/{rascunho_id}/escolha", json={"por": "marcos"}
+        )
+        self.assertEqual(resposta.status_code, 422)
+
+    def test_registrar_escolha_rascunho_inexistente_devolve_422(self):
+        resposta = self.cliente.post(
+            "/api/rascunhos/999/escolha", json={"opcao": 1, "por": "marcos"}
+        )
+        self.assertEqual(resposta.status_code, 422)
+
+    def test_nenhuma_rota_de_rascunho_contem_enviar(self):
+        caminhos = set(server.app.openapi()["paths"].keys())
+        for caminho in caminhos:
+            if "rascunho" in caminho:
+                self.assertNotIn("enviar", caminho)
 
 
 if __name__ == "__main__":

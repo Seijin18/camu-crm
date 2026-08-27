@@ -55,6 +55,21 @@ def hash_telefone(telefone: str, salt: str | None = None) -> str:
     return hashlib.sha256(f"{salt}:{normalizado}".encode("utf-8")).hexdigest()
 
 
+def _normalizar_texto(texto: str | None) -> str:
+    """strip + colapso de espaço + casefold — a ÚNICA definição de igualdade
+    que a reconciliação pelo eco (change `rascunho-registrado`, design.md)
+    usa. Vive aqui, não duplicada em `acoes.py`, para as duas pontas da
+    comparação (o texto vindo do eco da Evolution e o texto gravado em
+    `rascunhos.opcao_1/opcao_2/texto_final`) nunca divergirem por acidente.
+
+    Deliberadamente sem fuzzy matching: `None`/string vazia normaliza para
+    `""`, que nunca casa com nada (ver o guard em `rascunho_pendente_por_texto`).
+    """
+    if not texto:
+        return ""
+    return " ".join(texto.split()).casefold()
+
+
 # --------------------------------------------------------------------------
 # Dataclasses de linha
 # --------------------------------------------------------------------------
@@ -198,6 +213,40 @@ class ContatoResumido:
     tipo: str
     tem_telefone: bool
     criado_em: datetime
+
+
+@dataclass
+class RascunhoRegistro:
+    """Uma linha de `rascunhos` (change `rascunho-registrado`, §10).
+
+    Sufixo `Registro` para não colidir com `drafts.Rascunho` (o resultado em
+    memória de `drafts.gerar`, sem id nem persistência) nem com as
+    dataclasses de escrita do topo do arquivo. `NULL` em `escolhida` é
+    resultado — rascunho gerado e ainda não usado — não lacuna de dado.
+    """
+
+    id: int
+    conversa_id: int
+    estagio: str
+    temperatura: str
+    funil: str
+    objecao: str | None
+    followups_enviados: int
+    opcao_1: str | None
+    opcao_2: str | None
+    avisos: str | None
+    encerrar: bool
+    motivo: str | None
+    modelo: str | None
+    prompt_versao: str | None
+    gerado_em: datetime
+    gerado_por: str | None
+    escolhida: int | None
+    texto_final: str | None
+    escolhido_em: datetime | None
+    escolhido_por: str | None
+    mensagem_id: int | None
+    estagio_no_envio: str | None
 
 
 class TetoFollowupError(RuntimeError):
@@ -378,7 +427,78 @@ CREATE TABLE IF NOT EXISTS marcos_manuais (
     por             VARCHAR(48),
     UNIQUE (conversa_id, marco)
 );
+
+-- ADIÇÃO (§10, change `rascunho-registrado`): `drafts.gerar` produz duas
+-- opções e, até este change, tudo era descartado depois de impresso na CLI.
+-- Sem registro, aprendizado agregado (opção 1 vs opção 2, aceito sem edição
+-- vs editado) é impossível com ou sem modelo — ver design.md do change.
+--
+-- Contexto (estagio/temperatura/funil/objecao/followups_enviados) é
+-- COPIADO no momento da geração, não referenciado: a pergunta que a tabela
+-- responde é "o que esta abordagem produziu a partir DAQUI", e o estado da
+-- conversa muda depois. `NULL` em `escolhida` é resultado (gerado e
+-- descartado é o sinal mais barato de que o prompt errou), não lacuna.
+CREATE TABLE IF NOT EXISTS rascunhos (
+    id                  SERIAL PRIMARY KEY,
+    conversa_id         INTEGER NOT NULL REFERENCES conversas(id) ON DELETE CASCADE,
+    estagio             VARCHAR(4) NOT NULL,
+    temperatura         VARCHAR(16) NOT NULL,
+    funil               VARCHAR(8) NOT NULL CHECK (funil IN ('b2b', 'b2c')),
+    objecao             VARCHAR(24),
+    followups_enviados  INTEGER NOT NULL DEFAULT 0,
+    opcao_1             TEXT,
+    opcao_2             TEXT,
+    avisos              TEXT,
+    -- §10: recusar-se a rascunhar (teto de follow-up, FRIO já tocado) é
+    -- resposta legítima, não falha. `motivo` some quando não há recusa.
+    encerrar            BOOLEAN NOT NULL DEFAULT FALSE,
+    motivo              VARCHAR(160),
+    modelo              VARCHAR(64),
+    prompt_versao       VARCHAR(16),
+    gerado_em           TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    gerado_por          VARCHAR(48),
+    -- Escolha humana: 1/2 quando usou uma das opções tal como veio;
+    -- `texto_final` quando editou (junto com `escolhida`) ou escreveu do
+    -- zero (sozinho). Ver `rascunhos_escolha` abaixo.
+    escolhida           SMALLINT CHECK (escolhida IN (1, 2)),
+    texto_final         TEXT,
+    escolhido_em        TIMESTAMP WITH TIME ZONE,
+    escolhido_por       VARCHAR(48),
+    -- Vínculo com a mensagem realmente enviada (design.md: três caminhos,
+    -- do mais confiável ao menos — flag da CLI, reconciliação pelo eco,
+    -- registro manual sem vínculo). `estagio_no_envio` é o estágio da
+    -- conversa no momento do envio, não no momento da geração — os dois
+    -- podem divergir quando o rascunho fica pendente por um tempo.
+    mensagem_id         INTEGER REFERENCES mensagens(id) ON DELETE SET NULL,
+    estagio_no_envio    VARCHAR(4),
+    -- Nunca meia geração: ou as duas opções, ou recusa com motivo.
+    CONSTRAINT rascunhos_forma CHECK (
+        (NOT encerrar AND opcao_1 IS NOT NULL AND opcao_2 IS NOT NULL)
+        OR (encerrar AND motivo IS NOT NULL AND opcao_1 IS NULL AND opcao_2 IS NULL)
+    ),
+    -- Escolha registrada sempre tem `escolhido_em`; `escolhida IS NULL` com
+    -- `texto_final` preenchido é válido — o humano escreveu do zero, sem
+    -- usar nenhuma das duas opções.
+    CONSTRAINT rascunhos_escolha CHECK (
+        (escolhido_em IS NULL AND escolhida IS NULL AND texto_final IS NULL)
+        OR (escolhido_em IS NOT NULL AND (escolhida IS NOT NULL OR texto_final IS NOT NULL))
+    )
+);
+CREATE INDEX IF NOT EXISTS rascunhos_conversa_idx ON rascunhos (conversa_id, gerado_em);
+-- Nenhum mensagem_id reivindicado por dois rascunhos — dois rascunhos
+-- "vencedores" da mesma mensagem dobrariam a contagem de "esta abordagem
+-- avançou o estágio" de um jeito plausível e errado.
+CREATE UNIQUE INDEX IF NOT EXISTS rascunhos_mensagem_unica
+    ON rascunhos (mensagem_id) WHERE mensagem_id IS NOT NULL;
 """
+
+# §12, extensão da purga (change `rascunho-registrado`): texto escrito para
+# aquele cliente é conteúdo pessoal, mesmo depois de purgada a mensagem que
+# o carregava. Um placeholder — não NULL — porque `rascunhos_forma` exige
+# `opcao_1`/`opcao_2` preenchidos quando `encerrar = FALSE`: apagar para
+# `NULL` violaria a própria constraint que garante que a geração nunca ficou
+# pela metade.
+TEXTO_RASCUNHO_PURGADO = "[texto apagado — retenção §12]"
 
 
 class Database:
@@ -1174,6 +1294,187 @@ class Database:
                 row = cur.fetchone()
                 return ContatoResumido(*row) if row else None
 
+    # -- rascunhos (§10, change `rascunho-registrado`) ---------------------
+
+    _RASCUNHO_SELECT = """
+        SELECT id, conversa_id, estagio, temperatura, funil, objecao,
+               followups_enviados, opcao_1, opcao_2, avisos, encerrar, motivo,
+               modelo, prompt_versao, gerado_em, gerado_por, escolhida,
+               texto_final, escolhido_em, escolhido_por, mensagem_id,
+               estagio_no_envio
+          FROM rascunhos
+    """
+
+    def gravar_rascunho(
+        self,
+        conversa_id: int,
+        *,
+        estagio: str,
+        temperatura: str,
+        funil: str,
+        objecao: str | None = None,
+        followups_enviados: int = 0,
+        opcoes: tuple[str, str] | Sequence[str] | None = None,
+        avisos: Sequence[str] = (),
+        encerrar: bool = False,
+        motivo: str | None = None,
+        modelo: str | None = None,
+        prompt_versao: str | None = None,
+        gerado_por: str | None = None,
+    ) -> int:
+        """Grava o que `drafts.gerar` produziu — geração OU recusa, nunca as
+        duas (constraint `rascunhos_forma`). Devolve o id da linha.
+
+        Todo campo de contexto é copiado no momento da chamada — o chamador
+        (hoje só `camucrm.painel.api`) já resolveu `estado.estagio` etc. via
+        `pipeline.recalcular`; este método não recalcula nada.
+        """
+        if bool(encerrar) == bool(opcoes):
+            raise ValueError(
+                "rascunho é geração (opcoes) OU recusa (encerrar=True), nunca os dois"
+            )
+        opcao_1 = opcoes[0] if opcoes else None
+        opcao_2 = opcoes[1] if opcoes else None
+        avisos_texto = "; ".join(avisos) if avisos else None
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO rascunhos (
+                        conversa_id, estagio, temperatura, funil, objecao,
+                        followups_enviados, opcao_1, opcao_2, avisos,
+                        encerrar, motivo, modelo, prompt_versao, gerado_por
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        conversa_id, estagio, temperatura, funil, objecao,
+                        followups_enviados, opcao_1, opcao_2, avisos_texto,
+                        encerrar, motivo, modelo, prompt_versao, gerado_por,
+                    ),
+                )
+                return cur.fetchone()[0]
+
+    def registrar_escolha_rascunho(
+        self,
+        rascunho_id: int,
+        *,
+        escolhida: int | None = None,
+        texto_final: str | None = None,
+        por: str | None = None,
+    ) -> None:
+        """Registra a escolha humana. Nunca apaga a opção não escolhida — as
+        duas continuam na linha (requirement "Opção não escolhida não é
+        descartada"); só `escolhida`/`texto_final`/`escolhido_em/por` mudam.
+
+        Três formas válidas, todas aceitas aqui: escolheu uma opção
+        (`escolhida`), escolheu e editou (`escolhida` + `texto_final`), ou
+        escreveu do zero (só `texto_final`).
+        """
+        if escolhida is not None and escolhida not in (1, 2):
+            raise ValueError(f"escolhida inválida: {escolhida!r} (use 1, 2 ou None)")
+        if escolhida is None and not texto_final:
+            raise ValueError(
+                "escolha precisa de `escolhida` (1 ou 2) ou de `texto_final`"
+            )
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE rascunhos
+                       SET escolhida = %s, texto_final = %s,
+                           escolhido_em = now(), escolhido_por = %s
+                     WHERE id = %s
+                    """,
+                    (escolhida, texto_final, por, rascunho_id),
+                )
+
+    def vincular_rascunho(
+        self, rascunho_id: int, mensagem_id: int, *, estagio_no_envio: str | None = None
+    ) -> bool:
+        """Vincula rascunho -> mensagem realmente enviada (caminho 1 ou 2 do
+        design.md). A garantia de que `mensagem_id` não é reivindicado duas
+        vezes é do índice único parcial `rascunhos_mensagem_unica` — uma
+        segunda tentativa de vincular a mesma mensagem propaga
+        `psycopg.errors.UniqueViolation`, não é traduzida aqui.
+
+        Devolve `False` quando `rascunho_id` não existe (nada para vincular);
+        `True` quando a linha foi encontrada e atualizada.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE rascunhos
+                       SET mensagem_id = %s,
+                           estagio_no_envio = COALESCE(%s, estagio_no_envio)
+                     WHERE id = %s
+                    """,
+                    (mensagem_id, estagio_no_envio, rascunho_id),
+                )
+                return cur.rowcount > 0
+
+    def rascunho_pendente_por_texto(
+        self, conversa_id: int, texto: str, *, janela_horas: int = 48
+    ) -> int | None:
+        """Reconciliação pelo eco (design.md, caminho 2): casamento EXATO de
+        texto normalizado (`_normalizar_texto`) contra `opcao_1`/`opcao_2`/
+        `texto_final` de um rascunho pendente (`mensagem_id IS NULL`) das
+        últimas `janela_horas`. Sem fuzzy, sem LLM — texto editado no envio
+        não casa, e a função devolve `None` (requirement "Reconciliação pelo
+        eco não usa casamento aproximado").
+
+        A comparação é feita em Python, não em SQL: `_normalizar_texto` é a
+        única definição de igualdade, e mantê-la fora do SQL evita que a
+        regra de normalização precise ser reescrita (e possivelmente
+        divergir) em dialeto de banco.
+        """
+        alvo = _normalizar_texto(texto)
+        if not alvo:
+            return None
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, opcao_1, opcao_2, texto_final FROM rascunhos
+                     WHERE conversa_id = %s
+                       AND mensagem_id IS NULL
+                       AND gerado_em >= now() - make_interval(hours => %s)
+                     ORDER BY gerado_em DESC
+                    """,
+                    (conversa_id, janela_horas),
+                )
+                candidatos = cur.fetchall()
+        for rascunho_id, opcao_1, opcao_2, texto_final in candidatos:
+            if alvo in (
+                _normalizar_texto(opcao_1),
+                _normalizar_texto(opcao_2),
+                _normalizar_texto(texto_final),
+            ):
+                return rascunho_id
+        return None
+
+    def rascunho(self, rascunho_id: int) -> RascunhoRegistro | None:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"{self._RASCUNHO_SELECT} WHERE id = %s", (rascunho_id,))
+                row = cur.fetchone()
+                return RascunhoRegistro(*row) if row else None
+
+    def rascunhos_da_conversa(
+        self, conversa_id: int, limite: int = 5
+    ) -> list[RascunhoRegistro]:
+        """Histórico de rascunhos da conversa, mais recente primeiro — sem
+        chamar LLM (leitura pura, `GET /api/conversas/{id}/rascunhos`)."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"{self._RASCUNHO_SELECT} WHERE conversa_id = %s "
+                    "ORDER BY gerado_em DESC LIMIT %s",
+                    (conversa_id, limite),
+                )
+                return [RascunhoRegistro(*row) for row in cur.fetchall()]
+
     # -- retenção (§12) ---------------------------------------------------
 
     def purgar_mensagens_antigas(self, meses: int = 12) -> int:
@@ -1183,9 +1484,34 @@ class Database:
         serve para análise e não guarda conteúdo pessoal. O telefone em claro
         também sai, porque o motivo de guardá-lo era poder enviar, e uma
         conversa encerrada há um ano não recebe envio.
+
+        Extensão do change `rascunho-registrado`: `rascunhos.opcao_1`/
+        `opcao_2`/`texto_final` de rascunhos vinculados às mensagens que
+        serão purgadas também é conteúdo pessoal (texto escrito para aquele
+        cliente) e sai — a linha em si (contexto, escolha, timestamps)
+        permanece. O `UPDATE` roda ANTES do `DELETE`: depois que a mensagem
+        some, o `ON DELETE SET NULL` do FK já apagou o `mensagem_id` que
+        identifica qual rascunho anonimizar.
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE rascunhos r
+                       SET opcao_1 = CASE WHEN r.opcao_1 IS NOT NULL
+                                          THEN %(marca)s ELSE NULL END,
+                           opcao_2 = CASE WHEN r.opcao_2 IS NOT NULL
+                                          THEN %(marca)s ELSE NULL END,
+                           texto_final = CASE WHEN r.texto_final IS NOT NULL
+                                              THEN %(marca)s ELSE NULL END
+                      FROM mensagens m
+                      JOIN conversas c ON c.id = m.conversa_id
+                     WHERE r.mensagem_id = m.id
+                       AND c.resultado IS NOT NULL
+                       AND c.atualizado_em < now() - make_interval(months => %(meses)s)
+                    """,
+                    {"marca": TEXTO_RASCUNHO_PURGADO, "meses": meses},
+                )
                 cur.execute(
                     """
                     DELETE FROM mensagens m USING conversas c

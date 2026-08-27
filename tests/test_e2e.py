@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from fakes import FakeDatabase  # noqa: E402
 
+from camucrm import acoes  # noqa: E402
 from camucrm.drafts import gerar as gerar_rascunho  # noqa: E402
 from camucrm.extraction.extractor import Extrator  # noqa: E402
 from camucrm.llm import FakeLlm, LlmIndisponivelError  # noqa: E402
@@ -336,6 +337,91 @@ class TesteRascunhoNoFimDoCiclo(unittest.TestCase):
         self.assertEqual(len(rascunho.opcoes), 2)
         # S1: nenhuma opção pode abrir com preço.
         self.assertFalse(any("R$" in o for o in rascunho.opcoes))
+
+
+class TesteCicloAteVinculoDoRascunho(unittest.TestCase):
+    """Change `rascunho-registrado` (§10): estende o E2E único do ciclo —
+
+        gera -> escolhe -> registra outbound -> reconcilia -> mensagem_id
+        vinculado; inbound de resposta -> extração -> avanço de estágio, com
+        o rascunho vinculado ao evento que veio DEPOIS dele.
+
+    CLAUDE.md: "toda mudança que altera esse ciclo estende este arquivo,
+    nunca duplica um E2E paralelo" — por isso mora aqui, não num arquivo
+    `test_rascunhos_e2e.py` à parte.
+    """
+
+    def test_ciclo_ate_o_vinculo_do_rascunho(self):
+        db = FakeDatabase()
+        conversa = db.criar_conversa(nome="Ana")
+        db.registrar_mensagem(
+            conversa.id, "in", "oi, vi o insta de voces", AGORA - timedelta(hours=2)
+        )
+        estado = recalcular(db, conversa, agora=AGORA)
+        self.assertEqual(estado.estagio, "S1")
+
+        # Gera duas opções (LLM) e persiste — não descarta como antes deste
+        # change.
+        opcoes_geradas = (
+            "Manda uma foto do seu pet?\nTe mostro como fica.",
+            "Consegue mandar uma foto dele?\nJá te envio a prévia.",
+        )
+        rascunho = gerar_rascunho(
+            FakeLlm([json.dumps({"opcoes": list(opcoes_geradas)})]),
+            [("in", "oi, vi o insta de voces")],
+            estagio=estado.estagio,
+            temperatura=estado.temperatura,
+            funil="b2c",
+            followups_enviados=0,
+        )
+        self.assertFalse(rascunho.encerrar)
+        rascunho_id = db.gravar_rascunho(
+            conversa.id,
+            estagio=estado.estagio,
+            temperatura=estado.temperatura,
+            funil="b2c",
+            followups_enviados=0,
+            opcoes=rascunho.opcoes,
+            avisos=rascunho.avisos,
+        )
+
+        # Escolhe a opção 1, tal como veio (caminho de escolha humana).
+        db.registrar_escolha_rascunho(rascunho_id, escolhida=1, por="Marcos")
+        self.assertEqual(db.rascunho(rascunho_id).opcao_2, opcoes_geradas[1])  # não descartada
+
+        # Registra a mensagem outbound de verdade e reconcilia pelo eco
+        # (caminho 2, design.md) — texto exato após normalização.
+        mensagem_out_id = db.registrar_mensagem(
+            conversa.id, "out", opcoes_geradas[0], AGORA - timedelta(hours=1, minutes=50)
+        )
+        vinculado = acoes.reconciliar_rascunho(
+            db, conversa.id, mensagem_out_id, opcoes_geradas[0]
+        )
+        self.assertEqual(vinculado, rascunho_id)
+        self.assertEqual(db.rascunho(rascunho_id).mensagem_id, mensagem_out_id)
+
+        # O cliente responde com a foto: extração avança S1 -> S2, num
+        # evento que acontece DEPOIS do envio ao qual o rascunho já está
+        # vinculado.
+        db.registrar_mensagem(
+            conversa.id, "in", "aqui ele, o nome dele e Thor", AGORA - timedelta(hours=1)
+        )
+        extrator = Extrator(db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "aqui ele, o nome dele e Thor"})
+        ]))
+        resultado = extrator.processar_conversa(conversa.id, agora=AGORA)
+        self.assertEqual(resultado.estado.estagio, "S2")
+
+        evento_avanco = [
+            e for e in db.eventos if e["conversa_id"] == conversa.id and e["para"] == "S2"
+        ][0]
+        mensagem_out = [
+            m for m in db.listar_mensagens(conversa.id) if m.texto == opcoes_geradas[0]
+        ][0]
+        self.assertLess(mensagem_out.enviada_em, evento_avanco["em"])
+        # O vínculo do rascunho sobreviveu ao recálculo de estágio.
+        self.assertEqual(db.rascunho(rascunho_id).mensagem_id, mensagem_out_id)
 
 
 if __name__ == "__main__":

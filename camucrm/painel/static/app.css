@@ -256,6 +256,28 @@ main {
   font-size: 0.75rem;
 }
 
+/* -- Rascunho (§10, change `rascunho-registrado`) ------------------------- */
+
+.rascunho-item {
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  padding: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+
+.rascunho-item pre {
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 0.85rem;
+  margin: 0 0 0.3rem 0;
+}
+
+.comando-pronto {
+  font-family: monospace;
+  font-size: 0.72rem;
+  word-break: break-all;
+}
+
 .msg {
   padding: 0.3rem 0.6rem;
   border-radius: 8px;

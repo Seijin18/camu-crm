@@ -21,12 +21,24 @@ buraco tanto na CLI quanto na API do painel.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from .db import Database, MARCOS_MANUAIS
+from .db import _normalizar_texto as _normalizar
 from .pipeline import EstadoConversa, carregar_sinais, recalcular
 from .rules.estagio import Transicao, mudar_funil
 from .taxonomia import B2B, B2C
+
+# §10, change `rascunho-registrado`: caminho 2 de vínculo (reconciliação
+# pelo eco da Evolution). `_normalizar` é reexportado de `db._normalizar_texto`
+# — não uma segunda definição — para as duas pontas da comparação (o texto
+# do eco e o texto gravado em `rascunhos`) nunca divergirem por acidente.
+ENV_RECONCILIAR_RASCUNHO = "CAMU_RECONCILIAR_RASCUNHO"
+
+# design.md: janela de 48h — rascunho gerado há mais tempo que isso não é
+# mais candidato a ter sido "o que acabou de ser enviado".
+JANELA_RECONCILIACAO_HORAS = 48
 
 # Marcos que só fazem sentido no funil B2B — §3: "consignação assinada" e
 # "primeira reposição" são conceitos de petshop revendedor, sem equivalente
@@ -157,3 +169,36 @@ def mudar_funil_conversa(
         db.atualizar_estado_conversa(conversa_id, estagio=movimento.para)
 
     return ResultadoFunil(conversa_id, anterior, novo_funil, movimento=movimento)
+
+
+def reconciliar_rascunho(
+    db: Database, conversa_id: int, mensagem_id: int, texto: str
+) -> int | None:
+    """Caminho 2 de vínculo rascunho -> mensagem (design.md, `rascunho-registrado`).
+
+    Chamado por `ingest.ingerir` sempre que uma mensagem `out` NOVA (não
+    duplicata) é gravada. Procura um rascunho pendente (`mensagem_id IS
+    NULL`) da mesma conversa, dentro de `JANELA_RECONCILIACAO_HORAS`, cujo
+    texto normalizado (`_normalizar`) bate EXATAMENTE com o texto recebido.
+
+    Sem fuzzy matching, sem LLM: se o operador editou o texto antes de
+    enviar, o casamento falha e a função devolve `None` — o rascunho fica
+    sem vínculo automático. Isso é o comportamento correto, não uma lacuna:
+    um vínculo errado envenena em silêncio a análise agregada que a tabela
+    existe para sustentar (requirement "Reconciliação pelo eco não usa
+    casamento aproximado").
+
+    Desligável por `CAMU_RECONCILIAR_RASCUNHO=false` (qualquer outro valor,
+    inclusive ausente, mantém a reconciliação ligada).
+    """
+    if os.getenv(ENV_RECONCILIAR_RASCUNHO, "true").strip().lower() == "false":
+        return None
+    if not _normalizar(texto):
+        return None
+    rascunho_id = db.rascunho_pendente_por_texto(
+        conversa_id, texto, janela_horas=JANELA_RECONCILIACAO_HORAS
+    )
+    if rascunho_id is None:
+        return None
+    db.vincular_rascunho(rascunho_id, mensagem_id)
+    return rascunho_id

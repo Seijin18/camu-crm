@@ -434,7 +434,132 @@ async function renderizarDetalhe(container, id) {
   });
   container.appendChild(secaoCorrecoes);
 
+  await renderizarRascunhos(container, id);
   await renderizarMensagens(container, id);
+}
+
+/**
+ * Change `rascunho-registrado` (§10): gera duas opções via LLM (POST — gasta
+ * cota e grava linha, nunca GET), mostra as duas com botão copiar (texto +
+ * comando `camucrm enviar` pronto, já com o id do rascunho) e permite
+ * registrar a escolha manualmente. O painel NUNCA envia — só gera e grava.
+ */
+async function renderizarRascunhos(container, id) {
+  const secao = el("div", { class: "secao" }, [el("h3", { texto: "Rascunho (§10)" })]);
+
+  const areaResultado = el("div", { class: "rascunho-resultado" });
+  const botaoGerar = el("button", { texto: "Gerar rascunho" });
+  botaoGerar.addEventListener("click", async () => {
+    botaoGerar.disabled = true;
+    areaResultado.textContent = "Gerando (chama o LLM)…";
+    try {
+      const dados = await chamarApiEscrever(`/conversas/${id}/rascunho`, {
+        por: obterOperador(),
+      });
+      areaResultado.textContent = "";
+      areaResultado.appendChild(montarRascunho(dados));
+    } catch (erro) {
+      areaResultado.textContent = `Erro: ${erro.message}${erro.regra ? ` (${erro.regra})` : ""}`;
+    } finally {
+      botaoGerar.disabled = false;
+    }
+  });
+  secao.appendChild(botaoGerar);
+  secao.appendChild(areaResultado);
+
+  const historico = await chamarApi(`/conversas/${id}/rascunhos?limite=5`);
+  secao.appendChild(el("h4", { texto: "Histórico (sem chamar o LLM)" }));
+  if (historico.rascunhos.length === 0) {
+    secao.appendChild(el("p", { class: "aviso", texto: "nenhum rascunho gerado ainda" }));
+  }
+  historico.rascunhos.forEach((r) => secao.appendChild(montarRascunho(r)));
+
+  container.appendChild(secao);
+}
+
+/** Um rascunho — opções (ou recusa), avisos, escolha já feita, e os botões
+ * de copiar/escolher. `textContent`/`el(..., {texto})` sempre; o texto vem
+ * de conversa/LLM e nunca deve virar HTML (regra do topo do arquivo). */
+function montarRascunho(rascunho) {
+  const bloco = el("div", { class: "rascunho-item" });
+  bloco.appendChild(
+    el("p", {
+      class: "aviso",
+      texto: `#${rascunho.id} — ${new Date(rascunho.gerado_em).toLocaleString()}`,
+    })
+  );
+
+  if (rascunho.encerrar) {
+    bloco.appendChild(el("p", { texto: `Recusado pelo modelo: ${rascunho.motivo}` }));
+    return bloco;
+  }
+
+  rascunho.opcoes.forEach((texto, indice) => {
+    const numero = indice + 1;
+    const opcaoEl = el("div", { class: "linha" });
+    opcaoEl.appendChild(el("pre", { texto }));
+
+    const comando = rascunho.comandos ? rascunho.comandos[String(numero)] : null;
+    const botaoCopiar = el("button", {
+      class: "secundario",
+      texto: `Copiar opção ${numero} + comando`,
+    });
+    botaoCopiar.addEventListener("click", async () => {
+      const rotuloOriginal = botaoCopiar.textContent;
+      try {
+        await navigator.clipboard.writeText(comando ? `${texto}\n\n${comando}` : texto);
+        botaoCopiar.textContent = "Copiado!";
+      } catch (e) {
+        // Clipboard indisponível (sem permissão, contexto não seguro) — o
+        // texto e o comando já estão visíveis na tela para copiar à mão.
+        botaoCopiar.textContent = "Copie manualmente (clipboard indisponível)";
+      }
+      setTimeout(() => { botaoCopiar.textContent = rotuloOriginal; }, 2000);
+    });
+    opcaoEl.appendChild(botaoCopiar);
+    if (comando) {
+      opcaoEl.appendChild(el("div", { class: "aviso comando-pronto", texto: comando }));
+    }
+
+    if (rascunho.escolhida === null && !rascunho.texto_final) {
+      const botaoEscolher = el("button", {
+        class: "secundario",
+        texto: `Registrar escolha: opção ${numero}`,
+      });
+      botaoEscolher.addEventListener("click", async () => {
+        try {
+          await chamarApiEscrever(`/rascunhos/${rascunho.id}/escolha`, {
+            opcao: numero,
+            por: obterOperador(),
+          });
+          botaoEscolher.textContent = "Registrado";
+          botaoEscolher.disabled = true;
+        } catch (erro) {
+          botaoEscolher.textContent = `Erro: ${erro.message}`;
+        }
+      });
+      opcaoEl.appendChild(botaoEscolher);
+    }
+    bloco.appendChild(opcaoEl);
+  });
+
+  if (rascunho.avisos && rascunho.avisos.length > 0) {
+    bloco.appendChild(
+      el("p", { class: "aviso", texto: `Avisos de tom: ${rascunho.avisos.join("; ")}` })
+    );
+  }
+  if (rascunho.escolhida !== null || rascunho.texto_final) {
+    const quem = rascunho.escolhida !== null ? `opção ${rascunho.escolhida}` : "texto próprio";
+    bloco.appendChild(
+      el("p", {
+        class: "aviso",
+        texto: `Escolhido: ${quem} — por ${rascunho.escolhido_por || "?"}${
+          rascunho.mensagem_id ? ` — vinculado à mensagem #${rascunho.mensagem_id}` : ""
+        }`,
+      })
+    );
+  }
+  return bloco;
 }
 
 async function renderizarMensagens(container, id) {

@@ -10,7 +10,7 @@ que "garante" uma constraint prova apenas que o fake concorda consigo mesmo.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from camucrm.db import (
@@ -24,7 +24,9 @@ from camucrm.db import (
     MarcoRegistro,
     MensagemRegistro,
     ObjecaoRegistro,
+    RascunhoRegistro,
     TetoFollowupError,
+    _normalizar_texto,
 )
 from camucrm.rules.sinais import Mensagem
 from camucrm.taxonomia import MAX_FOLLOWUPS, is_terminal, rank_estagio
@@ -136,6 +138,8 @@ class FakeDatabase:
         # `marco -> (em, por)`, por conversa — precisa de `por` e `em` reais
         # para `marcos_detalhados`, que `self.marcos` (só o set) não guarda.
         self.marcos_por: dict[int, dict[str, tuple[datetime, str | None]]] = {}
+        # change `rascunho-registrado`.
+        self.rascunhos: dict[int, RascunhoRegistro] = {}
         self._proximo_id = 1
         # Proxy de `conversas.atualizado_em` para `token_de_mudanca` (change
         # `painel-tempo-real`): o fake não guarda timestamp de atualização
@@ -489,3 +493,116 @@ class FakeDatabase:
         )
         conversa.contato_id = contato_id
         return conversa
+
+    # -- rascunhos (§10, change `rascunho-registrado`) --------------------
+
+    def gravar_rascunho(
+        self,
+        conversa_id,
+        *,
+        estagio,
+        temperatura,
+        funil,
+        objecao=None,
+        followups_enviados=0,
+        opcoes=None,
+        avisos=(),
+        encerrar=False,
+        motivo=None,
+        modelo=None,
+        prompt_versao=None,
+        gerado_por=None,
+    ) -> int:
+        if bool(encerrar) == bool(opcoes):
+            raise ValueError(
+                "rascunho é geração (opcoes) OU recusa (encerrar=True), nunca os dois"
+            )
+        rascunho_id = self._novo_id()
+        self.rascunhos[rascunho_id] = RascunhoRegistro(
+            id=rascunho_id,
+            conversa_id=conversa_id,
+            estagio=estagio,
+            temperatura=temperatura,
+            funil=funil,
+            objecao=objecao,
+            followups_enviados=followups_enviados,
+            opcao_1=opcoes[0] if opcoes else None,
+            opcao_2=opcoes[1] if opcoes else None,
+            avisos="; ".join(avisos) if avisos else None,
+            encerrar=encerrar,
+            motivo=motivo,
+            modelo=modelo,
+            prompt_versao=prompt_versao,
+            gerado_em=datetime.now(timezone.utc),
+            gerado_por=gerado_por,
+            escolhida=None,
+            texto_final=None,
+            escolhido_em=None,
+            escolhido_por=None,
+            mensagem_id=None,
+            estagio_no_envio=None,
+        )
+        return rascunho_id
+
+    def registrar_escolha_rascunho(
+        self, rascunho_id, *, escolhida=None, texto_final=None, por=None
+    ) -> None:
+        if escolhida is not None and escolhida not in (1, 2):
+            raise ValueError(f"escolhida inválida: {escolhida!r} (use 1, 2 ou None)")
+        if escolhida is None and not texto_final:
+            raise ValueError(
+                "escolha precisa de `escolhida` (1 ou 2) ou de `texto_final`"
+            )
+        registro = self.rascunhos.get(rascunho_id)
+        if registro is None:
+            return
+        registro.escolhida = escolhida
+        registro.texto_final = texto_final
+        registro.escolhido_em = datetime.now(timezone.utc)
+        registro.escolhido_por = por
+
+    def vincular_rascunho(self, rascunho_id, mensagem_id, *, estagio_no_envio=None) -> bool:
+        registro = self.rascunhos.get(rascunho_id)
+        if registro is None:
+            return False
+        # Espelha o índice único parcial `rascunhos_mensagem_unica`: recusa
+        # reivindicar uma mensagem já vinculada a outro rascunho.
+        for outro in self.rascunhos.values():
+            if outro.id != rascunho_id and outro.mensagem_id == mensagem_id:
+                raise ValueError(
+                    f"mensagem {mensagem_id} já vinculada ao rascunho {outro.id}"
+                )
+        registro.mensagem_id = mensagem_id
+        if estagio_no_envio is not None:
+            registro.estagio_no_envio = estagio_no_envio
+        return True
+
+    def rascunho_pendente_por_texto(self, conversa_id, texto, *, janela_horas=48):
+        alvo = _normalizar_texto(texto)
+        if not alvo:
+            return None
+        agora = datetime.now(timezone.utc)
+        candidatos = [
+            r
+            for r in self.rascunhos.values()
+            if r.conversa_id == conversa_id
+            and r.mensagem_id is None
+            and (agora - r.gerado_em) <= timedelta(hours=janela_horas)
+        ]
+        candidatos.sort(key=lambda r: r.gerado_em, reverse=True)
+        for registro in candidatos:
+            if alvo in (
+                _normalizar_texto(registro.opcao_1),
+                _normalizar_texto(registro.opcao_2),
+                _normalizar_texto(registro.texto_final),
+            ):
+                return registro.id
+        return None
+
+    def rascunho(self, rascunho_id: int) -> RascunhoRegistro | None:
+        return self.rascunhos.get(rascunho_id)
+
+    def rascunhos_da_conversa(self, conversa_id: int, limite: int = 5):
+        linhas = [r for r in self.rascunhos.values() if r.conversa_id == conversa_id]
+        linhas.sort(key=lambda r: r.gerado_em, reverse=True)
+        return linhas[:limite]

@@ -33,8 +33,11 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .. import acoes, metrics
+from .. import acoes, config, metrics
 from ..db import Database
+from ..drafts import PROMPT_VERSAO, RascunhoInvalidoError
+from ..drafts import gerar as gerar_rascunho
+from ..llm import LlmIndisponivelError, criar_llm
 from ..pipeline import recalcular
 from ..rules.fila import Candidato, montar_fila
 from ..taxonomia import B2B, B2C, FUNIS
@@ -318,3 +321,111 @@ def registrar_correcao(conversa_id: int, corpo: CorrecaoBody, db: Database = Dep
         conversa_id, corpo.campo, corpo.antes, corpo.depois, por=corpo.por
     )
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Rascunho (change `rascunho-registrado`) — o painel gera e registra, nunca
+# envia. `POST`, sempre: gerar gasta cota de LLM e grava linha; registrar
+# escolha grava linha. Um `GET` reexecutado por qualquer prefetch de
+# navegador custaria dinheiro sozinho (mesma regra das rotas de resumo,
+# design.md).
+# --------------------------------------------------------------------------
+
+
+class GerarRascunhoBody(BaseModel):
+    por: str | None = None
+
+
+class EscolhaRascunhoBody(BaseModel):
+    opcao: int | None = None
+    texto_final: str | None = None
+    por: str | None = None
+
+
+@router.post("/conversas/{conversa_id}/rascunho")
+def gerar_rascunho_da_conversa(
+    conversa_id: int, corpo: GerarRascunhoBody, db: Database = Depends(_db)
+):
+    """Gera duas opções via LLM e persiste (§10). O painel NÃO envia — a
+    resposta traz, para cada opção, o comando `camucrm enviar ... --rascunho
+    <id> --opcao N` pronto para copiar (design.md: "o botão copiar do painel
+    copia o texto *e* mostra ao lado o comando pronto").
+    """
+    conversa = db.get_conversa(conversa_id)
+    if conversa is None:
+        return JSONResponse(
+            status_code=422, content=views.erro(f"conversa {conversa_id} não existe", None)
+        )
+
+    estado = recalcular(db, conversa, persistir=False)
+    historico = [(m.direcao, m.texto) for m in db.listar_mensagens(conversa_id)]
+    llm = criar_llm()
+    try:
+        rascunho = gerar_rascunho(
+            llm,
+            historico[-20:],
+            estagio=estado.estagio,
+            temperatura=estado.temperatura,
+            funil=conversa.funil,
+            followups_enviados=conversa.followups_enviados,
+            playbook=config.playbook(),
+        )
+    except (RascunhoInvalidoError, LlmIndisponivelError) as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), "§10"))
+
+    rascunho_id = db.gravar_rascunho(
+        conversa_id,
+        estagio=estado.estagio,
+        temperatura=estado.temperatura,
+        funil=conversa.funil,
+        followups_enviados=conversa.followups_enviados,
+        opcoes=rascunho.opcoes if not rascunho.encerrar else None,
+        avisos=rascunho.avisos,
+        encerrar=rascunho.encerrar,
+        motivo=rascunho.motivo,
+        modelo=getattr(llm, "nome", None),
+        prompt_versao=PROMPT_VERSAO,
+        gerado_por=corpo.por,
+    )
+    return views.rascunho_para_json(db.rascunho(rascunho_id))
+
+
+@router.get("/conversas/{conversa_id}/rascunhos")
+def rascunhos_da_conversa(
+    conversa_id: int, limite: int = 5, db: Database = Depends(_db)
+):
+    """Histórico de rascunhos da conversa — leitura pura, sem LLM."""
+    conversa = db.get_conversa(conversa_id)
+    if conversa is None:
+        return views.erro(f"conversa {conversa_id} não existe", None)
+    rascunhos = db.rascunhos_da_conversa(conversa_id, limite=limite)
+    return {"rascunhos": [views.rascunho_para_json(r) for r in rascunhos]}
+
+
+@router.post("/rascunhos/{rascunho_id}/escolha")
+def registrar_escolha_rascunho(
+    rascunho_id: int, corpo: EscolhaRascunhoBody, db: Database = Depends(_db)
+):
+    """Registro manual da escolha (design.md, caminho 3) — sem `mensagem_id`:
+    o operador diz "usei a opção 1" sem que o sistema saiba qual mensagem
+    concreta corresponde. Ver `cli.cmd_enviar --rascunho/--opcao` (caminho 1)
+    e `acoes.reconciliar_rascunho` (caminho 2) para os vínculos com mensagem.
+    """
+    rascunho = db.rascunho(rascunho_id)
+    if rascunho is None:
+        return JSONResponse(
+            status_code=422, content=views.erro(f"rascunho {rascunho_id} não existe", None)
+        )
+    if corpo.opcao is not None and corpo.opcao not in (1, 2):
+        return JSONResponse(
+            status_code=422, content=views.erro("`opcao` deve ser 1, 2 ou omitida", None)
+        )
+    if corpo.opcao is None and not corpo.texto_final:
+        return JSONResponse(
+            status_code=422,
+            content=views.erro("informe `opcao` (1 ou 2) ou `texto_final`", None),
+        )
+    db.registrar_escolha_rascunho(
+        rascunho_id, escolhida=corpo.opcao, texto_final=corpo.texto_final, por=corpo.por
+    )
+    return views.rascunho_para_json(db.rascunho(rascunho_id))

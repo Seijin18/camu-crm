@@ -15,8 +15,10 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 
+from . import acoes
 from .db import Database
 from .pipeline import EstadoConversa, recalcular
+from .rules.sinais import SAIDA
 from .taxonomia import B2B, B2C
 from .transport.base import EventoRecebido
 
@@ -91,6 +93,13 @@ def ingerir(
             "Mensagem duplicada ignorada (externa_id=%s)", evento.externa_id
         )
         return ResultadoIngestao(conversa.id, contato.label, duplicada=True)
+
+    if evento.direcao == SAIDA:
+        # Caminho 2 de vínculo rascunho -> mensagem (design.md, change
+        # `rascunho-registrado`): só para mensagem NOVA (não duplicata) e só
+        # `out` — o eco da Evolution é a única fonte que confirma o que foi
+        # de fato enviado.
+        acoes.reconciliar_rascunho(db, conversa.id, inserida, evento.texto)
 
     atualizada = db.get_conversa(conversa.id)
     assert atualizada is not None
