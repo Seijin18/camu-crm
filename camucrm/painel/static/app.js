@@ -251,7 +251,7 @@ async function renderizarKanban(container) {
               por,
             });
           }
-          await renderizarRota(); // recarrega o kanban com o estado novo
+          await renderizarRotaSegura(); // recarrega o kanban com o estado novo
         } catch (erro) {
           mostrarErroKanban(
             container,
@@ -921,6 +921,36 @@ async function renderizarFunciona(container) {
 
 // -- Roteador ----------------------------------------------------------------
 
+// Cada render limpa o container e só faz `appendChild` depois de um `await`
+// (buscar dados da API). Sem essa guarda, duas chamadas concorrentes a
+// `renderizarRotaSegura` intercalam: a segunda limpa o container que a
+// primeira ainda não preencheu, e as duas terminam anexando conteúdo — a
+// tela duplica cada seção. Isso acontece de verdade: `stream.py` emite um
+// evento `mensagem` E um evento `mudanca` no mesmo ciclo quando chega
+// mensagem nova (`gerador_sse`), e os dois chamavam `renderizarRota()` sem
+// exclusão mútua nenhuma. A correção é coalescer: só uma renderização roda
+// por vez, e um pedido que chega no meio vira "rode mais uma vez depois",
+// não uma segunda execução paralela.
+let renderEmAndamento = false;
+let renderPendente = false;
+
+async function renderizarRotaSegura() {
+  if (renderEmAndamento) {
+    renderPendente = true;
+    return;
+  }
+  renderEmAndamento = true;
+  try {
+    await renderizarRota();
+  } finally {
+    renderEmAndamento = false;
+    if (renderPendente) {
+      renderPendente = false;
+      renderizarRotaSegura();
+    }
+  }
+}
+
 async function renderizarRota() {
   const conteudo = document.getElementById("conteudo");
   conteudo.textContent = "";
@@ -996,7 +1026,7 @@ function processarBlocoSse(bloco) {
     // Recarrega a tela atual com os mesmos dados que "Atualizar" busca —
     // o stream só avisa que algo mudou, não tenta atualizar o DOM à mão
     // por cima do que `renderizarRota` já sabe montar.
-    renderizarRota();
+    renderizarRotaSegura();
   }
 }
 
@@ -1041,11 +1071,11 @@ function iniciar() {
   document.getElementById("botao-salvar-token").addEventListener("click", () => {
     salvarToken(document.getElementById("campo-token").value.trim());
     salvarOperador(document.getElementById("campo-operador").value.trim());
-    renderizarRota();
+    renderizarRotaSegura();
   });
-  document.getElementById("botao-atualizar").addEventListener("click", renderizarRota);
-  window.addEventListener("hashchange", renderizarRota);
-  renderizarRota();
+  document.getElementById("botao-atualizar").addEventListener("click", renderizarRotaSegura);
+  window.addEventListener("hashchange", renderizarRotaSegura);
+  renderizarRotaSegura();
   conectarStream();
 }
 
