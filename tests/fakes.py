@@ -25,6 +25,7 @@ from camucrm.db import (
     MensagemRegistro,
     ObjecaoRegistro,
     RascunhoRegistro,
+    RascunhoVinculadoRegistro,
     ResumoConversa,
     TetoFollowupError,
     _normalizar_texto,
@@ -305,6 +306,19 @@ class FakeDatabase:
         eventos = [e for e in self.eventos if e["conversa_id"] == conversa_id]
         return eventos[-1]["para"] if eventos else None
 
+    def estagios_de_conversas_encerradas(self) -> dict[int, list[str]]:
+        """Change `analise-desempenho`: espelha `db.py`, eventos crus de
+        conversas com `resultado IS NOT NULL` — a ordenação por rank fica em
+        `metrics.onde_morrem`, não aqui."""
+        encerradas = {
+            c.id for c in self.conversas.values() if c.resultado is not None
+        }
+        resultado: dict[int, list[str]] = {}
+        for e in self.eventos:
+            if e["conversa_id"] in encerradas:
+                resultado.setdefault(e["conversa_id"], []).append(e["para"])
+        return resultado
+
     def estagios_registrados(self, conversa_id: int) -> set[str]:
         return {e["para"] for e in self.eventos if e["conversa_id"] == conversa_id}
 
@@ -327,6 +341,17 @@ class FakeDatabase:
             if desde is not None and o["em"] < desde:
                 continue
             contagem[o["categoria"]] = contagem.get(o["categoria"], 0) + 1
+        return contagem
+
+    def distribuicao_objecoes_por_estagio(
+        self, desde=None
+    ) -> dict[tuple[str | None, str], int]:
+        contagem: dict[tuple[str | None, str], int] = {}
+        for o in self.objecoes:
+            if desde is not None and o["em"] < desde:
+                continue
+            chave = (o["estagio"], o["categoria"])
+            contagem[chave] = contagem.get(chave, 0) + 1
         return contagem
 
     def _conn(self) -> _FakeConn:
@@ -388,6 +413,24 @@ class FakeDatabase:
             for numero, texto, enviado_em in sorted(enviados, key=lambda f: f[0])
         ]
 
+    def retorno_por_numero_followup(self) -> dict[int, tuple[int, int]]:
+        """Change `analise-desempenho`: qualquer mensagem `in` na mesma
+        conversa depois de `enviado_em` conta como retorno — mesmo critério
+        de `db.py`."""
+        contagem: dict[int, list[int]] = {}
+        for conversa_id, enviados in self.followups.items():
+            mensagens_in = [
+                enviada_em
+                for _, direcao, _, enviada_em in self.mensagens.get(conversa_id, [])
+                if direcao == "in"
+            ]
+            for numero, _, enviado_em in enviados:
+                total, com_retorno = contagem.setdefault(numero, [0, 0])
+                total += 1
+                teve_retorno = any(m > enviado_em for m in mensagens_in)
+                contagem[numero] = [total, com_retorno + (1 if teve_retorno else 0)]
+        return {numero: tuple(v) for numero, v in contagem.items()}
+
     def registrar_marco(self, conversa_id, marco, *, por=None):
         self.marcos.setdefault(conversa_id, set()).add(marco)
         self.marcos_por.setdefault(conversa_id, {})[marco] = (
@@ -430,6 +473,18 @@ class FakeDatabase:
             if c["conversa_id"] == conversa_id
         ]
         return sorted(linhas, key=lambda c: c.em, reverse=True)
+
+    def padrao_correcoes(
+        self, desde=None
+    ) -> list[tuple[str, str | None, str | None, int]]:
+        contagem: dict[tuple[str, str | None, str | None], int] = {}
+        for c in self.correcoes:
+            if desde is not None and c["em"] < desde:
+                continue
+            chave = (c["campo"], c["antes"], c["depois"])
+            contagem[chave] = contagem.get(chave, 0) + 1
+        linhas = [(campo, antes, depois, n) for (campo, antes, depois), n in contagem.items()]
+        return sorted(linhas, key=lambda l: -l[3])
 
     def listar_mensagens_registradas(
         self, *, conversa_id: int | None = None, desde_id: int | None = None,
@@ -611,6 +666,43 @@ class FakeDatabase:
         linhas = [r for r in self.rascunhos.values() if r.conversa_id == conversa_id]
         linhas.sort(key=lambda r: r.gerado_em, reverse=True)
         return linhas[:limite]
+
+    def rascunhos_vinculados_para_analise(self) -> list[RascunhoVinculadoRegistro]:
+        """Change `analise-desempenho`: mesma janela de 72h de `db.py`,
+        calculada em Python sobre as mensagens em memória."""
+        # mensagem_id -> (conversa_id, enviada_em)
+        por_mensagem: dict[int, tuple[int, datetime]] = {}
+        for conversa_id, linhas in self.mensagens.items():
+            for mensagem_id, _direcao, _texto, enviada_em in linhas:
+                por_mensagem[mensagem_id] = (conversa_id, enviada_em)
+
+        resultado = []
+        for r in self.rascunhos.values():
+            if r.mensagem_id is None:
+                continue
+            info = por_mensagem.get(r.mensagem_id)
+            if info is None:
+                continue
+            conversa_id, enviada_em = info
+            janela = enviada_em + timedelta(hours=72)
+            estagios_72h = []
+            for e in self.eventos:
+                if (
+                    e["conversa_id"] == conversa_id
+                    and enviada_em < e["em"] <= janela
+                    and e["para"] not in estagios_72h
+                ):
+                    estagios_72h.append(e["para"])
+            resultado.append(
+                RascunhoVinculadoRegistro(
+                    rascunho_id=r.id,
+                    escolhida=r.escolhida,
+                    editado=r.texto_final is not None,
+                    estagio_no_envio=r.estagio_no_envio,
+                    estagios_72h=estagios_72h,
+                )
+            )
+        return sorted(resultado, key=lambda r: r.rascunho_id)
 
     # -- resumos (change `resumo-conversa`) --------------------------------
 

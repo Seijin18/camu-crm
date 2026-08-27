@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
+from camucrm import metrics
 from camucrm.db import (
     Conversa,
     CorrecaoRegistro,
@@ -289,6 +290,100 @@ class TesteErro(unittest.TestCase):
 
     def test_regra_pode_ser_none(self):
         self.assertEqual(views.erro("x", None), {"erro": "x", "regra": None})
+
+
+class TesteOQueFuncionaParaJson(unittest.TestCase):
+    """Change `analise-desempenho`: `n` sempre presente, e a supressão
+    ("sem amostra") é decisão de apresentação — aqui só confere que o
+    payload carrega `n`/`amostra_suficiente` sempre, mesmo baixo."""
+
+    def _payload(self, **overrides):
+        base = dict(
+            metricas_chave=[metrics.Conversao("S1", "S2", 3, 1)],
+            conversao_b2c=[metrics.Conversao("S0", "S1", 3, 1)],
+            conversao_b2b=[],
+            onde_morrem=metrics.OndeConversasMorrem({"S2": 2, "S4": 1}, 3),
+            tempo_por_estagio=[metrics.TempoNoEstagio("S1", 3, 12.0)],
+            objecao_por_estagio=metrics.ObjecaoPorEstagio({("S4", "frete"): 3}, 3),
+            saude_taxonomia=metrics.SaudeTaxonomia(3, 0, {"frete": 3}),
+            padrao_correcoes=[metrics.PadraoCorrecao("funil", "b2c", "b2b", 3)],
+            retorno_followup=[metrics.RetornoFollowup(1, 4, 2)],
+            ab_rascunhos=metrics.AbRascunhos(
+                n_vinculados=3, escolha_1=2, escolha_2=1, escreveu_do_zero=0,
+                editado=1, sem_edicao=2, avancou_72h=1, n_avaliavel_avanco=3,
+            ),
+        )
+        base.update(overrides)
+        return views.o_que_funciona_para_json(**base)
+
+    def test_conversao_carrega_n_e_amostra_suficiente_mesmo_baixo(self):
+        payload = self._payload()
+        linha = payload["funil"]["metricas_chave"][0]
+        self.assertEqual(linha["n"], 3)
+        self.assertEqual(linha["taxa"], 1 / 3)
+        self.assertFalse(linha["amostra_suficiente"])  # n=3 < AMOSTRA_MINIMA
+
+    def test_onde_morrem_carrega_distribuicao_e_n(self):
+        payload = self._payload()
+        bloco = payload["funil"]["onde_morrem"]
+        self.assertEqual(bloco["n"], 3)
+        self.assertFalse(bloco["amostra_suficiente"])
+        self.assertEqual({d["estagio"]: d["n"] for d in bloco["distribuicao"]}, {"S2": 2, "S4": 1})
+
+    def test_tempo_por_estagio_carrega_n(self):
+        payload = self._payload()
+        linha = payload["tempo_por_estagio"][0]
+        self.assertEqual(linha["n"], 3)
+        self.assertEqual(linha["horas_medianas"], 12.0)
+
+    def test_objecoes_por_estagio_nao_descarta_estagio(self):
+        payload = self._payload()
+        celulas = payload["objecoes"]["por_estagio"]["celulas"]
+        self.assertEqual(celulas, [{"estagio": "S4", "estagio_label": "Preço apresentado",
+                                     "categoria": "frete", "n": 3}])
+
+    def test_correcoes_carrega_padrao_e_n_total(self):
+        payload = self._payload()
+        bloco = payload["correcoes"]
+        self.assertEqual(bloco["n"], 3)
+        self.assertEqual(bloco["linhas"][0]["campo"], "funil")
+
+    def test_followups_carrega_taxa_e_n(self):
+        payload = self._payload()
+        linha = payload["followups"]["retorno"][0]
+        self.assertEqual(linha["n"], 4)
+        self.assertEqual(linha["taxa"], 0.5)
+        self.assertFalse(linha["amostra_suficiente"])  # n=4 < 10
+
+    def test_rascunhos_bloqueado_abaixo_do_limiar_mas_nao_esconde_o_dado(self):
+        """Requirement "Bloco de rascunhos nasce bloqueado": `bloqueado` vem
+        junto de `n_vinculados`/`limiar`, e as contagens calculadas
+        continuam no payload — é a tela que decide desenhar o contador em
+        vez do gráfico, não este serializador."""
+        payload = self._payload()
+        bloco = payload["rascunhos"]
+        self.assertEqual(bloco["n_vinculados"], 3)
+        self.assertEqual(bloco["limiar"], metrics.LIMIAR_RASCUNHOS_VINCULADOS)
+        self.assertTrue(bloco["bloqueado"])
+        self.assertEqual(bloco["opcao_1"]["n"], 2)
+        self.assertEqual(bloco["editado"]["n"], 1)
+
+    def test_rascunhos_desbloqueado_no_limiar(self):
+        ab = metrics.AbRascunhos(
+            n_vinculados=metrics.LIMIAR_RASCUNHOS_VINCULADOS,
+            escolha_1=15, escolha_2=15, escreveu_do_zero=0,
+            editado=10, sem_edicao=20, avancou_72h=12, n_avaliavel_avanco=30,
+        )
+        payload = self._payload(ab_rascunhos=ab)
+        self.assertFalse(payload["rascunhos"]["bloqueado"])
+
+    def test_nenhum_campo_de_acuracia_de_extracao(self):
+        """Restrição herdada de `openspec/project.md`: `/funciona` não pode
+        afirmar acurácia de extração antes de `ground-truth-marcos`."""
+        payload = self._payload()
+        texto = str(payload).lower()
+        self.assertNotIn("acuracia", texto)
+        self.assertNotIn("acurácia", texto)
 
 
 if __name__ == "__main__":

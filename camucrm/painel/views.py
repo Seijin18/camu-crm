@@ -27,6 +27,7 @@ from ..db import (
     RascunhoRegistro,
     ResumoConversa,
 )
+from .. import metrics
 from ..pipeline import EstadoConversa
 from ..rules.estagio import ORIGEM_BACKFILL
 from ..rules.fila import ItemFila
@@ -415,6 +416,160 @@ def resumo_para_json(
         "gerado_por": registro.gerado_por,
         "mensagens_desde": mensagens_desde,
         "erro": erro,
+    }
+
+
+def _conversao_para_json(c) -> dict[str, Any]:
+    return {
+        "de": c.de,
+        "para": c.para,
+        "de_label": estagio_label(c.de),
+        "para_label": estagio_label(c.para),
+        "alcancaram_de": c.alcancaram_de,
+        "alcancaram_para": c.alcancaram_para,
+        "n": c.alcancaram_de,
+        "taxa": c.taxa,
+        "amostra_suficiente": metrics.amostra_suficiente(c.alcancaram_de),
+    }
+
+
+def _onde_morrem_para_json(dados: "metrics.OndeConversasMorrem") -> dict[str, Any]:
+    return {
+        "distribuicao": [
+            {"estagio": e, "estagio_label": estagio_label(e), "n": n}
+            for e, n in sorted(dados.distribuicao.items(), key=lambda kv: -kv[1])
+        ],
+        "n": dados.n,
+        "amostra_suficiente": metrics.amostra_suficiente(dados.n),
+    }
+
+
+def _objecao_por_estagio_para_json(dados: "metrics.ObjecaoPorEstagio") -> dict[str, Any]:
+    return {
+        "celulas": [
+            {
+                "estagio": estagio,
+                "estagio_label": estagio_label(estagio) if estagio else None,
+                "categoria": categoria,
+                "n": n,
+            }
+            for (estagio, categoria), n in sorted(
+                dados.contagem.items(), key=lambda kv: -kv[1]
+            )
+        ],
+        "n": dados.n,
+        "amostra_suficiente": metrics.amostra_suficiente(dados.n),
+    }
+
+
+def _padrao_correcoes_para_json(linhas: list["metrics.PadraoCorrecao"]) -> dict[str, Any]:
+    n_total = sum(l.n for l in linhas)
+    return {
+        "linhas": [
+            {"campo": l.campo, "antes": l.antes, "depois": l.depois, "n": l.n}
+            for l in linhas
+        ],
+        "n": n_total,
+        "amostra_suficiente": metrics.amostra_suficiente(n_total),
+    }
+
+
+def _retorno_followup_para_json(linhas: list["metrics.RetornoFollowup"]) -> dict[str, Any]:
+    return [
+        {
+            "numero": r.numero,
+            "n": r.n,
+            "com_retorno": r.com_retorno,
+            "taxa": r.taxa,
+            "amostra_suficiente": metrics.amostra_suficiente(r.n),
+        }
+        for r in linhas
+    ]
+
+
+def _ab_rascunhos_para_json(dados: "metrics.AbRascunhos") -> dict[str, Any]:
+    """Bloco de rascunhos (§10) — sempre carrega `n_vinculados`/`limiar`/
+    `bloqueado`, mesmo abaixo do limiar (requirement "Bloco de rascunhos
+    nasce bloqueado"): a tela decide se desenha o contador ou o gráfico, este
+    payload nunca esconde o dado calculado.
+    """
+    n_escolha = dados.escolha_1 + dados.escolha_2
+    n_edicao = dados.editado + dados.sem_edicao
+    return {
+        "n_vinculados": dados.n_vinculados,
+        "limiar": metrics.LIMIAR_RASCUNHOS_VINCULADOS,
+        "bloqueado": not dados.amostra_suficiente,
+        "opcao_1": {"n": dados.escolha_1, "total": n_escolha, "proporcao": dados.proporcao_opcao_1,
+                    "amostra_suficiente": metrics.amostra_suficiente(n_escolha)},
+        "opcao_2": {"n": dados.escolha_2, "total": n_escolha,
+                    "amostra_suficiente": metrics.amostra_suficiente(n_escolha)},
+        "escreveu_do_zero": dados.escreveu_do_zero,
+        "editado": {"n": dados.editado, "total": n_edicao, "proporcao": dados.proporcao_editado,
+                    "amostra_suficiente": metrics.amostra_suficiente(n_edicao)},
+        "sem_edicao": {"n": dados.sem_edicao, "total": n_edicao,
+                       "amostra_suficiente": metrics.amostra_suficiente(n_edicao)},
+        "avanco_72h": {
+            "n": dados.avancou_72h,
+            "total": dados.n_avaliavel_avanco,
+            "taxa": dados.taxa_avanco_72h,
+            "amostra_suficiente": metrics.amostra_suficiente(dados.n_avaliavel_avanco),
+        },
+    }
+
+
+def o_que_funciona_para_json(
+    *,
+    metricas_chave,
+    conversao_b2c,
+    conversao_b2b,
+    onde_morrem,
+    tempo_por_estagio,
+    objecao_por_estagio,
+    saude_taxonomia,
+    padrao_correcoes,
+    retorno_followup,
+    ab_rascunhos,
+) -> dict[str, Any]:
+    """Payload de `GET /api/o-que-funciona` (change `analise-desempenho`).
+
+    Restrição herdada de `openspec/project.md`: nenhuma chave aqui é
+    "acurácia de extração" — conversão e tempo por estágio são os únicos
+    números de funil mostrados porque não dependem de `ground-truth-marcos`.
+    Toda porcentagem sai acompanhada de `n` e `amostra_suficiente`
+    (§7/CLAUDE.md); é a tela, não este dicionário, que decide esconder o
+    número — o valor calculado nunca é omitido.
+    """
+    return {
+        "funil": {
+            "metricas_chave": [_conversao_para_json(c) for c in metricas_chave],
+            "conversao_b2c": [_conversao_para_json(c) for c in conversao_b2c],
+            "conversao_b2b": [_conversao_para_json(c) for c in conversao_b2b],
+            "onde_morrem": _onde_morrem_para_json(onde_morrem),
+        },
+        "tempo_por_estagio": [
+            {
+                "estagio": t.estagio,
+                "estagio_label": estagio_label(t.estagio),
+                "n": t.conversas,
+                "horas_medianas": t.horas_medianas,
+                "amostra_suficiente": metrics.amostra_suficiente(t.conversas),
+            }
+            for t in tempo_por_estagio
+        ],
+        "objecoes": {
+            "por_estagio": _objecao_por_estagio_para_json(objecao_por_estagio),
+            "saude_taxonomia": {
+                "total": saude_taxonomia.total,
+                "outros": saude_taxonomia.outros,
+                "proporcao_outro": saude_taxonomia.proporcao_outro,
+                "veredito": saude_taxonomia.veredito,
+                "distribuicao": saude_taxonomia.distribuicao,
+                "amostra_suficiente": metrics.amostra_suficiente(saude_taxonomia.total),
+            },
+        },
+        "correcoes": _padrao_correcoes_para_json(padrao_correcoes),
+        "followups": {"retorno": _retorno_followup_para_json(retorno_followup)},
+        "rascunhos": _ab_rascunhos_para_json(ab_rascunhos),
     }
 
 

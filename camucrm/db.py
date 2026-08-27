@@ -250,6 +250,24 @@ class RascunhoRegistro:
 
 
 @dataclass
+class RascunhoVinculadoRegistro:
+    """Insumo cru do A/B natural de rascunho (change `analise-desempenho`).
+
+    Uma linha por rascunho com `mensagem_id` vinculado. `estagios_72h` é a
+    lista (sem duplicar) de estágios alcançados pela conversa na janela de
+    72h após o envio da mensagem vinculada — cabe a `metrics.py`, não a este
+    módulo, decidir se algum deles representa avanço (comparar rank é regra
+    de domínio, `taxonomia.rank_estagio`, não SQL).
+    """
+
+    rascunho_id: int
+    escolhida: int | None
+    editado: bool
+    estagio_no_envio: str | None
+    estagios_72h: list[str]
+
+
+@dataclass
 class ResumoConversa:
     """Uma linha de `resumos_conversa` (change `resumo-conversa`).
 
@@ -989,6 +1007,31 @@ class Database:
                 estagios = [p for (p,) in cur.fetchall() if not is_terminal(p)]
         return max(estagios, key=rank_estagio) if estagios else None
 
+    def estagios_de_conversas_encerradas(self) -> dict[int, list[str]]:
+        """`conversa_id -> estágios (`para`) alcançados`, só para conversas
+        com `resultado IS NOT NULL` (change `analise-desempenho`).
+
+        Insumo de "onde as conversas morrem" (o plano: "o número mais
+        acionável no dia um"). Devolve os eventos crus; `metrics.py` decide o
+        estágio máximo com `taxonomia.rank_estagio`, mesma regra de
+        `estagio_maximo_alcancado` — a ordenação de estágio não é duplicada
+        aqui em SQL.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT ee.conversa_id, ee.para
+                      FROM eventos_estagio ee
+                      JOIN conversas c ON c.id = ee.conversa_id
+                     WHERE c.resultado IS NOT NULL
+                    """
+                )
+                resultado: dict[int, list[str]] = {}
+                for conversa_id, para in cur.fetchall():
+                    resultado.setdefault(conversa_id, []).append(para)
+                return resultado
+
     def estagio_corrente(self, conversa_id: int) -> str | None:
         """Estágio segundo o histórico de eventos — a fonte de verdade.
 
@@ -1076,6 +1119,29 @@ class Database:
                     cur.execute("SELECT categoria, COUNT(*) FROM objecoes GROUP BY categoria")
                 return dict(cur.fetchall())
 
+    def distribuicao_objecoes_por_estagio(
+        self, desde: datetime | None = None
+    ) -> dict[tuple[str | None, str], int]:
+        """Contagem por (estagio, categoria) — `objecoes.estagio` já é
+        coletado desde o início mas `distribuicao_objecoes` o descarta
+        (change `analise-desempenho`: "frete concentrado em S4" é mudança de
+        playbook, não de código).
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if desde:
+                    cur.execute(
+                        "SELECT estagio, categoria, COUNT(*) FROM objecoes "
+                        "WHERE em >= %s GROUP BY estagio, categoria",
+                        (desde,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT estagio, categoria, COUNT(*) FROM objecoes "
+                        "GROUP BY estagio, categoria"
+                    )
+                return {(estagio, categoria): n for estagio, categoria, n in cur.fetchall()}
+
     # -- follow-ups (§6) --------------------------------------------------
 
     def registrar_followup(self, conversa_id: int, texto: str | None = None) -> int:
@@ -1123,6 +1189,35 @@ class Database:
                     (conversa_id,),
                 )
                 return cur.fetchone()[0]
+
+    def retorno_por_numero_followup(self) -> dict[int, tuple[int, int]]:
+        """`numero (1 ou 2) -> (total_enviados, com_resposta_depois)`.
+
+        "Com resposta" é qualquer mensagem `in` na mesma conversa depois do
+        `enviado_em` do follow-up — responde "o 2º toque funciona alguma
+        vez" (plano: "decide se o teto devia ser 1"), change
+        `analise-desempenho`.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT f.numero,
+                           COUNT(*),
+                           COUNT(*) FILTER (
+                               WHERE EXISTS (
+                                   SELECT 1 FROM mensagens m
+                                    WHERE m.conversa_id = f.conversa_id
+                                      AND m.direcao = 'in'
+                                      AND m.enviada_em > f.enviado_em
+                               )
+                           )
+                      FROM followups f
+                     GROUP BY f.numero
+                     ORDER BY f.numero
+                    """
+                )
+                return {numero: (total, com_retorno) for numero, total, com_retorno in cur.fetchall()}
 
     # -- marcos manuais (§3) ----------------------------------------------
 
@@ -1192,6 +1287,30 @@ class Database:
                     "ORDER BY em DESC LIMIT %s",
                     (limite,),
                 )
+                return list(cur.fetchall())
+
+    def padrao_correcoes(
+        self, desde: datetime | None = None
+    ) -> list[tuple[str, str | None, str | None, int]]:
+        """Contagem por campo + par (antes, depois) (change
+        `analise-desempenho`). Plano: "funil corrigido 9× de b2c para b2b"
+        diz que a classificação B2B falha na ingestão — o padrão, não a
+        correção isolada, é o que aponta o defeito.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if desde:
+                    cur.execute(
+                        "SELECT campo, antes, depois, COUNT(*) FROM correcoes "
+                        "WHERE em >= %s GROUP BY campo, antes, depois "
+                        "ORDER BY COUNT(*) DESC",
+                        (desde,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT campo, antes, depois, COUNT(*) FROM correcoes "
+                        "GROUP BY campo, antes, depois ORDER BY COUNT(*) DESC"
+                    )
                 return list(cur.fetchall())
 
     # -- leitura do painel (§13, antecipado) -------------------------------
@@ -1531,6 +1650,49 @@ class Database:
                     (conversa_id, limite),
                 )
                 return [RascunhoRegistro(*row) for row in cur.fetchall()]
+
+    def rascunhos_vinculados_para_analise(self) -> list[RascunhoVinculadoRegistro]:
+        """Insumo do A/B natural de rascunho (§10, change `analise-desempenho`
+        — bloqueado por `rascunho-registrado`).
+
+        Só rascunhos com `mensagem_id` vinculado (o restante não corresponde
+        a envio real). A janela de 72h é filtrada aqui no SQL; decidir se os
+        estágios alcançados nela representam AVANÇO (comparar rank) é regra
+        de domínio e fica em `metrics.py` via `taxonomia.rank_estagio` — não
+        duplicamos a ordenação de estágio em SQL.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT r.id, r.escolhida, r.texto_final IS NOT NULL,
+                           r.estagio_no_envio,
+                           ee.para
+                      FROM rascunhos r
+                      JOIN mensagens m ON m.id = r.mensagem_id
+                      LEFT JOIN eventos_estagio ee
+                        ON ee.conversa_id = r.conversa_id
+                       AND ee.em > m.enviada_em
+                       AND ee.em <= m.enviada_em + interval '72 hours'
+                     WHERE r.mensagem_id IS NOT NULL
+                     ORDER BY r.id
+                    """
+                )
+                por_rascunho: dict[int, RascunhoVinculadoRegistro] = {}
+                for rascunho_id, escolhida, editado, estagio_no_envio, para in cur.fetchall():
+                    registro = por_rascunho.get(rascunho_id)
+                    if registro is None:
+                        registro = RascunhoVinculadoRegistro(
+                            rascunho_id=rascunho_id,
+                            escolhida=escolhida,
+                            editado=editado,
+                            estagio_no_envio=estagio_no_envio,
+                            estagios_72h=[],
+                        )
+                        por_rascunho[rascunho_id] = registro
+                    if para is not None and para not in registro.estagios_72h:
+                        registro.estagios_72h.append(para)
+                return list(por_rascunho.values())
 
     # -- resumos (§1 divergência registrada, change `resumo-conversa`) ----
 

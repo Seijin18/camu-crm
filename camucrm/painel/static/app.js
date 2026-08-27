@@ -679,6 +679,246 @@ async function renderizarMetricas(container) {
   container.appendChild(el("p", { texto: dados.saude_taxonomia.veredito }));
 }
 
+/*
+ * Change `analise-desempenho`: tela "O que está funcionando" (`#/funciona`).
+ *
+ * Regras que este bloco não pode quebrar (CLAUDE.md / spec do change):
+ *   - toda porcentagem vem com `n` ao lado; abaixo de `AMOSTRA_MINIMA`
+ *     (o servidor já manda `amostra_suficiente: false`) mostra "sem
+ *     amostra" em vez do número — a supressão é só de exibição, o valor
+ *     calculado já veio no payload.
+ *   - NUNCA linha de tendência — tendência sobre poucos pontos é o mesmo
+ *     modo de falha que a §7 do documento condena. Só tabela + barra CSS.
+ *   - o bloco de rascunhos nasce bloqueado com um contador explícito
+ *     ("precisa de N envios vinculados; hoje há M"), nunca um gráfico
+ *     vazio — gráfico vazio parece bug, contador parece progresso.
+ *   - esta tela não afirma nada sobre acurácia de extração (restrição do
+ *     `openspec/project.md`, herdada pelo change `analise-desempenho`):
+ *     nenhuma linha abaixo lê ou mostra "acurácia".
+ */
+
+function formatarPercentual(valor) {
+  return `${(valor * 100).toFixed(0)}%`;
+}
+
+/** Uma linha de tabela com barra CSS — `null`/`amostra_suficiente=false`
+ * mostra "sem amostra" no lugar do número (nunca esconde a linha inteira,
+ * só o percentual). */
+function linhaComBarra({ rotulo, n, proporcao, amostraSuficiente, detalhe }) {
+  const tr = el("tr");
+  tr.appendChild(el("td", { texto: rotulo }));
+
+  const tdValor = el("td");
+  if (proporcao === null || proporcao === undefined || !amostraSuficiente) {
+    tdValor.appendChild(el("span", { class: "funciona-sem-amostra", texto: "sem amostra" }));
+  } else {
+    const wrap = el("div", { class: "funciona-barra-wrap" });
+    const fundo = el("div", { class: "funciona-barra-fundo" });
+    const preenchimento = el("div", { class: "funciona-barra-preenchimento" });
+    preenchimento.style.width = `${Math.max(0, Math.min(100, proporcao * 100))}%`;
+    fundo.appendChild(preenchimento);
+    wrap.appendChild(fundo);
+    wrap.appendChild(el("span", { texto: formatarPercentual(proporcao) }));
+    tdValor.appendChild(wrap);
+  }
+  tr.appendChild(tdValor);
+
+  tr.appendChild(el("td", { texto: `n=${n}${detalhe ? ` — ${detalhe}` : ""}` }));
+  return tr;
+}
+
+function tabelaFunciona(cabecalhos, linhas) {
+  const tabela = el("table", { class: "funciona-tabela" });
+  const thead = el("thead", {}, [
+    el("tr", {}, cabecalhos.map((c) => el("th", { texto: c }))),
+  ]);
+  const tbody = el("tbody", {}, linhas);
+  tabela.appendChild(thead);
+  tabela.appendChild(tbody);
+  return tabela;
+}
+
+function secaoFunciona(titulo, filhos) {
+  return el("div", { class: "funciona-secao" }, [el("h3", { texto: titulo }), ...filhos]);
+}
+
+function blocoConversao(titulo, linhas) {
+  const trs = linhas.map((c) =>
+    linhaComBarra({
+      rotulo: `${c.de_label} → ${c.para_label} (${c.de}→${c.para})`,
+      n: c.n,
+      proporcao: c.taxa,
+      amostraSuficiente: c.amostra_suficiente,
+      detalhe: c.taxa === null ? null : `${c.alcancaram_para}/${c.alcancaram_de}`,
+    })
+  );
+  return secaoFunciona(titulo, [tabelaFunciona(["Transição", "Conversão", "Amostra"], trs)]);
+}
+
+function blocoOndeMorrem(dados) {
+  if (dados.distribuicao.length === 0) {
+    return secaoFunciona("Onde as conversas morrem (encerradas)", [
+      el("p", { class: "aviso", texto: "nenhuma conversa encerrada ainda" }),
+    ]);
+  }
+  const maiorN = Math.max(...dados.distribuicao.map((d) => d.n));
+  const linhas = dados.distribuicao.map((d) => {
+    const tr = el("tr");
+    tr.appendChild(el("td", { texto: `${d.estagio_label} (${d.estagio})` }));
+    const tdBarra = el("td");
+    const wrap = el("div", { class: "funciona-barra-wrap" });
+    const fundo = el("div", { class: "funciona-barra-fundo" });
+    const preenchimento = el("div", { class: "funciona-barra-preenchimento" });
+    preenchimento.style.width = `${maiorN ? (d.n / maiorN) * 100 : 0}%`;
+    fundo.appendChild(preenchimento);
+    wrap.appendChild(fundo);
+    wrap.appendChild(el("span", { texto: String(d.n) }));
+    tdBarra.appendChild(wrap);
+    tr.appendChild(tdBarra);
+    return tr;
+  });
+  const filhos = [tabelaFunciona(["Estágio", "Conversas encerradas ali"], linhas)];
+  if (!dados.amostra_suficiente) {
+    filhos.push(el("p", { class: "aviso", texto: `amostra baixa (n=${dados.n}) — leia com cautela` }));
+  }
+  return secaoFunciona("Onde as conversas morrem (encerradas)", filhos);
+}
+
+function blocoTempoPorEstagio(linhas) {
+  if (linhas.length === 0) {
+    return secaoFunciona("Tempo por estágio (só eventos ao vivo — §8)", [
+      el("p", { class: "aviso", texto: "sem transições ao vivo ainda" }),
+    ]);
+  }
+  const trs = linhas.map((t) => {
+    const tr = el("tr");
+    tr.appendChild(el("td", { texto: `${t.estagio_label} (${t.estagio})` }));
+    tr.appendChild(el("td", {
+      texto: t.horas_medianas === null ? "sem dado" : `${t.horas_medianas.toFixed(0)}h`,
+    }));
+    tr.appendChild(el("td", { texto: `n=${t.n}` }));
+    return tr;
+  });
+  return secaoFunciona("Tempo por estágio (só eventos ao vivo — §8)", [
+    tabelaFunciona(["Estágio", "Mediana", "Amostra"], trs),
+  ]);
+}
+
+function blocoObjecoesECorrecoes(objecoes, correcoes) {
+  const filhos = [];
+  if (objecoes.por_estagio.celulas.length === 0) {
+    filhos.push(el("p", { class: "aviso", texto: "nenhuma objeção com estágio registrado ainda" }));
+  } else {
+    const trs = objecoes.por_estagio.celulas.map((c) => {
+      const tr = el("tr");
+      tr.appendChild(el("td", { texto: c.estagio_label ? `${c.estagio_label} (${c.estagio})` : "(sem estágio)" }));
+      tr.appendChild(el("td", { texto: c.categoria }));
+      tr.appendChild(el("td", { texto: String(c.n) }));
+      return tr;
+    });
+    filhos.push(el("h4", { texto: "Objeção por estágio (§4)" }));
+    filhos.push(tabelaFunciona(["Estágio", "Objeção", "n"], trs));
+  }
+  filhos.push(el("p", { class: "aviso", texto: objecoes.saude_taxonomia.veredito }));
+
+  if (correcoes.linhas.length === 0) {
+    filhos.push(el("p", { class: "aviso", texto: "nenhuma correção registrada ainda" }));
+  } else {
+    const trs = correcoes.linhas.map((c) => {
+      const tr = el("tr");
+      tr.appendChild(el("td", { texto: c.campo }));
+      tr.appendChild(el("td", { texto: `"${c.antes ?? ""}" → "${c.depois ?? ""}"` }));
+      tr.appendChild(el("td", { texto: String(c.n) }));
+      return tr;
+    });
+    filhos.push(el("h4", { texto: "Padrão de correções (§7)" }));
+    filhos.push(tabelaFunciona(["Campo", "De → Para", "n"], trs));
+  }
+  return secaoFunciona("Objeções e correções", filhos);
+}
+
+function blocoFollowups(retorno) {
+  if (retorno.length === 0) {
+    return secaoFunciona("Retorno por número de follow-up (§6)", [
+      el("p", { class: "aviso", texto: "nenhum follow-up enviado ainda" }),
+    ]);
+  }
+  const trs = retorno.map((r) =>
+    linhaComBarra({
+      rotulo: `${r.numero}º toque`,
+      n: r.n,
+      proporcao: r.taxa,
+      amostraSuficiente: r.amostra_suficiente,
+      detalhe: r.taxa === null ? null : `${r.com_retorno}/${r.n} responderam depois`,
+    })
+  );
+  return secaoFunciona("Retorno por número de follow-up (§6)", [
+    tabelaFunciona(["Toque", "Taxa de retorno", "Amostra"], trs),
+  ]);
+}
+
+/** Bloco de rascunhos (§10): bloqueado com contador explícito enquanto
+ * `n_vinculados < limiar` — NUNCA um gráfico vazio (requirement "Bloco de
+ * rascunhos nasce bloqueado"). */
+function blocoRascunhos(dados) {
+  if (dados.bloqueado) {
+    return secaoFunciona("A/B natural de rascunho (§10)", [
+      el("div", { class: "funciona-bloqueado" }, [
+        el("div", { class: "contador", texto: `${dados.n_vinculados} / ${dados.limiar}` }),
+        el("div", { texto: `precisa de ${dados.limiar} envios vinculados; hoje há ${dados.n_vinculados}` }),
+      ]),
+    ]);
+  }
+  const trs = [
+    linhaComBarra({
+      rotulo: "Opção 1 (viés de posição)",
+      n: dados.opcao_1.total,
+      proporcao: dados.opcao_1.proporcao,
+      amostraSuficiente: dados.opcao_1.amostra_suficiente,
+    }),
+    linhaComBarra({
+      rotulo: "Editado (vs. sem edição)",
+      n: dados.editado.total,
+      proporcao: dados.editado.proporcao,
+      amostraSuficiente: dados.editado.amostra_suficiente,
+    }),
+    linhaComBarra({
+      rotulo: "Avançou estágio em 72h",
+      n: dados.avanco_72h.total,
+      proporcao: dados.avanco_72h.taxa,
+      amostraSuficiente: dados.avanco_72h.amostra_suficiente,
+    }),
+  ];
+  return secaoFunciona("A/B natural de rascunho (§10)", [
+    tabelaFunciona(["Pergunta", "Resultado", "Amostra"], trs),
+    el("p", { class: "aviso", texto: `escreveu do zero (sem usar opção): ${dados.escreveu_do_zero}` }),
+  ]);
+}
+
+async function renderizarFunciona(container) {
+  const dados = await chamarApi("/o-que-funciona?dias=90");
+  container.appendChild(el("h2", { texto: "O que está funcionando" }));
+  container.appendChild(
+    el("div", {
+      class: "funciona-nota",
+      texto:
+        "Esta tela não afirma nada sobre acurácia de extração — isso depende do " +
+        "conjunto de avaliação rotulado à mão (ground truth) e ainda não existe. " +
+        "Conversão e tempo por estágio abaixo são medidos direto do histórico de " +
+        "eventos, não da extração do modelo.",
+    })
+  );
+
+  container.appendChild(blocoConversao("Os três números (§14)", dados.funil.metricas_chave));
+  container.appendChild(blocoConversao("Conversão adjacente — B2C", dados.funil.conversao_b2c));
+  container.appendChild(blocoConversao("Conversão adjacente — B2B", dados.funil.conversao_b2b));
+  container.appendChild(blocoOndeMorrem(dados.funil.onde_morrem));
+  container.appendChild(blocoTempoPorEstagio(dados.tempo_por_estagio));
+  container.appendChild(blocoObjecoesECorrecoes(dados.objecoes, dados.correcoes));
+  container.appendChild(blocoFollowups(dados.followups.retorno));
+  container.appendChild(blocoRascunhos(dados.rascunhos));
+}
+
 // -- Roteador ----------------------------------------------------------------
 
 async function renderizarRota() {
@@ -704,6 +944,9 @@ async function renderizarRota() {
     } else if (partes[0] === "metricas") {
       marcarAbaAtiva("/metricas");
       await renderizarMetricas(conteudo);
+    } else if (partes[0] === "funciona") {
+      marcarAbaAtiva("/funciona");
+      await renderizarFunciona(conteudo);
     } else {
       conteudo.appendChild(el("p", { class: "aviso", texto: "rota desconhecida" }));
     }

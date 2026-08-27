@@ -325,3 +325,93 @@ main {
 .resumo-conteudo {
   margin-top: 0.4rem;
 }
+
+/* -- "O que está funcionando" (change `analise-desempenho`) --------------
+   Tabelas HTML + barra em CSS puro, de propósito (CLAUDE.md/plano): nenhuma
+   biblioteca de gráfico, nenhuma linha de tendência. */
+
+.funciona-nota {
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  margin-bottom: 1.25rem;
+  font-size: 0.8rem;
+  color: var(--texto-fraco);
+  background: var(--bg-elev);
+}
+
+.funciona-tabela {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 1rem;
+  font-size: 0.85rem;
+}
+
+.funciona-tabela th, .funciona-tabela td {
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--borda);
+}
+
+.funciona-tabela th {
+  color: var(--texto-fraco);
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.funciona-barra-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 160px;
+}
+
+.funciona-barra-fundo {
+  flex: 1;
+  height: 0.6rem;
+  background: var(--borda);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.funciona-barra-preenchimento {
+  height: 100%;
+  background: var(--acento);
+  border-radius: 999px;
+}
+
+.funciona-sem-amostra {
+  color: var(--texto-fraco);
+  font-style: italic;
+}
+
+/* Bloco de rascunhos bloqueado (§10): contador de progresso, nunca gráfico
+   vazio — "gráfico vazio parece bug, contador parece progresso" (plano). */
+.funciona-bloqueado {
+  border: 1px dashed var(--borda);
+  border-radius: 8px;
+  padding: 1rem;
+  text-align: center;
+  color: var(--texto-fraco);
+}
+
+.funciona-bloqueado .contador {
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--texto);
+  margin-bottom: 0.3rem;
+}
+
+.funciona-secao {
+  margin-bottom: 1.75rem;
+}
+
+.funciona-secao h3 {
+  font-size: 0.85rem;
+  color: var(--texto-fraco);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.5rem;
+}

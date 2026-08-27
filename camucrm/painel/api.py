@@ -247,6 +247,39 @@ def get_metricas(dias: int = 30, db: Database = Depends(_db)):
     )
 
 
+@router.get("/o-que-funciona")
+def get_o_que_funciona(dias: int = 90, db: Database = Depends(_db)):
+    """Tela `/funciona` (change `analise-desempenho`) — agrega tudo que é
+    respondível hoje sem depender de `ground-truth-marcos` (restrição
+    herdada de `openspec/project.md`: esta rota nunca devolve acurácia de
+    extração).
+
+    DIVERGÊNCIA registrada: `proposal.md` do change nomeia a rota
+    `/api/analise`; a execução seguiu `/api/o-que-funciona` (nome pedido na
+    instrução de execução, e o que casa com a rota de tela `/funciona`).
+    Nenhum requirement do `spec.md` amarra o nome da rota — o contrato
+    normativo é o payload, não o path.
+
+    `desde` filtra conversão, objeção e correção pelo período; "onde as
+    conversas morrem" e o A/B de rascunho olham o histórico inteiro de
+    propósito — cortar por `dias` uma pergunta sobre conversas já encerradas
+    ou rascunhos já vinculados descartaria amostra sem necessidade.
+    """
+    desde = datetime.now(timezone.utc) - timedelta(days=dias) if dias else None
+    return views.o_que_funciona_para_json(
+        metricas_chave=metrics.metricas_chave(db, desde=desde),
+        conversao_b2c=metrics.conversao_adjacente(db, B2C, desde=desde),
+        conversao_b2b=metrics.conversao_adjacente(db, B2B, desde=desde),
+        onde_morrem=metrics.onde_morrem(db),
+        tempo_por_estagio=metrics.tempo_por_estagio(db),
+        objecao_por_estagio=metrics.objecao_por_estagio(db, desde=desde),
+        saude_taxonomia=metrics.saude_taxonomia(db, desde=desde),
+        padrao_correcoes=metrics.padrao_correcoes(db, desde=desde),
+        retorno_followup=metrics.retorno_por_followup(db),
+        ab_rascunhos=metrics.ab_rascunhos(db),
+    )
+
+
 # --------------------------------------------------------------------------
 # Rotas de escrita (change `acoes-no-painel`) — sempre via `camucrm.acoes`
 # --------------------------------------------------------------------------

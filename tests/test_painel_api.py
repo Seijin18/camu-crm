@@ -157,6 +157,27 @@ class TesteRotas(unittest.TestCase):
         self.assertIn("tempo_por_estagio", corpo)
         self.assertIn("saude_taxonomia", corpo)
 
+    def test_o_que_funciona_smoke(self):
+        """Change `analise-desempenho`: rota nova, banco vazio — nenhum bloco
+        pode quebrar com n=0, e nenhum campo de acurácia de extração."""
+        resposta = self.cliente.get("/api/o-que-funciona")
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        for chave in ("funil", "tempo_por_estagio", "objecoes", "correcoes",
+                      "followups", "rascunhos"):
+            self.assertIn(chave, corpo)
+        self.assertIn("onde_morrem", corpo["funil"])
+        self.assertEqual(corpo["funil"]["onde_morrem"]["n"], 0)
+        self.assertIn("bloqueado", corpo["rascunhos"])
+        self.assertTrue(corpo["rascunhos"]["bloqueado"])
+        texto = json.dumps(corpo).lower()
+        self.assertNotIn("acuracia", texto)
+        self.assertNotIn("acurácia", texto)
+
+    def test_o_que_funciona_respeita_dias(self):
+        resposta = self.cliente.get("/api/o-que-funciona?dias=7")
+        self.assertEqual(resposta.status_code, 200)
+
     def test_conversa_inexistente_404_shape(self):
         resposta = self.cliente.get("/api/conversas/999")
         self.assertEqual(resposta.status_code, 200)  # painel devolve corpo de erro, não HTTP 404
