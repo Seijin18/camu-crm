@@ -112,6 +112,22 @@ Todas justificadas no ponto de uso; listadas aqui para não se perderem.
   ou a opção 2 converte melhor. `resumos_conversa` é folha do grafo: nenhuma
   regra a lê, e apagar a tabela inteira não muda estágio, temperatura nem
   fila de nenhuma conversa — existe só para leitura humana mais rápida.
+- **Base legal para prospecção B2B fria** (change `prospeccao-b2b-shortlist`,
+  tabela `prospeccoes`, fora do modelo de conversa da §9 de propósito). §12
+  registra que nenhuma base legal cobre "lista fria comprada ou raspada" —
+  decisão do usuário: **legítimo interesse (art. 10, LGPD) cobre este caso
+  específico** porque é pessoa jurídica (petshop), contato comercial B2B
+  (proposta de parceria), com dado já público (telefone comercial, endereço).
+  **Não se estende a qualquer lista de consumidor (B2C) raspada** — essa
+  continua sem base nenhuma, e a capability é estritamente B2B por desenho
+  (sem campo que aceite funil B2C). Decisão registrada aqui e no `design.md`
+  do change, não escondida.
+- **Prospecção não envia mensagem** (mesmo change). O painel continua sem
+  nenhuma rota de envio e sem credencial da Evolution API — o "disparo" é um
+  link `wa.me`/`api.whatsapp.com` que abre o WhatsApp com a mensagem pronta;
+  o humano aperta enviar lá dentro. A garantia testada em todos os 6 changes
+  do painel (`camucrm.painel` nunca importa `camucrm.transport`) permanece
+  intacta.
 
 ## Correções pendentes — auditoria completa do pipeline (2026-08)
 
@@ -203,6 +219,11 @@ Nesta ordem de dependência:
 3. **`midia-foto-pet`** — S2 é o estágio-chave e hoje depende de o cliente
    escrever algo junto da foto. Tratar mídia traz retenção e LGPD (§12) junto,
    e por isso é capability própria.
+4. **`prospeccao-b2b-shortlist`** — pedido do usuário, sem dependência das
+   outras três. Lista de petshops levantada externamente, anterior a
+   qualquer conversa — capability nova, separada do modelo de conversa da
+   §9 de propósito (ver "Decisões que divergem" acima para a base legal e a
+   decisão de nunca enviar pela API).
 
 O painel não é mais candidato — é change ativo, antecipado. Ver os seis
 changes `painel-leitura`, `painel-tempo-real`, `acoes-no-painel`,
