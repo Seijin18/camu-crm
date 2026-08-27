@@ -3,7 +3,7 @@
 import json
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -77,6 +77,21 @@ class TesteImportacao(unittest.TestCase):
         conversa = next(iter(db.conversas.values()))
         primeira = db.listar_mensagens(conversa.id)[0]
         self.assertEqual(primeira.enviada_em.tzinfo, timezone.utc)
+
+    def test_reimportar_mesmo_dump_sem_externa_id_nao_duplica_mensagem(self):
+        """Change `backfill-seguro-para-reexecucao`, §8: o próprio dump de
+        `DUMP` não traz `externa_id` nas mensagens (caso comum de um dump
+        externo sem os ids do WhatsApp) — sem um `externa_id` SINTÉTICO
+        estável, a segunda importação duplicaria as 3 mensagens."""
+        db = FakeDatabase()
+        primeiro = importar_conversas(db, DUMP)
+        self.assertEqual(primeiro.mensagens, 3)
+
+        segundo = importar_conversas(db, DUMP)
+        self.assertEqual(segundo.mensagens, 0)
+
+        conversa = next(iter(db.conversas.values()))
+        self.assertEqual(len(db.listar_mensagens(conversa.id)), 3)
 
 
 class TesteOrigemBackfill(unittest.TestCase):
@@ -158,6 +173,88 @@ class TesteReprocessamentoIdempotente(unittest.TestCase):
 
         extrator.processar_conversa(conversa.id, agora=AGORA, forcar=True)
         self.assertEqual(len(db.objecoes), 1)
+
+
+class TesteChunkingDeHistoricoGrande(unittest.TestCase):
+    """Change `backfill-seguro-para-reexecucao`, §8: uma conversa longa não
+    pode virar uma única chamada de LLM — estoura contexto (extração vazia,
+    silenciosa) ou degrada recall."""
+
+    def test_historico_de_1000_mais_mensagens_e_processado_em_blocos(self):
+        from camucrm.extraction.extractor import TAMANHO_MAXIMO_BLOCO
+
+        total = TAMANHO_MAXIMO_BLOCO * 5 + 50  # "1000+", não múltiplo exato
+        mensagens = [
+            {
+                "direcao": "in" if i % 2 == 0 else "out",
+                "texto": f"mensagem numero {i}",
+                "enviada_em": (
+                    datetime(2026, 7, 1, tzinfo=timezone.utc)
+                    + timedelta(minutes=i)
+                ).isoformat(),
+            }
+            for i in range(total)
+        ]
+        dump = [
+            {
+                "telefone": "5511999993333",
+                "nome": "Diana",
+                "tipo": "b2c",
+                "mensagens": mensagens,
+            }
+        ]
+
+        db = FakeDatabase()
+        importar_conversas(db, dump)
+        conversa = next(iter(db.conversas.values()))
+
+        llm = FakeLlm([])
+        extrator = Extrator(db, llm)
+        resultado = extrator.processar_conversa(conversa.id, agora=AGORA, forcar=True)
+
+        esperado_blocos = -(-total // TAMANHO_MAXIMO_BLOCO)  # divisão inteira p/ cima
+        self.assertGreater(esperado_blocos, 1)
+        self.assertEqual(len(llm.chamadas), esperado_blocos)
+
+        total_por_chamada = 0
+        for _, user in llm.chamadas:
+            contadas = user.count("CLIENTE:") + user.count("CAMU:")
+            self.assertLessEqual(contadas, TAMANHO_MAXIMO_BLOCO)
+            total_por_chamada += contadas
+        self.assertEqual(total_por_chamada, total)
+        self.assertEqual(resultado.mensagens_processadas, total)
+
+
+class TesteOrdemDeLeituraBateComEnviadaEm(unittest.TestCase):
+    """Change `backfill-seguro-para-reexecucao`, §8: `id` de inserção e
+    `enviada_em` podem divergir num dump não estritamente ordenado — a
+    extração precisa ler pela ordem CRONOLÓGICA real, não pela ordem em que
+    as linhas entraram no banco."""
+
+    def test_mensagens_inseridas_fora_de_ordem_sao_lidas_cronologicamente(self):
+        db = FakeDatabase()
+        contato = db.upsert_contato("5511999992222", nome="Elis", tipo="b2c")
+        conversa = db.get_or_create_conversa(contato.id, funil="b2c")
+
+        base = datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc)
+        # Inseridas fora de ordem cronológica: a primeira linha gravada
+        # (menor `id`) é a ÚLTIMA mensagem real; a ordem de `enviada_em` é o
+        # inverso da ordem de inserção.
+        db.registrar_mensagem(conversa.id, "in", "terceira", base + timedelta(minutes=20))
+        db.registrar_mensagem(conversa.id, "in", "primeira", base)
+        db.registrar_mensagem(conversa.id, "in", "segunda", base + timedelta(minutes=10))
+
+        llm = FakeLlm([])
+        extrator = Extrator(db, llm)
+        extrator.processar_conversa(conversa.id, agora=AGORA)
+
+        self.assertEqual(len(llm.chamadas), 1)
+        _, user = llm.chamadas[0]
+        posicao = {
+            texto: user.index(texto) for texto in ("primeira", "segunda", "terceira")
+        }
+        self.assertLess(posicao["primeira"], posicao["segunda"])
+        self.assertLess(posicao["segunda"], posicao["terceira"])
 
 
 if __name__ == "__main__":

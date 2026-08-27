@@ -1236,12 +1236,22 @@ class Database:
 
         Processar só o delta é o que mantém o custo de LLM proporcional ao que
         aconteceu, e não ao tamanho do histórico.
+
+        Change `backfill-seguro-para-reexecucao`, §8: ordenado por
+        `enviada_em` (com `id` como desempate), não só por `id` de inserção.
+        Em dumps não estritamente ordenados/multi-fonte, `id` (ordem de
+        inserção) e `enviada_em` (ordem real) podem divergir — `id` continua
+        decidindo o que é "novo" (o corte do delta), mas a ORDEM em que o
+        bloco chega ao LLM precisa bater com a cronologia real, mesma
+        convenção que `Database.listar_mensagens`/`construir_sinais` já
+        usam. Ordenar só por `id` faria o LLM ler a conversa fora de ordem
+        sempre que o dump de origem não for estritamente cronológico.
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, direcao, texto, enviada_em FROM mensagens "
-                    "WHERE conversa_id = %s AND id > %s ORDER BY id",
+                    "WHERE conversa_id = %s AND id > %s ORDER BY enviada_em, id",
                     (conversa_id, desde_id or 0),
                 )
                 return list(cur.fetchall())
@@ -1433,6 +1443,25 @@ class Database:
                     (conversa_id,),
                 )
                 return {p for (p,) in cur.fetchall()}
+
+    def trilhas_registradas(self, conversa_id: int) -> set[tuple[str | None, str]]:
+        """Pares `(de, para)` já gravados (change `backfill-seguro-para-reexecucao`).
+
+        `estagios_registrados` (só `para`) é o que `_trilha_de_backfill`
+        usava antes: pular uma transição por já existir QUALQUER evento com
+        aquele destino, não necessariamente com a mesma origem. Canto raro
+        (funil trocado + backfill reexecutado, ou um dump reprocessado com
+        fatos diferentes) pode produzir uma transição legítima com o mesmo
+        `para` mas `de` diferente da já registrada — pular por `para` sozinho
+        descartaria essa trilha distinta como se já estivesse contabilizada.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT de, para FROM eventos_estagio WHERE conversa_id = %s",
+                    (conversa_id,),
+                )
+                return {(d, p) for (d, p) in cur.fetchall()}
 
     def ultimo_avanco_em(self, conversa_id: int) -> datetime | None:
         """Timestamp do último avanço ao vivo (§5, sinal "avançou hoje").

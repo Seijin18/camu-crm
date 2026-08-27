@@ -7,6 +7,14 @@ Idempotência (§2): `conversas.ultima_mensagem_processada_id` marca até onde j
 se leu. Reprocessar o mesmo bloco não duplica fato (índice único em `fatos`),
 não duplica evento de estágio (`transicao` devolve `None` quando nada muda) e
 não regride estágio (`merge` torna fato monotônico).
+
+Chunking (§8, change `backfill-seguro-para-reexecucao`): um histórico grande
+— sobretudo com `forcar=True`, que relê a conversa inteira, não só o delta —
+não vai para o LLM numa única chamada. Estourar o contexto do modelo produz
+extração vazia e SILENCIOSA (o LLM não avisa que ignorou metade da conversa),
+e mesmo sem estourar, um corpus enorme degrada recall. `TAMANHO_MAXIMO_BLOCO`
+divide o bloco em pedaços cronologicamente ordenados, cada um sua própria
+chamada — ver `_dividir_em_blocos` e o laço em `processar_conversa`.
 """
 
 from __future__ import annotations
@@ -32,6 +40,25 @@ from .contract import (
 )
 
 logger = logging.getLogger("camucrm.extracao")
+
+# Tamanho máximo de mensagens por chamada de LLM (§8). Arbitrário mas
+# deliberadamente conservador: o objetivo é nunca chegar perto do limite de
+# contexto do modelo, não maximizar o tamanho do bloco. Um histórico maior
+# que isso vira múltiplas chamadas, nunca uma monolítica.
+TAMANHO_MAXIMO_BLOCO = 200
+
+
+def _dividir_em_blocos(
+    mensagens: list[tuple[int, str, str, datetime]], tamanho: int
+) -> list[list[tuple[int, str, str, datetime]]]:
+    """Divide um bloco de mensagens (já ordenadas cronologicamente, ver
+    `Database.mensagens_novas`) em pedaços de até `tamanho`, preservando a
+    ordem entre pedaços."""
+    if tamanho <= 0:
+        return [mensagens]
+    return [
+        mensagens[i : i + tamanho] for i in range(0, len(mensagens), tamanho)
+    ]
 
 
 @dataclass(frozen=True)
@@ -67,6 +94,14 @@ class Extrator:
         `forcar=True` reprocessa desde o início — usado quando o prompt muda e
         se quer reextrair. Continua idempotente: os fatos já gravados não
         duplicam, e o estágio não regride.
+
+        Histórico grande (§8): o bloco novo é dividido em pedaços de até
+        `TAMANHO_MAXIMO_BLOCO` mensagens, cada um sua própria chamada de LLM,
+        em vez de uma chamada monolítica para o histórico inteiro — ver
+        docstring do módulo. Cada pedaço é persistido e recalculado antes do
+        próximo, então uma falha no meio do caminho preserva o que já foi
+        processado (o pedaço seguinte, não os anteriores, é reprocessado na
+        próxima rodada).
         """
         agora = agora or datetime.now(timezone.utc)
         conversa = self.db.get_conversa(conversa_id)
@@ -83,36 +118,8 @@ class Extrator:
             estado = recalcular(self.db, conversa, agora=agora, origem=origem)
             return ResultadoExtracao(conversa_id, 0, extracao_vazia(), estado)
 
-        fatos_conhecidos = self.db.fatos_da_conversa(conversa_id)
-        mensagens = [(direcao, texto) for _, direcao, texto, _ in novas]
-        corpus = build_corpus(mensagens)
-
-        try:
-            bruto = self.llm.completar(
-                prompt_mod.system_prompt(),
-                prompt_mod.user_prompt(
-                    mensagens, fatos_conhecidos=fatos_conhecidos, funil=conversa.funil
-                ),
-                json_estrito=True,
-            )
-            extracao = validar(bruto, corpus=corpus)
-        except (LlmIndisponivelError, ContratoInvalidoError) as exc:
-            # Falha de extração deixa a conversa exatamente onde estava. É o
-            # lado seguro do erro (§7): nenhum avanço de estágio, e o bloco
-            # continua não processado, então a próxima rodada tenta de novo.
-            logger.warning("Extração falhou na conversa %s: %s", conversa_id, exc)
-            estado = recalcular(self.db, conversa, agora=agora, origem=origem)
-            return ResultadoExtracao(
-                conversa_id, 0, extracao_vazia(), estado, erro=str(exc)
-            )
-
-        if extracao.democoes:
-            logger.info(
-                "Conversa %s: %s campo(s) rebaixado(s) por falta de evidência: %s",
-                conversa_id,
-                len(extracao.democoes),
-                "; ".join(str(d) for d in extracao.democoes),
-            )
+        fatos_antes = self.db.fatos_da_conversa(conversa_id)
+        combinada = Extracao(fatos=dict(fatos_antes), evidencias={})
 
         # Estágio atribuído à objeção (§4): fora de `forcar`, o estágio da
         # conversa ANTES deste bloco chegar (`conversa.estagio`, o cache lido
@@ -135,30 +142,87 @@ class Extrator:
         # mesmo zero: o estágio inicial do funil, do mesmo jeito que
         # `pipeline._trilha_de_backfill` sempre reparte da origem, e não do
         # cache, para a trilha de estágio em si.
-        estagio_da_objecao = (
+        #
+        # Entre PEDAÇOS do mesmo bloco (chunking, §8): o estágio de
+        # referência do pedaço seguinte é o estágio já recalculado depois do
+        # pedaço anterior (`atualizada.estagio` abaixo) — o progresso feito
+        # DENTRO desta mesma rodada continua valendo, só a rodada anterior
+        # (cache stale de uma invocação passada) é que não serve.
+        estagio_referencia = (
             estagio_inicial(conversa.funil) if forcar else conversa.estagio
         )
-        self._persistir(
-            conversa_id,
-            estagio_da_objecao,
-            extracao,
-            agora,
-            [(texto, enviada_em) for _, _, texto, enviada_em in novas],
-        )
 
-        ultima_id = novas[-1][0]
-        self.db.atualizar_estado_conversa(
-            conversa_id, ultima_mensagem_processada_id=ultima_id
-        )
+        total_processadas = 0
+        erro: str | None = None
+        estado: EstadoConversa | None = None
 
-        atualizada = self.db.get_conversa(conversa_id)
-        assert atualizada is not None
-        estado = recalcular(self.db, atualizada, agora=agora, origem=origem)
+        for bloco in _dividir_em_blocos(novas, TAMANHO_MAXIMO_BLOCO):
+            fatos_conhecidos = self.db.fatos_da_conversa(conversa_id)
+            mensagens = [(direcao, texto) for _, direcao, texto, _ in bloco]
+            corpus = build_corpus(mensagens)
 
-        combinada = merge(
-            Extracao(fatos=dict(fatos_conhecidos), evidencias={}), extracao
+            try:
+                bruto = self.llm.completar(
+                    prompt_mod.system_prompt(),
+                    prompt_mod.user_prompt(
+                        mensagens,
+                        fatos_conhecidos=fatos_conhecidos,
+                        funil=conversa.funil,
+                    ),
+                    json_estrito=True,
+                )
+                extracao = validar(bruto, corpus=corpus)
+            except (LlmIndisponivelError, ContratoInvalidoError) as exc:
+                # Falha de extração deixa a conversa exatamente onde estava. É
+                # o lado seguro do erro (§7): nenhum avanço de estágio, e o
+                # pedaço continua não processado, então a próxima rodada
+                # tenta de novo — pedaços já processados neste laço ficam de
+                # pé.
+                logger.warning(
+                    "Extração falhou na conversa %s: %s", conversa_id, exc
+                )
+                erro = str(exc)
+                break
+
+            if extracao.democoes:
+                logger.info(
+                    "Conversa %s: %s campo(s) rebaixado(s) por falta de "
+                    "evidência: %s",
+                    conversa_id,
+                    len(extracao.democoes),
+                    "; ".join(str(d) for d in extracao.democoes),
+                )
+
+            self._persistir(
+                conversa_id,
+                estagio_referencia,
+                extracao,
+                agora,
+                [(texto, enviada_em) for _, _, texto, enviada_em in bloco],
+            )
+
+            ultima_id = bloco[-1][0]
+            self.db.atualizar_estado_conversa(
+                conversa_id, ultima_mensagem_processada_id=ultima_id
+            )
+
+            atualizada = self.db.get_conversa(conversa_id)
+            assert atualizada is not None
+            estado = recalcular(self.db, atualizada, agora=agora, origem=origem)
+            estagio_referencia = atualizada.estagio
+
+            combinada = merge(combinada, extracao)
+            total_processadas += len(bloco)
+
+        if estado is None:
+            # Nenhum pedaço processou com sucesso (erro já no primeiro).
+            atual = self.db.get_conversa(conversa_id)
+            assert atual is not None
+            estado = recalcular(self.db, atual, agora=agora, origem=origem)
+
+        return ResultadoExtracao(
+            conversa_id, total_processadas, combinada, estado, erro=erro
         )
-        return ResultadoExtracao(conversa_id, len(novas), combinada, estado)
 
     def _persistir(
         self,

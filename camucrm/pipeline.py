@@ -277,11 +277,17 @@ def _trilha_de_backfill(db, conversa, fatos, sinais):
     """Reconstrói o percurso inteiro, pulando o que já está registrado.
 
     Parte do estágio inicial do funil, e não do estágio atual da conversa: o
-    backfill está reconstituindo história, não observando um avanço. Estágios
-    já gravados são pulados, o que torna reexecutar o backfill seguro — §2
+    backfill está reconstituindo história, não observando um avanço. Trilhas
+    já gravadas são puladas, o que torna reexecutar o backfill seguro — §2
     vale aqui também, reprocessar não pode duplicar evento.
+
+    Change `backfill-seguro-para-reexecucao`, §8: a checagem é pelo par
+    `(de, para)` (`db.trilhas_registradas`), não só pelo destino. Pular por
+    `para` sozinho descartaria uma transição legítima que chega ao mesmo
+    estágio por uma origem diferente da já registrada — canto raro (funil
+    trocado + backfill reexecutado), mas real o bastante para não silenciar.
     """
-    ja_registrados = db.estagios_registrados(conversa.id)
+    ja_registrados = db.trilhas_registradas(conversa.id)
     estagio_atual = regras_estagio.estagio_inicial(conversa.funil)
     transicoes: list[regras_estagio.Transicao] = []
 
@@ -292,7 +298,7 @@ def _trilha_de_backfill(db, conversa, fatos, sinais):
         if movimento is None:
             continue
         estagio_atual = movimento.para
-        if movimento.para in ja_registrados:
+        if (movimento.de, movimento.para) in ja_registrados:
             continue
         transicoes.append(movimento)
     return estagio_atual, transicoes

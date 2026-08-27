@@ -358,8 +358,15 @@ class FakeDatabase:
         ]
 
     def mensagens_novas(self, conversa_id: int, desde_id: int | None):
+        # Espelha `db.Database.mensagens_novas` (change
+        # `backfill-seguro-para-reexecucao`): ordenado por `enviada_em`
+        # (m[3]), com `id` (m[0]) como desempate — não só por `id` de
+        # inserção, que pode divergir da cronologia real num dump não
+        # estritamente ordenado.
         return [
-            m for m in sorted(self.mensagens.get(conversa_id, []), key=lambda m: m[0])
+            m for m in sorted(
+                self.mensagens.get(conversa_id, []), key=lambda m: (m[3], m[0])
+            )
             if m[0] > (desde_id or 0)
         ]
 
@@ -452,6 +459,16 @@ class FakeDatabase:
 
     def estagios_registrados(self, conversa_id: int) -> set[str]:
         return {e["para"] for e in self.eventos if e["conversa_id"] == conversa_id}
+
+    def trilhas_registradas(self, conversa_id: int) -> set:
+        """Espelha `db.Database.trilhas_registradas` (change
+        `backfill-seguro-para-reexecucao`): pares `(de, para)`, não só
+        `para`."""
+        return {
+            (e["de"], e["para"])
+            for e in self.eventos
+            if e["conversa_id"] == conversa_id
+        }
 
     def ultimo_avanco_em(self, conversa_id: int) -> datetime | None:
         evento = self._ultimo_evento_estagio_live(conversa_id)

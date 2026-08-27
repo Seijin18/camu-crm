@@ -14,6 +14,7 @@ backfill à vontade.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,9 +63,14 @@ def importar_conversas(
           ]
         }
 
-    A importação é idempotente por `externa_id` quando ele existe. Sem
-    `externa_id`, reimportar o mesmo dump duplica mensagens — por isso o dump
-    de origem deve trazer os ids do WhatsApp sempre que os tiver.
+    A importação é idempotente por `externa_id`. Quando o dump traz o id de
+    origem (o normal, WhatsApp sempre tem `key.id`), ele é usado direto. Sem
+    ele — change `backfill-seguro-para-reexecucao`, §8 — um `externa_id`
+    SINTÉTICO estável é derivado de contato+direção+texto+timestamp bruto do
+    próprio dump, mesma estratégia de `ingest._externa_id_efetivo` (hash em
+    vez de `NULL`): sem isso, reimportar o mesmo dump duplicava cada
+    mensagem, porque `mensagens_externa_id_idx` só protege `externa_id IS NOT
+    NULL` e uma mensagem sem id nasceria sempre fora do alcance do índice.
     """
     resumo = ResumoBackfill()
     for registro in registros:
@@ -88,16 +94,36 @@ def importar_conversas(
             direcao = str(mensagem.get("direcao") or ENTRADA).lower()
             if direcao not in (ENTRADA, SAIDA):
                 continue
+            texto = str(mensagem.get("texto") or "")
+            externa_id = mensagem.get("externa_id") or _externa_id_sintetico(
+                telefone, direcao, texto, mensagem.get("enviada_em")
+            )
             inserida = db.registrar_mensagem(
                 conversa.id,
                 direcao,
-                str(mensagem.get("texto") or ""),
+                texto,
                 _momento(mensagem.get("enviada_em")),
-                externa_id=mensagem.get("externa_id"),
+                externa_id=externa_id,
             )
             if inserida is not None:
                 resumo.mensagens += 1
     return resumo
+
+
+def _externa_id_sintetico(
+    telefone: str, direcao: str, texto: str, enviada_em_bruto: Any
+) -> str:
+    """Hash estável (contato+direção+texto+timestamp) para mensagem sem
+    `externa_id` no dump (change `backfill-seguro-para-reexecucao`, §8).
+
+    Hasheia o timestamp BRUTO do dump (`enviada_em_bruto`), não o resultado
+    de `_momento`: `_momento` cai para `datetime.now(timezone.utc)` quando o
+    timestamp está ausente ou ilegível, e isso mudaria a cada chamada —
+    exatamente o oposto de estável. O valor bruto é idêntico entre duas
+    importações do mesmo dump, mesmo quando ilegível.
+    """
+    canonico = "|".join((telefone, direcao, texto, str(enviada_em_bruto)))
+    return f"hash:{hashlib.md5(canonico.encode('utf-8')).hexdigest()}"
 
 
 def extrair_historico(
