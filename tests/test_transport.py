@@ -277,6 +277,135 @@ class TesteRecepcaoNaoPrecisaDeCredencial(unittest.TestCase):
         self.assertEqual(transporte.nome, "evolution")
 
 
+class TesteBroadcastEStatusIgnorados(unittest.TestCase):
+    """Change `identificacao-e-relogio-confiaveis`: nunca é conversa 1:1."""
+
+    def setUp(self):
+        self.t = EvolutionTransporte("http://x", "k", "i")
+
+    def test_status_broadcast_e_ignorado(self):
+        self.assertIsNone(
+            self.t.receber(
+                evento(key={"remoteJid": "status@broadcast", "id": "S1", "fromMe": False})
+            )
+        )
+
+    def test_lista_de_transmissao_e_ignorada(self):
+        self.assertIsNone(
+            self.t.receber(
+                evento(
+                    key={
+                        "remoteJid": "120363012345678901@broadcast",
+                        "id": "S2",
+                        "fromMe": False,
+                    }
+                )
+            )
+        )
+
+
+class TesteLidSemPnConfiavelERecusado(unittest.TestCase):
+    """Sem campo de PN confiável, `@lid` nunca vira contato fantasma."""
+
+    def setUp(self):
+        self.t = EvolutionTransporte("http://x", "k", "i")
+
+    def test_lid_sem_pn_alternativo_e_recusado(self):
+        self.assertIsNone(
+            self.t.receber(
+                evento(key={"remoteJid": "987654321@lid", "id": "L1", "fromMe": False})
+            )
+        )
+
+    def test_lid_com_pn_alternativo_funciona(self):
+        recebido = self.t.receber(
+            evento(
+                key={
+                    "remoteJid": "987654321@lid",
+                    "remoteJidAlt": "5511999998888@s.whatsapp.net",
+                    "id": "L2",
+                    "fromMe": False,
+                }
+            )
+        )
+        self.assertIsNotNone(recebido)
+        self.assertEqual(recebido.telefone, "5511999998888")
+
+
+class TesteTimestampClampado(unittest.TestCase):
+    """Change `identificacao-e-relogio-confiaveis`: relógio confiável."""
+
+    def setUp(self):
+        self.t = EvolutionTransporte("http://x", "k", "i")
+
+    def test_timestamp_futuro_e_clampado_para_agora(self):
+        futuro = int(datetime.now(timezone.utc).timestamp()) + 3600 * 24 * 365
+        recebido = self.t.receber(evento(messageTimestamp=futuro))
+        self.assertLessEqual(recebido.enviada_em, datetime.now(timezone.utc))
+        self.assertLess(
+            abs((datetime.now(timezone.utc) - recebido.enviada_em).total_seconds()), 5
+        )
+
+    def test_timestamp_implausivelmente_antigo_cai_em_agora(self):
+        antigo = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
+        recebido = self.t.receber(evento(messageTimestamp=antigo))
+        self.assertLess(
+            abs((datetime.now(timezone.utc) - recebido.enviada_em).total_seconds()), 5
+        )
+
+    def test_timestamp_plausivel_passa_sem_alteracao(self):
+        recebido = self.t.receber(evento(messageTimestamp=1756200000))
+        self.assertEqual(
+            recebido.enviada_em, datetime.fromtimestamp(1756200000, tz=timezone.utc)
+        )
+
+    def test_timestamp_futuro_nao_trava_ultimo_inbound_apos_mensagem_real(self):
+        """Reproduz o cenário do `GREATEST` (§ proposal): um timestamp
+        corrompido no futuro distante (ano 2030) não deve "vencer para
+        sempre" contra uma mensagem real do dia seguinte. Antes da correção,
+        `GREATEST(2030, <timestamp real do dia seguinte>)` ficaria preso em
+        2030 para sempre; depois da correção, o valor de 2030 é clampado ao
+        `agora()` do momento em que chegou, e a mensagem real subsequente —
+        cronologicamente depois — produz um `enviada_em` maior, permitindo
+        que `ultimo_inbound` avance corretamente.
+        """
+        from unittest import mock
+
+        from camucrm.transport import evolution as evolution_mod
+
+        t0 = datetime(2026, 8, 27, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 8, 28, 9, 0, 0, tzinfo=timezone.utc)  # dia seguinte
+        timestamp_corrompido_2030 = int(datetime(2030, 1, 1, tzinfo=timezone.utc).timestamp())
+        timestamp_real_dia_seguinte = int(t1.timestamp())
+
+        class DatetimeFalso(datetime):
+            _agora = t0
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls._agora
+
+        with mock.patch.object(evolution_mod, "datetime", DatetimeFalso):
+            DatetimeFalso._agora = t0
+            primeiro = self.t.receber(
+                evento(
+                    messageTimestamp=timestamp_corrompido_2030,
+                    key={"remoteJid": "5511999998888@s.whatsapp.net", "id": "T1", "fromMe": False},
+                )
+            )
+            DatetimeFalso._agora = t1
+            segundo = self.t.receber(
+                evento(
+                    messageTimestamp=timestamp_real_dia_seguinte,
+                    key={"remoteJid": "5511999998888@s.whatsapp.net", "id": "T2", "fromMe": False},
+                )
+            )
+
+        self.assertEqual(primeiro.enviada_em, t0)
+        self.assertEqual(segundo.enviada_em, t1)
+        self.assertGreater(segundo.enviada_em, primeiro.enviada_em)
+
+
 class TesteNomeNoEco(unittest.TestCase):
     """`pushName` no eco é o perfil da Camu, não o do cliente."""
 

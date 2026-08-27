@@ -118,6 +118,25 @@ class EvolutionTransporte:
         `deviceSentMessage`) é desembrulhado recursivamente pela mesma
         função. Ruído de protocolo (`reactionMessage`, recibo, presença, tipo
         não reconhecido) continua devolvendo `None` — evento descartado.
+
+        Identificação (change `identificacao-e-relogio-confiaveis`): três
+        formatos de `remoteJid` não representam uma conversa 1:1 com um
+        contato real e são recusados aqui, antes de qualquer contato ser
+        tocado:
+
+        - `status@broadcast` (status do WhatsApp) e `<id>@broadcast` (lista
+          de transmissão) — `receber()` devolve `None`, mesmo tratamento do
+          grupo `@g.us`.
+        - `<lid>@lid` ("linked ID", identidade alternativa que o WhatsApp usa
+          em certos fluxos multi-dispositivo em vez do PN real) — sem um
+          campo de PN confiável no payload (`_pn_confiavel_do_lid`), o evento
+          é recusado e a recusa é logada, em vez de criar um contato cujo
+          `telefone_hash` seria derivado de um identificador que não é
+          telefone (o LID pode não ser o mesmo across dispositivos/sessões,
+          e sem reconciliação — fora de escopo aqui, ver
+          `openspec/project.md` — dois "contatos" fantasmas do mesmo cliente
+          real seriam criados). Quando o payload traz o PN alternativo, o
+          evento segue o caminho normal usando esse PN.
         """
         if not isinstance(evento, Mapping):
             return None
@@ -127,9 +146,31 @@ class EvolutionTransporte:
 
         chave = dados.get("key") or {}
         remote_jid = chave.get("remoteJid") if isinstance(chave, Mapping) else None
-        if not remote_jid or "@g.us" in str(remote_jid):
+        if not remote_jid:
+            return None
+        remote_jid_str = str(remote_jid)
+        if "@g.us" in remote_jid_str:
             # Grupo não é conversa de venda; ignorar aqui evita poluir o funil.
             return None
+        if remote_jid_str.endswith("@broadcast"):
+            # Cobre `status@broadcast` (status do WhatsApp) e `<id>@broadcast`
+            # (lista de transmissão) — nenhum dos dois é conversa com uma
+            # pessoa; sem este filtro, `telefone` viraria os dígitos de
+            # "status" (string vazia) ou do id da lista, criando um contato
+            # fantasma com o mesmo `telefone_hash` a cada evento.
+            return None
+        if remote_jid_str.endswith("@lid"):
+            pn_alternativo = _pn_confiavel_do_lid(chave)
+            if pn_alternativo is None:
+                logger.warning(
+                    "Evento recusado: remoteJid=%s é @lid sem campo de PN "
+                    "confiável no payload — não criamos contato a partir de "
+                    "um identificador de LID puro (reconciliação LID↔PN fora "
+                    "de escopo, ver openspec/project.md)",
+                    remote_jid_str,
+                )
+                return None
+            remote_jid_str = pn_alternativo
 
         texto = _texto_da_mensagem(dados.get("message") or {})
         if texto is None:
@@ -137,7 +178,7 @@ class EvolutionTransporte:
 
         from_me = bool(chave.get("fromMe")) if isinstance(chave, Mapping) else False
         return EventoRecebido(
-            telefone=_so_digitos(str(remote_jid).split("@", 1)[0]),
+            telefone=_so_digitos(remote_jid_str.split("@", 1)[0]),
             texto=texto,
             enviada_em=_timestamp(dados.get("messageTimestamp")),
             direcao=SAIDA if from_me else ENTRADA,
@@ -245,12 +286,57 @@ def _tipo_de_midia(mensagem: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _pn_confiavel_do_lid(chave: Mapping[str, Any]) -> str | None:
+    """PN (phone number) alternativo para um JID `@lid`, quando exposto.
+
+    O payload padrão `messages.upsert` da Evolution API não documenta um
+    campo confiável de PN para reconciliar um `@lid` com o telefone real —
+    checamos defensivamente por variantes que builds do Baileys às vezes
+    incluem (`remoteJidAlt`/`participantAlt`), mas o caminho comum é nenhum
+    dos dois estar presente, e então `receber()` recusa o evento em vez de
+    criar um contato a partir do LID puro (ver docstring de `receber`).
+    """
+    if not isinstance(chave, Mapping):
+        return None
+    for campo in ("remoteJidAlt", "participantAlt"):
+        alternativo = chave.get(campo)
+        if isinstance(alternativo, str) and alternativo.endswith("@s.whatsapp.net"):
+            return alternativo
+    return None
+
+
+#: Data mínima sã para `enviada_em`: qualquer timestamp anterior a isso é
+#: implausível (relógio de celular corrompido, campo malformado) — o produto
+#: não existia antes disso. Não é uma fronteira de retenção nem de negócio,
+#: só um piso de sanidade para o clamp em `_timestamp`.
+TIMESTAMP_MINIMO_SAO = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+
 def _timestamp(bruto: Any) -> datetime:
-    """Epoch em segundos -> datetime UTC; qualquer outra coisa -> agora."""
+    """Epoch em segundos -> datetime UTC, clampado a uma faixa sã.
+
+    Três casos, nesta ordem:
+
+    1. Não converte para `int` (`None`, texto, etc.) -> `agora()`, como
+       antes.
+    2. Converte, mas é implausível — no futuro (além do relógio real do
+       servidor) ou anterior a `TIMESTAMP_MINIMO_SAO` — -> `agora()`. A
+       mensagem em si ainda é gravada normalmente por quem chama esta
+       função; só o timestamp usado em `enviada_em`/`GREATEST` (ver
+       `db.registrar_mensagem`) é corrigido, para que nunca "vença" para
+       sempre contra mensagens reais subsequentes (`ultimo_inbound`/
+       `ultimo_outbound` presos no futuro seriam permanentes, porque
+       `GREATEST` sempre escolhe o maior valor).
+    3. Converte e está dentro da faixa sã -> valor convertido, sem alteração.
+    """
+    agora = datetime.now(timezone.utc)
     try:
-        return datetime.fromtimestamp(int(bruto), tz=timezone.utc)
-    except (TypeError, ValueError):
-        return datetime.now(timezone.utc)
+        convertido = datetime.fromtimestamp(int(bruto), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return agora
+    if convertido > agora or convertido < TIMESTAMP_MINIMO_SAO:
+        return agora
+    return convertido
 
 
 def _id_da_resposta(corpo: Mapping[str, Any]) -> str | None:
