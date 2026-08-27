@@ -2632,6 +2632,25 @@ class Database:
                 )
                 return cur.fetchone()[0]
 
+    def primeira_mensagem_pendente_em(
+        self, conversa_id: int, desde_id: int | None
+    ) -> datetime | None:
+        """`enviada_em` da mensagem pendente mais antiga (change
+        `extracao-em-lote-por-janela`): há quanto tempo a fila de extração
+        desta conversa está esperando, para o gatilho híbrido de
+        `webhook._deve_extrair_agora` decidir se vale extrair na hora.
+        `None` quando não há mensagem pendente.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT min(enviada_em) FROM mensagens "
+                    "WHERE conversa_id = %s AND id > %s",
+                    (conversa_id, desde_id or 0),
+                )
+                linha = cur.fetchone()
+        return linha[0] if linha else None
+
     # -- retenção (§12) ---------------------------------------------------
 
     def purgar_mensagens_antigas(self, meses: int = 12) -> int:

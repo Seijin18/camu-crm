@@ -635,6 +635,68 @@ class TesteRotasDeRascunho(unittest.TestCase):
                 self.assertNotIn("enviar", caminho)
 
 
+class TesteRotaDeExtracaoManual(unittest.TestCase):
+    """Change `extracao-em-lote-por-janela`: `POST /conversas/{id}/extrair`
+    ignora o gatilho híbrido do webhook — o operador força a extração do
+    bloco pendente na hora, sem esperar limiar nem `camucrm extrair`."""
+
+    def setUp(self):
+        self.cliente = TestClient(server.app)
+        contexto = patch.dict("os.environ", {}, clear=False)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        os.environ.pop(server.ENV_TOKEN, None)
+        self.fake = FakeDatabase()
+        patcher = patch.object(server, "get_db", return_value=self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_extrai_o_bloco_pendente_e_devolve_o_card_atualizado(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "aqui esta a foto do meu pet")
+        resposta_llm = json.dumps({
+            "foto_pet_recebida": True,
+            "objecao": None,
+            "evidencias": {"foto_pet_recebida": "aqui esta a foto do meu pet"},
+        })
+        with patch.object(api, "criar_llm", return_value=FakeLlm([resposta_llm])):
+            resposta = self.cliente.post(f"/api/conversas/{conversa.id}/extrair")
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertTrue(corpo["ok"])
+        self.assertEqual(corpo["mensagens_processadas"], 1)
+        self.assertEqual(corpo["card"]["estagio"], "S2")
+
+    def test_conversa_inexistente_devolve_422(self):
+        resposta = self.cliente.post("/api/conversas/999/extrair")
+        self.assertEqual(resposta.status_code, 422)
+        self.assertIn("erro", resposta.json())
+
+    def test_llm_indisponivel_devolve_422(self):
+        from camucrm.llm import LlmIndisponivelError
+
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "oi")
+
+        def _quebrado(*args, **kwargs):
+            raise LlmIndisponivelError("sem chave configurada")
+
+        with patch.object(api, "criar_llm", side_effect=_quebrado):
+            resposta = self.cliente.post(f"/api/conversas/{conversa.id}/extrair")
+        self.assertEqual(resposta.status_code, 422)
+        self.assertIn("erro", resposta.json())
+
+    def test_sem_mensagem_pendente_nao_chama_llm_e_devolve_ok(self):
+        """Extrair uma conversa já em dia é barato — `mensagens_novas` vazia
+        cai no ramo de `recalcular` sem chamar o LLM (mesma garantia de
+        `Extrator.processar_conversa`)."""
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        with patch.object(api, "criar_llm", return_value=FakeLlm([])):
+            resposta = self.cliente.post(f"/api/conversas/{conversa.id}/extrair")
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.json()["mensagens_processadas"], 0)
+
+
 RESUMO_OK = json.dumps({
     "resumo": "Ana pediu peça personalizada e mandou a foto do pet.\n"
               "A prévia foi enviada, sem resposta ainda.",

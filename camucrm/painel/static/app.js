@@ -453,6 +453,26 @@ async function renderizarDetalhe(container, id) {
   const resumo = el("p", { class: "aviso" }, filhosResumo);
   container.appendChild(resumo);
 
+  // Change `extracao-em-lote-por-janela`: extração manual, incondicional —
+  // ignora o gatilho híbrido do webhook (contagem/espera de mensagens
+  // pendentes). Útil quando o operador quer o estágio atualizado agora,
+  // sem esperar a próxima rodada de `camucrm extrair`.
+  const botaoExtrair = el("button", { class: "secundario", texto: "Extrair agora" });
+  botaoExtrair.addEventListener("click", async () => {
+    botaoExtrair.disabled = true;
+    const rotuloOriginal = botaoExtrair.textContent;
+    botaoExtrair.textContent = "Extraindo (chama o LLM)…";
+    try {
+      await chamarApiEscrever(`/conversas/${id}/extrair`);
+      await renderizarRotaSegura();
+    } catch (erro) {
+      container.appendChild(el("p", { class: "aviso", texto: `Erro: ${erro.message}` }));
+      botaoExtrair.disabled = false;
+      botaoExtrair.textContent = rotuloOriginal;
+    }
+  });
+  container.appendChild(botaoExtrair);
+
   if (detalhe.contato) {
     const contato = detalhe.contato;
     container.appendChild(

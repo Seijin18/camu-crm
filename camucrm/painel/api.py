@@ -52,6 +52,7 @@ from ..drafts import PROMPT_VERSAO, RascunhoInvalidoError
 from ..drafts import gerar as gerar_rascunho
 from ..evaluation.dataset import DatasetInvalidoError, TAMANHO_MINIMO, avisos_de_tamanho, carregar, validar_entrada
 from ..evaluation.runner import rodar as rodar_eval
+from ..extraction.extractor import Extrator
 from ..llm import LlmIndisponivelError, criar_llm
 from ..pipeline import recalcular
 from ..rules.fila import Candidato, montar_fila
@@ -701,6 +702,45 @@ def resumo_da_conversa(conversa_id: int, db: Database = Depends(_db)):
         return views.resumo_para_json(None, mensagens_desde=None)
     pendentes = db.mensagens_desde(conversa_id, cache.ultima_mensagem_id)
     return views.resumo_para_json(cache, mensagens_desde=pendentes)
+
+
+# --------------------------------------------------------------------------
+# Extração manual (change `extracao-em-lote-por-janela`): o webhook agora
+# adia a extração de eventos abaixo do gatilho híbrido
+# (`webhook._deve_extrair_agora`) para `camucrm extrair` processar depois —
+# esta rota é a válvula de escape para o operador que não quer esperar.
+# `POST`, nunca `GET`: gasta cota de LLM, mesma regra de `/rascunho` e
+# `/resumo` acima.
+# --------------------------------------------------------------------------
+
+
+@router.post("/conversas/{conversa_id}/extrair")
+def extrair_conversa_agora(conversa_id: int, db: Database = Depends(_db)):
+    """Extrai a conversa na hora, ignorando o gatilho híbrido do webhook.
+
+    Chama `Extrator.processar_conversa` sem `forcar` — processa só o bloco
+    pendente, o mesmo que o webhook faria se o gatilho tivesse permitido, ou
+    que `camucrm extrair` faria na próxima rodada. Esta rota só adianta
+    QUANDO isso acontece, nunca reprocessa mais do que o pendente.
+    """
+    conversa = db.get_conversa(conversa_id)
+    if conversa is None:
+        return JSONResponse(
+            status_code=422, content=views.erro(f"conversa {conversa_id} não existe", None)
+        )
+    try:
+        extrator = Extrator(db, criar_llm())
+        resultado = extrator.processar_conversa(conversa_id)
+    except LlmIndisponivelError as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), None))
+    if resultado.erro:
+        return JSONResponse(status_code=422, content=views.erro(resultado.erro, None))
+    atualizada = db.get_conversa(conversa_id)
+    return {
+        "ok": True,
+        "mensagens_processadas": resultado.mensagens_processadas,
+        "card": views.card_conversa(atualizada, resultado.estado),
+    }
 
 
 # --------------------------------------------------------------------------

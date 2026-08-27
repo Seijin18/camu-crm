@@ -20,12 +20,13 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from . import config
-from .db import Database
+from .db import Conversa, Database
 from .ingest import ingerir
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -37,6 +38,13 @@ logger = logging.getLogger("camucrm.webhook")
 ENV_TOKEN = "CAMU_WEBHOOK_TOKEN"
 ENV_PORTA = "CAMU_WEBHOOK_PORT"
 ENV_EXTRAIR = "CAMU_EXTRAIR_AO_RECEBER"
+# Change `extracao-em-lote-por-janela`: gatilho híbrido — qualquer um dos
+# dois limiares dispara extração imediata; abaixo dos dois, a mensagem fica
+# pendente para `camucrm extrair` (cron externo, ver design.md do change).
+ENV_LIMIAR_MENSAGENS = "CAMU_EXTRACAO_LIMIAR_MENSAGENS"
+ENV_TETO_ESPERA_MINUTOS = "CAMU_EXTRACAO_TETO_ESPERA_MINUTOS"
+LIMIAR_MENSAGENS_PADRAO = 6
+TETO_ESPERA_MINUTOS_PADRAO = 3
 PORTA_PADRAO = 8091  # 8090 é do ingress do WhatBot
 
 app = FastAPI(title="camu-crm — ingestão", docs_url=None, redoc_url=None)
@@ -56,10 +64,59 @@ def extrair_ao_receber() -> bool:
     Desligue com `CAMU_EXTRAIR_AO_RECEBER=false` quando quiser observar a
     ingestão sem gastar cota, ou quando o provedor estiver fora do ar — a
     ingestão continua funcionando, e `make extrair` recupera o atraso depois.
+
+    Ligado (o padrão) não significa mais "chama o LLM a cada evento" —
+    change `extracao-em-lote-por-janela`: `_extrair` ainda consulta
+    `_deve_extrair_agora` antes de chamar o modelo. Esta flag continua
+    sendo o interruptor geral (extração nenhuma no caminho de ingestão);
+    o gatilho híbrido decide o "quando", não o "se".
     """
     return os.getenv(ENV_EXTRAIR, "true").strip().lower() not in {
         "0", "false", "no", "off", "nao", "não",
     }
+
+
+def limiar_mensagens() -> int:
+    """Mensagens pendentes suficientes para disparar extração na hora,
+    mesmo sem atingir o teto de espera (change `extracao-em-lote-por-
+    janela`) — ver `design.md` do change para o porquê do default."""
+    return int(os.getenv(ENV_LIMIAR_MENSAGENS, str(LIMIAR_MENSAGENS_PADRAO)))
+
+
+def teto_espera_minutos() -> int:
+    """Minutos que a mensagem pendente mais antiga pode esperar antes de
+    forçar extração na hora, mesmo abaixo do limiar de contagem (change
+    `extracao-em-lote-por-janela`)."""
+    return int(
+        os.getenv(ENV_TETO_ESPERA_MINUTOS, str(TETO_ESPERA_MINUTOS_PADRAO))
+    )
+
+
+def _deve_extrair_agora(
+    db: Database, conversa: Conversa, *, agora: datetime | None = None
+) -> bool:
+    """Gatilho híbrido (change `extracao-em-lote-por-janela`): contagem OU
+    espera, o que vier primeiro — nunca os dois juntos, nenhum dos dois
+    isolado (ver `design.md` do change para o porquê de cada um sozinho
+    falhar).
+
+    Sem mensagem pendente, não há o que decidir — `False`. Esse caso não é
+    esperado logo após um ingest bem-sucedido (a mensagem que acabou de
+    chegar já é uma pendência), mas mantém a função segura para qualquer
+    chamador.
+    """
+    agora = agora or datetime.now(timezone.utc)
+    pendentes = db.mensagens_desde(conversa.id, conversa.ultima_mensagem_processada_id)
+    if pendentes <= 0:
+        return False
+    if pendentes >= limiar_mensagens():
+        return True
+    mais_antiga = db.primeira_mensagem_pendente_em(
+        conversa.id, conversa.ultima_mensagem_processada_id
+    )
+    if mais_antiga is None:  # defensivo: `pendentes > 0` deveria garantir isto
+        return True
+    return (agora - mais_antiga) >= timedelta(minutes=teto_espera_minutos())
 
 
 def get_extrator() -> "Extrator | None":
@@ -189,7 +246,9 @@ def _processar(payload: dict[str, Any]) -> None:
 
 
 def _extrair(conversa_id: int) -> None:
-    """Extrai os fatos do bloco recém-ingerido.
+    """Extrai os fatos do bloco recém-ingerido — ou adia, se o gatilho
+    híbrido decidir que ainda não vale a pena (change `extracao-em-lote-
+    por-janela`, ver `_deve_extrair_agora`).
 
     Separado de `_processar` e com `try` próprio de propósito: a mensagem já
     está gravada neste ponto, e uma falha de extração não pode desfazer isso
@@ -198,6 +257,16 @@ def _extrair(conversa_id: int) -> None:
     """
     extrator = get_extrator()
     if extrator is None:
+        return
+    conversa = extrator.db.get_conversa(conversa_id)
+    if conversa is None:
+        return
+    if not _deve_extrair_agora(extrator.db, conversa):
+        logger.debug(
+            "Conversa %s: extração adiada (abaixo dos limiares do gatilho "
+            "híbrido) — `camucrm extrair` processa depois",
+            conversa_id,
+        )
         return
     try:
         resultado = extrator.processar_conversa(conversa_id)

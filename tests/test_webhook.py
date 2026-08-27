@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
@@ -139,6 +140,13 @@ class TesteExtracaoAoReceber(unittest.TestCase):
         """A mensagem já está gravada; extração que quebra não pode desfazer isso."""
         quebrado = Mock()
         quebrado.processar_conversa.side_effect = RuntimeError("boom")
+        # Change `extracao-em-lote-por-janela`: `_extrair` agora consulta o
+        # gatilho híbrido antes de chamar `processar_conversa` — o mock
+        # precisa responder o bastante para o gatilho decidir "sim, agora"
+        # (aqui, via `mensagens_desde` acima do limiar padrão), senão o
+        # teste nunca chegaria a exercitar a falha que quer provar.
+        quebrado.db.get_conversa.return_value = Mock(id=1, ultima_mensagem_processada_id=None)
+        quebrado.db.mensagens_desde.return_value = 999
         with patch.object(webhook, "get_extrator", return_value=quebrado):
             webhook._extrair(1)  # não deve levantar
 
@@ -177,6 +185,82 @@ class TesteExtracaoAoReceber(unittest.TestCase):
         ), patch.object(webhook, "_extrair") as extrair:
             webhook._processar({"event": "messages.upsert"})
         extrair.assert_called_once_with(7)
+
+
+class TesteGatilhoHibrido(unittest.TestCase):
+    """Change `extracao-em-lote-por-janela`: `_deve_extrair_agora` e o uso
+    dele em `_extrair` — contagem OU espera, o que vier primeiro; abaixo
+    dos dois, a extração fica pendente para `camucrm extrair`."""
+
+    def setUp(self):
+        contexto = patch.dict("os.environ", {}, clear=False)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        os.environ.pop(webhook.ENV_LIMIAR_MENSAGENS, None)
+        os.environ.pop(webhook.ENV_TETO_ESPERA_MINUTOS, None)
+
+    def _conversa(self, ultima_mensagem_processada_id=None):
+        return Mock(id=1, ultima_mensagem_processada_id=ultima_mensagem_processada_id)
+
+    def test_padroes_sem_variavel_de_ambiente(self):
+        self.assertEqual(webhook.limiar_mensagens(), webhook.LIMIAR_MENSAGENS_PADRAO)
+        self.assertEqual(
+            webhook.teto_espera_minutos(), webhook.TETO_ESPERA_MINUTOS_PADRAO
+        )
+
+    def test_variavel_de_ambiente_e_respeitada(self):
+        with patch.dict("os.environ", {webhook.ENV_LIMIAR_MENSAGENS: "2"}):
+            self.assertEqual(webhook.limiar_mensagens(), 2)
+        with patch.dict("os.environ", {webhook.ENV_TETO_ESPERA_MINUTOS: "10"}):
+            self.assertEqual(webhook.teto_espera_minutos(), 10)
+
+    def test_sem_mensagem_pendente_nao_extrai(self):
+        db = Mock()
+        db.mensagens_desde.return_value = 0
+        self.assertFalse(webhook._deve_extrair_agora(db, self._conversa()))
+
+    def test_contagem_atinge_limiar_dispara_mesmo_recem_chegada(self):
+        db = Mock()
+        db.mensagens_desde.return_value = webhook.LIMIAR_MENSAGENS_PADRAO
+        # Mesmo que a mais antiga tenha chegado agora mesmo (não deveria nem
+        # ser consultada quando a contagem já decide).
+        db.primeira_mensagem_pendente_em.return_value = datetime.now(timezone.utc)
+        self.assertTrue(webhook._deve_extrair_agora(db, self._conversa()))
+
+    def test_espera_alem_do_teto_dispara_mesmo_com_poucas_pendentes(self):
+        db = Mock()
+        db.mensagens_desde.return_value = 1
+        agora = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+        db.primeira_mensagem_pendente_em.return_value = agora - timedelta(
+            minutes=webhook.TETO_ESPERA_MINUTOS_PADRAO + 1
+        )
+        self.assertTrue(webhook._deve_extrair_agora(db, self._conversa(), agora=agora))
+
+    def test_abaixo_dos_dois_limiares_nao_extrai(self):
+        db = Mock()
+        db.mensagens_desde.return_value = 1
+        agora = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+        db.primeira_mensagem_pendente_em.return_value = agora - timedelta(seconds=5)
+        self.assertFalse(webhook._deve_extrair_agora(db, self._conversa(), agora=agora))
+
+    def test_extrair_nao_chama_llm_abaixo_dos_limiares(self):
+        extrator = Mock()
+        extrator.db.get_conversa.return_value = self._conversa()
+        extrator.db.mensagens_desde.return_value = 1
+        extrator.db.primeira_mensagem_pendente_em.return_value = datetime.now(
+            timezone.utc
+        )
+        with patch.object(webhook, "get_extrator", return_value=extrator):
+            webhook._extrair(1)
+        extrator.processar_conversa.assert_not_called()
+
+    def test_extrair_chama_llm_quando_gatilho_permite(self):
+        extrator = Mock()
+        extrator.db.get_conversa.return_value = self._conversa()
+        extrator.db.mensagens_desde.return_value = webhook.LIMIAR_MENSAGENS_PADRAO
+        with patch.object(webhook, "get_extrator", return_value=extrator):
+            webhook._extrair(1)
+        extrator.processar_conversa.assert_called_once_with(1)
 
 
 class TesteBootFalhaAlto(unittest.TestCase):

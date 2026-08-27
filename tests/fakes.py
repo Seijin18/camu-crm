@@ -1094,6 +1094,19 @@ class FakeDatabase:
         limite = mensagem_id or 0
         return sum(1 for identificador, *_ in linhas if identificador > limite)
 
+    def primeira_mensagem_pendente_em(
+        self, conversa_id: int, desde_id: int | None
+    ) -> datetime | None:
+        """Espelha `db.Database.primeira_mensagem_pendente_em` (change
+        `extracao-em-lote-por-janela`)."""
+        limite = desde_id or 0
+        pendentes = [
+            enviada_em
+            for identificador, _, _, enviada_em in self.mensagens.get(conversa_id, [])
+            if identificador > limite
+        ]
+        return min(pendentes) if pendentes else None
+
     # -- eventos brutos (staging, change `ingestao-a-prova-de-falha`) -----
 
     def registrar_evento_bruto(self, payload) -> int:
