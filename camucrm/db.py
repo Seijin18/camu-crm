@@ -1168,6 +1168,36 @@ class Database:
                 )
                 return [Conversa(*row) for row in cur.fetchall()]
 
+    def listar_conversas_fechadas(
+        self,
+        limite: int = 500,
+        *,
+        incluir_teste: bool = False,
+        apenas_teste: bool = False,
+    ) -> list[Conversa]:
+        """Conversas COM resultado — fechadas por marco manual (ganho/perdido).
+
+        Change `marco-manual-visivel-na-aba-conversas`: existe só para a aba
+        Conversas do painel (`GET /api/conversas`), nunca para kanban nem
+        fila — as duas continuam batendo só em `listar_conversas_abertas`
+        (requirement "Kanban e fila continuam mostrando só conversas
+        abertas"). `ORDER BY atualizado_em DESC` aqui é o oposto de
+        `listar_conversas_abertas` de propósito: não existe "conversa fechada
+        negligenciada" a proteger do corte — a mais recente é a mais
+        relevante pra quem está conferindo o que fechou.
+        """
+        condicao = _condicao_teste(
+            "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"{self._CONVERSA_SELECT} WHERE c.resultado IS NOT NULL {condicao} "
+                    "ORDER BY c.atualizado_em DESC LIMIT %s",
+                    (limite,),
+                )
+                return [Conversa(*row) for row in cur.fetchall()]
+
     def contar_conversas_abertas(
         self, *, incluir_teste: bool = False, apenas_teste: bool = False
     ) -> int:

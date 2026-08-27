@@ -73,6 +73,16 @@ class TesteCardConversa(unittest.TestCase):
         card = views.card_conversa(_conversa(nome_contato=None), _estado())
         self.assertEqual(card["nome"], "#1")
 
+    def test_conversa_aberta_expoe_resultado_none(self):
+        """Change `marco-manual-visivel-na-aba-conversas`: card sempre carrega
+        `resultado`, `None` quando a conversa está aberta."""
+        card = views.card_conversa(_conversa(resultado=None), _estado())
+        self.assertIsNone(card["resultado"])
+
+    def test_conversa_fechada_expoe_resultado_gravado(self):
+        card = views.card_conversa(_conversa(resultado="perdido"), _estado())
+        self.assertEqual(card["resultado"], "perdido")
+
 
 class TesteColunasKanban(unittest.TestCase):
     def test_b2c_estagios_derivados_recusam_drop(self):

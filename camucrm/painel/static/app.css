@@ -12,6 +12,11 @@
   --esfriando: #4a90d9;
   --frio: #6c7280;
   --encerrado: #3a3d45;
+  /* Change `marco-manual-visivel-na-aba-conversas`: cores próprias, para não
+     confundir com `--quente`/`--encerrado` — resultado de marco manual tem
+     proveniência diferente de temperatura ou de estágio terminal automático. */
+  --ganho: #2e9e5b;
+  --perdido: #b23a48;
 }
 
 * { box-sizing: border-box; }
@@ -158,6 +163,8 @@ main {
 .tag.esfriando { background: var(--esfriando); color: white; }
 .tag.frio { background: var(--frio); color: white; }
 .tag.encerrado { background: var(--encerrado); color: var(--texto-fraco); }
+.tag.ganho { background: var(--ganho); color: white; }
+.tag.perdido { background: var(--perdido); color: white; }
 
 /* -- Kanban -------------------------------------------------------------- */
 

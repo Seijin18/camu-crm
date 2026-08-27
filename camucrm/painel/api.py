@@ -110,6 +110,23 @@ def _carregar_candidatos(
     return resultado
 
 
+def _carregar_fechadas(
+    db: Database, *, limite: int = LIMITE_CONVERSAS_PADRAO, apenas_teste: bool = False
+):
+    """Conversas fechadas por marco manual (`resultado` preenchido), recalculadas.
+
+    Change `marco-manual-visivel-na-aba-conversas`: existe só para
+    `listar_conversas` abaixo — nunca para `/kanban` nem para a fila, que
+    continuam batendo exclusivamente em `_carregar_candidatos` (requirement
+    "Kanban e fila continuam mostrando só conversas abertas"). Mesmo padrão
+    de recálculo N+1 sem persistir (`recalcular(..., persistir=False)`):
+    barato, e não tem side-effect mesmo numa conversa já fechada.
+    """
+    conversas = db.listar_conversas_fechadas(limite=limite, apenas_teste=apenas_teste)
+    agora = datetime.now(timezone.utc)
+    return [(c, recalcular(db, c, agora=agora, persistir=False)) for c in conversas]
+
+
 def _candidato_de(conversa, estado) -> Candidato:
     return Candidato(
         conversa_id=conversa.id,
@@ -163,8 +180,16 @@ def listar_conversas(
     db: Database = Depends(_db),
 ):
     """Change `contatos-de-teste-isolados`: `apenas_teste` é o toggle "Modo
-    teste" do painel, propagado até `db.listar_conversas_abertas`."""
-    pares = _carregar_candidatos(db, apenas_teste=apenas_teste)
+    teste" do painel, propagado até `db.listar_conversas_abertas`.
+
+    Change `marco-manual-visivel-na-aba-conversas`: diferente de `/kanban`,
+    esta rota também inclui as conversas fechadas por marco manual
+    (`_carregar_fechadas`) — cada card carrega `resultado` para a UI marcar
+    a diferença, mas a conversa não desaparece só porque foi encerrada.
+    """
+    pares = _carregar_candidatos(db, apenas_teste=apenas_teste) + _carregar_fechadas(
+        db, apenas_teste=apenas_teste
+    )
     cards = [views.card_conversa(c, e) for c, e in pares]
     if funil:
         cards = [c for c in cards if c["funil"] == funil]

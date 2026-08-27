@@ -344,6 +344,20 @@ class FakeDatabase:
             c for c in self.conversas.values() if c.resultado is None and passa(c.id)
         ][:limite]
 
+    def listar_conversas_fechadas(
+        self,
+        limite: int = 500,
+        *,
+        incluir_teste: bool = False,
+        apenas_teste: bool = False,
+    ) -> list[Conversa]:
+        """Espelha `db.Database.listar_conversas_fechadas` (change
+        `marco-manual-visivel-na-aba-conversas`): conversas COM resultado."""
+        passa = self._filtro_teste(incluir_teste=incluir_teste, apenas_teste=apenas_teste)
+        return [
+            c for c in self.conversas.values() if c.resultado is not None and passa(c.id)
+        ][:limite]
+
     def contar_conversas_abertas(
         self, *, incluir_teste: bool = False, apenas_teste: bool = False
     ) -> int:

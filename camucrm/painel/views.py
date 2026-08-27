@@ -80,6 +80,11 @@ def card_conversa(conversa: Conversa, estado: EstadoConversa) -> dict[str, Any]:
         "followups_enviados": conversa.followups_enviados,
         "horas_esperando": horas_esperando,
         "avancou_estagio_hoje": sinais.avancou_estagio_hoje,
+        # Change `marco-manual-visivel-na-aba-conversas`: `None` para
+        # conversa aberta, "ganho"/"perdido" para fechada por marco manual —
+        # é o que permite a aba Conversas mostrar essas conversas com um
+        # indicador diferente em vez de simplesmente sumir da lista.
+        "resultado": conversa.resultado,
     }
 
 

@@ -150,6 +150,16 @@ function tagTemperatura(temperatura) {
   return el("span", { class: `tag ${temperatura}`, texto: temperatura });
 }
 
+// Change `marco-manual-visivel-na-aba-conversas`: indicador de conversa
+// fechada por marco manual (ganho/perdido) — diferente de `.tag.encerrado`,
+// que já existe para o estágio terminal automático (SX/PX). Devolve `null`
+// para conversa aberta, para o chamador decidir se renderiza a tag.
+function tagResultado(resultado) {
+  if (!resultado) return null;
+  const rotulo = resultado === "ganho" ? "✓ ganho (manual)" : "✕ perdido (manual)";
+  return el("span", { class: `tag ${resultado}`, texto: rotulo });
+}
+
 // -- Telas -----------------------------------------------------------------
 
 async function renderizarFila(container) {
@@ -385,11 +395,14 @@ async function renderizarConversas(container) {
     const dados = await chamarApi(`/conversas?${params.toString()}`);
     lista.appendChild(el("p", { class: "aviso", texto: `${dados.total} conversa(s)` }));
     dados.conversas.forEach((card) => {
-      const linha = el("div", { class: "fila-item" }, [
+      const filhos = [
         el("span", { class: "nome", texto: `${card.nome} — ${card.estagio_label}` }),
         tagTemperatura(card.temperatura),
-        el("span", { class: "acao", texto: formatarHoras(card.horas_esperando) }),
-      ]);
+      ];
+      const tagFechada = tagResultado(card.resultado);
+      if (tagFechada) filhos.push(tagFechada);
+      filhos.push(el("span", { class: "acao", texto: formatarHoras(card.horas_esperando) }));
+      const linha = el("div", { class: "fila-item" }, filhos);
       linha.style.cursor = "pointer";
       linha.addEventListener("click", () => {
         window.location.hash = `#/conversas/${card.id}`;
@@ -430,11 +443,14 @@ async function renderizarDetalhe(container, id) {
   }
   const card = detalhe.card;
   container.appendChild(el("h2", { texto: `#${card.id} ${card.nome}` }));
-  const resumo = el("p", { class: "aviso" }, [
+  const filhosResumo = [
     document.createTextNode(`${card.estagio_label} (${card.estagio}) — `),
     tagTemperatura(card.temperatura),
-    document.createTextNode(` — sinal: ${card.sinal}`),
-  ]);
+  ];
+  const tagFechada = tagResultado(card.resultado);
+  if (tagFechada) filhosResumo.push(document.createTextNode(" "), tagFechada);
+  filhosResumo.push(document.createTextNode(` — sinal: ${card.sinal}`));
+  const resumo = el("p", { class: "aviso" }, filhosResumo);
   container.appendChild(resumo);
 
   if (detalhe.contato) {

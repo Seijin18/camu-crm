@@ -162,6 +162,50 @@ class TesteRotas(unittest.TestCase):
         ids = {c["id"] for c in corpo["conversas"]}
         self.assertIn(c1.id, ids)
 
+    def test_conversas_inclui_fechada_por_marco_manual_com_indicador(self):
+        """Change `marco-manual-visivel-na-aba-conversas`, requirement
+        "Conversa fechada por marco manual continua na aba Conversas": uma
+        conversa com `resultado` preenchido não some de `GET /api/conversas`,
+        e o card carrega o `resultado` para a UI diferenciar."""
+        aberta = self.fake.criar_conversa(funil="b2c", estagio="S0", nome="Ana")
+        fechada = self.fake.criar_conversa(funil="b2b", estagio="P1", nome="Beto")
+        self.fake.atualizar_estado_conversa(fechada.id, resultado="perdido")
+
+        resposta = self.cliente.get("/api/conversas")
+        corpo = resposta.json()
+        por_id = {c["id"]: c for c in corpo["conversas"]}
+
+        self.assertIn(aberta.id, por_id)
+        self.assertIsNone(por_id[aberta.id]["resultado"])
+        self.assertIn(fechada.id, por_id)
+        self.assertEqual(por_id[fechada.id]["resultado"], "perdido")
+
+    def test_conversa_fechada_por_marco_manual_some_do_kanban(self):
+        """Requirement "Kanban e fila continuam mostrando só conversas
+        abertas": a mesma conversa fechada não aparece em `GET
+        /api/kanban`."""
+        fechada = self.fake.criar_conversa(funil="b2b", estagio="P1", nome="Beto")
+        self.fake.atualizar_estado_conversa(fechada.id, resultado="perdido")
+
+        resposta = self.cliente.get("/api/kanban")
+        corpo = resposta.json()
+        ids_no_kanban = {
+            card["id"]
+            for kanban in corpo["kanbans"]
+            for coluna in kanban["colunas"]
+            for card in coluna["cards"]
+        }
+        self.assertNotIn(fechada.id, ids_no_kanban)
+
+    def test_conversa_fechada_por_marco_manual_some_da_fila(self):
+        """Mesmo requirement acima, aplicado à fila do dia."""
+        fechada = self.fake.criar_conversa(funil="b2b", estagio="P1", nome="Beto")
+        self.fake.atualizar_estado_conversa(fechada.id, resultado="perdido")
+
+        resposta = self.cliente.get("/api/fila")
+        ids_na_fila = {item["conversa_id"] for item in resposta.json()["itens"]}
+        self.assertNotIn(fechada.id, ids_na_fila)
+
     def test_fila_smoke(self):
         self.fake.criar_conversa(funil="b2c", estagio="S0", nome="Ana")
         resposta = self.cliente.get("/api/fila")
