@@ -82,6 +82,61 @@ class TesteIngestao(unittest.TestCase):
         self.assertEqual(next(iter(self.db.contatos.values())).tipo, "b2c")
 
 
+class TesteMidiaSemLegendaNaIngestao(unittest.TestCase):
+    """Change `mensagem-sem-texto-preservada`: o marcador percorre o mesmo
+    caminho de texto normal — grava mensagem, atualiza `bola_com`, e nunca
+    vira evidência de fato na extração (fora de escopo deste change: o
+    marcador não é literal de nenhum fato do §2)."""
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.transporte = EvolutionTransporte("http://x", "k", "i")
+
+    def _payload_audio(self, ident="A1", telefone="5511999998888"):
+        return {
+            "event": "messages.upsert",
+            "data": {
+                "key": {
+                    "remoteJid": f"{telefone}@s.whatsapp.net",
+                    "id": ident,
+                    "fromMe": False,
+                },
+                "message": {"audioMessage": {}},
+                "messageTimestamp": int((AGORA - timedelta(hours=1)).timestamp()),
+                "pushName": "Ana",
+            },
+        }
+
+    def test_audio_grava_mensagem_e_atualiza_bola_com(self):
+        resultado = ingerir(
+            self.db, self.transporte.receber(self._payload_audio()), agora=AGORA
+        )
+        self.assertFalse(resultado.ignorada)
+        cid = resultado.conversa_id
+        self.assertEqual(self.db.mensagens[cid][0][2], "[áudio recebido]")
+        # `bola_com == "camu"`: o cliente falou por último, resposta é dívida
+        # nossa (§5, `rules/sinais.py::Sinais.bola_com`) — não é o mesmo
+        # sentido de "a bola está do lado do cliente".
+        self.assertEqual(resultado.estado.sinais.bola_com, "camu")
+        self.assertEqual(self.db.conversas[cid].ultimo_inbound, AGORA - timedelta(hours=1))
+
+    def test_audio_nao_produz_fato_nenhum_na_extracao(self):
+        from camucrm.extraction.extractor import Extrator
+        from camucrm.llm import FakeLlm
+
+        resultado = ingerir(
+            self.db, self.transporte.receber(self._payload_audio()), agora=AGORA
+        )
+        cid = resultado.conversa_id
+
+        extraido = Extrator(self.db, FakeLlm(['{"objecao": null, "evidencias": {}}'])).processar_conversa(
+            cid, agora=AGORA
+        )
+        self.assertEqual(extraido.mensagens_processadas, 1)
+        fatos = self.db.fatos_da_conversa(cid)
+        self.assertFalse(any(fatos.values()))
+
+
 class TesteEventoDireto(unittest.TestCase):
     def test_aceita_evento_ja_normalizado(self):
         db = FakeDatabase()

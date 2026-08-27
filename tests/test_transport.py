@@ -98,6 +98,139 @@ class TesteRecebimentoEvolution(unittest.TestCase):
         )
 
 
+class TesteMidiaSemLegendaGeraMarcador(unittest.TestCase):
+    """Mudança de comportamento: mídia sem legenda deixa de ser `None`.
+
+    Antes, `audioMessage`/`stickerMessage`/`contactMessage`/`locationMessage`/
+    `liveLocationMessage` faziam `receber()` devolver `None` — evento
+    descartado inteiro, sem gravar nada, `bola_com` congelado.
+    """
+
+    def setUp(self):
+        self.t = EvolutionTransporte("http://x", "k", "i")
+
+    def test_audio_vira_marcador(self):
+        recebido = self.t.receber(evento(message={"audioMessage": {}}))
+        self.assertEqual(recebido.texto, "[áudio recebido]")
+
+    def test_figurinha_vira_marcador(self):
+        recebido = self.t.receber(evento(message={"stickerMessage": {}}))
+        self.assertEqual(recebido.texto, "[figurinha recebida]")
+
+    def test_contato_vira_marcador(self):
+        recebido = self.t.receber(evento(message={"contactMessage": {}}))
+        self.assertEqual(recebido.texto, "[contato recebido]")
+
+    def test_localizacao_vira_marcador(self):
+        recebido = self.t.receber(evento(message={"locationMessage": {}}))
+        self.assertEqual(recebido.texto, "[localização recebida]")
+
+    def test_localizacao_ao_vivo_vira_marcador(self):
+        recebido = self.t.receber(evento(message={"liveLocationMessage": {}}))
+        self.assertEqual(recebido.texto, "[localização recebida]")
+
+    def test_reacao_continua_none(self):
+        """Regressão de `test_evento_sem_texto_e_ignorado`: nenhuma mudança."""
+        self.assertIsNone(self.t.receber(evento(message={"reactionMessage": {}})))
+
+
+class TesteEnvelopeEfemeroEViewOnce(unittest.TestCase):
+    """Parte 2 (ampliação): `.message` interno é desembrulhado recursivamente."""
+
+    def setUp(self):
+        self.t = EvolutionTransporte("http://x", "k", "i")
+
+    def test_texto_puro_dentro_de_ephemeral_e_preservado(self):
+        recebido = self.t.receber(
+            evento(message={"ephemeralMessage": {"message": {"conversation": "oi"}}})
+        )
+        self.assertEqual(recebido.texto, "oi")
+
+    def test_texto_puro_dentro_de_view_once_e_preservado(self):
+        recebido = self.t.receber(
+            evento(
+                message={
+                    "viewOnceMessage": {
+                        "message": {"extendedTextMessage": {"text": "quanto custa?"}}
+                    }
+                }
+            )
+        )
+        self.assertEqual(recebido.texto, "quanto custa?")
+
+    def test_texto_puro_dentro_de_view_once_v2_e_preservado(self):
+        recebido = self.t.receber(
+            evento(
+                message={"viewOnceMessageV2": {"message": {"conversation": "oi de novo"}}}
+            )
+        )
+        self.assertEqual(recebido.texto, "oi de novo")
+
+    def test_midia_sem_legenda_dentro_de_envelope_gera_marcador(self):
+        recebido = self.t.receber(
+            evento(message={"ephemeralMessage": {"message": {"audioMessage": {}}}})
+        )
+        self.assertEqual(recebido.texto, "[áudio recebido]")
+
+    def test_legenda_de_midia_dentro_de_envelope_e_preservada(self):
+        recebido = self.t.receber(
+            evento(
+                message={
+                    "viewOnceMessage": {
+                        "message": {"imageMessage": {"caption": "olha ele aqui"}}
+                    }
+                }
+            )
+        )
+        self.assertEqual(recebido.texto, "olha ele aqui")
+
+    def test_conteudo_interno_nao_reconhecido_vira_none(self):
+        """A recursão não inventa marcador para o que a chamada direta
+        também não reconheceria."""
+        self.assertIsNone(
+            self.t.receber(
+                evento(message={"ephemeralMessage": {"message": {"reactionMessage": {}}}})
+            )
+        )
+
+    def test_envelope_sem_message_interno_vira_none(self):
+        self.assertIsNone(self.t.receber(evento(message={"viewOnceMessage": {}})))
+
+
+class TesteDeviceSentMessage(unittest.TestCase):
+    """Eco de mensagem enviada por outro dispositivo linkado (§5, `bola_com`)."""
+
+    def setUp(self):
+        self.t = EvolutionTransporte("http://x", "k", "i")
+
+    def test_texto_interno_conta_como_eco_de_saida(self):
+        recebido = self.t.receber(
+            evento(
+                key={"remoteJid": "5511999@s.whatsapp.net", "id": "D1", "fromMe": True},
+                message={
+                    "deviceSentMessage": {
+                        "destinationJid": "5511999@s.whatsapp.net",
+                        "message": {"conversation": "Oi! Ja te respondo"},
+                    }
+                },
+            )
+        )
+        self.assertEqual(recebido.texto, "Oi! Ja te respondo")
+        self.assertEqual(recebido.direcao, "out")
+
+    def test_conteudo_interno_nao_reconhecido_vira_none(self):
+        self.assertIsNone(
+            self.t.receber(
+                evento(
+                    key={"remoteJid": "5511999@s.whatsapp.net", "id": "D2", "fromMe": True},
+                    message={
+                        "deviceSentMessage": {"message": {"reactionMessage": {}}}
+                    },
+                )
+            )
+        )
+
+
 class TesteConsoleNaoEnvia(unittest.TestCase):
     def test_dry_run_nao_marca_como_entregue(self):
         resultado = ConsoleTransporte(silencioso=True).enviar(

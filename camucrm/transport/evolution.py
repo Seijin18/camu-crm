@@ -109,11 +109,15 @@ class EvolutionTransporte:
     def receber(self, evento: Mapping[str, Any]) -> EventoRecebido | None:
         """Normaliza um webhook `messages.upsert` da Evolution API.
 
-        Só mensagem de texto vira `EventoRecebido`. Mídia é ignorada de
-        propósito **na v1**: a foto do pet é o fato mais importante do funil
-        (S2), mas quem afirma que ela chegou é a extração sobre a conversa, e
-        armazenar binário traz retenção e LGPD (§12) junto. O gancho está em
-        `_tipo_de_midia` para quando isso for tratado como capability própria.
+        Mensagem de texto e mídia (com ou sem legenda) viram `EventoRecebido`
+        — nunca guardamos o binário em si (retenção e LGPD, §12), só o fato
+        de que algo chegou: mídia sem legenda grava um marcador textual fixo
+        (`_texto_da_mensagem`/`_MARCADORES`), nunca `None`. A foto do pet
+        continua sendo confirmada pela extração sobre a conversa (S2), não
+        por este marcador. Envelope (`ephemeralMessage`/`viewOnceMessage*`/
+        `deviceSentMessage`) é desembrulhado recursivamente pela mesma
+        função. Ruído de protocolo (`reactionMessage`, recibo, presença, tipo
+        não reconhecido) continua devolvendo `None` — evento descartado.
         """
         if not isinstance(evento, Mapping):
             return None
@@ -147,8 +151,51 @@ class EvolutionTransporte:
         )
 
 
+#: Marcador textual fixo para mídia sem legenda — decidido por
+#: `_tipo_de_midia`. Nunca é evidência literal de fato nenhum (§2): a
+#: conferência de literalidade em `extraction/contract.py::_fold` recusa
+#: qualquer `true` cuja evidência seja só este texto, como qualquer trecho
+#: que não corresponda ao que o cliente disse de verdade.
+_MARCADORES = {
+    "audio": "[áudio recebido]",
+    "sticker": "[figurinha recebida]",
+    "contact": "[contato recebido]",
+    "location": "[localização recebida]",
+    "live_location": "[localização recebida]",
+}
+
+#: Chaves de envelope: o conteúdo real está em `.message`, dentro do bloco.
+_ENVELOPES = (
+    "ephemeralMessage",
+    "viewOnceMessage",
+    "viewOnceMessageV2",
+    "deviceSentMessage",
+)
+
+
 def _texto_da_mensagem(mensagem: Mapping[str, Any]) -> str | None:
-    """Texto de um `message` da Evolution, nos formatos que ela usa."""
+    """Texto de um `message` da Evolution, nos formatos que ela usa.
+
+    Três estágios de reconhecimento, nesta ordem:
+
+    1. Texto puro (`conversation`/`extendedTextMessage`) ou legenda de mídia
+       com legenda (`imageMessage`/`videoMessage`/`documentMessage`) — a
+       legenda, mesmo vazia, é devolvida.
+    2. Mídia sem legenda (`audioMessage`, `stickerMessage`, `contactMessage`,
+       `locationMessage`, `liveLocationMessage`): `_tipo_de_midia` decide o
+       tipo, e `_MARCADORES` devolve um marcador fixo em vez de `None` — o
+       evento continua sendo gravado, não descartado.
+    3. Envelope (`ephemeralMessage`, `viewOnceMessage`, `viewOnceMessageV2`,
+       `deviceSentMessage`): o conteúdo real está em `.message`, dentro do
+       envelope. Extrai esse `.message` interno e chama esta MESMA função
+       recursivamente sobre ele — texto puro é preservado como texto normal,
+       mídia sem legenda cai no marcador do item 2, e conteúdo não
+       reconhecido continua devolvendo `None`, exatamente como devolveria
+       sem o envelope.
+
+    `reactionMessage` e qualquer chave não reconhecida (inclusive dentro de
+    um envelope) devolvem `None` — comportamento inalterado.
+    """
     if not isinstance(mensagem, Mapping):
         return None
     if isinstance(mensagem.get("conversation"), str):
@@ -162,11 +209,25 @@ def _texto_da_mensagem(mensagem: Mapping[str, Any]) -> str | None:
         bloco = mensagem.get(chave)
         if isinstance(bloco, Mapping):
             return bloco.get("caption") or ""
+    # Mídia sem legenda: marcador fixo em vez de descartar o evento inteiro.
+    marcador = _MARCADORES.get(_tipo_de_midia(mensagem) or "")
+    if marcador is not None:
+        return marcador
+    # Envelope (efêmero/view-once/eco de outro dispositivo): desembrulhar
+    # `.message` e reaplicar esta mesma função, recursivamente.
+    for chave in _ENVELOPES:
+        envelope = mensagem.get(chave)
+        if isinstance(envelope, Mapping):
+            return _texto_da_mensagem(envelope.get("message") or {})
     return None
 
 
 def _tipo_de_midia(mensagem: Mapping[str, Any]) -> str | None:
-    """Tipo de mídia anexada, quando houver. Gancho para uma capability futura."""
+    """Tipo de mídia anexada, quando houver.
+
+    Decide o marcador textual que `_texto_da_mensagem` devolve para mídia
+    sem legenda (via `_MARCADORES`) — deixou de ser gancho morto.
+    """
     if not isinstance(mensagem, Mapping):
         return None
     for chave, tipo in (
@@ -175,6 +236,9 @@ def _tipo_de_midia(mensagem: Mapping[str, Any]) -> str | None:
         ("videoMessage", "video"),
         ("documentMessage", "document"),
         ("stickerMessage", "sticker"),
+        ("contactMessage", "contact"),
+        ("locationMessage", "location"),
+        ("liveLocationMessage", "live_location"),
     ):
         if isinstance(mensagem.get(chave), Mapping):
             return tipo
