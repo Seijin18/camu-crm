@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "codebase-memory": {
+      "command": "/home/marshibs/.local/bin/codebase-memory-mcp",
+      "args": []
+    },
+    "context-mode": {
+      "command": "/home/marshibs/.npm-global/bin/context-mode",
+      "args": []
+    }
+  }
+}

@@ -93,3 +93,10 @@ exemplo e o número não significa nada.
 `openspec/` é a fonte de verdade do planejamento. Ver `openspec/project.md`
 para o estado atual e a ordem de dependência. As regras gerais do fluxo
 (propor → aplicar → sincronizar → arquivar) estão nas instruções globais.
+
+## MCP Context Mode e MCP Codebase Memory
+
+Este projeto declara os servidores `context-mode` e `codebase-memory` em
+`.mcp.json`. As regras de quando usar cada um (comando único vs. saída
+grande a resumir; grep pontual vs. pergunta estrutural sobre a base) estão
+nas instruções globais — não repetidas aqui para não divergir delas.
