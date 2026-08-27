@@ -224,6 +224,14 @@ Nesta ordem de dependência:
    qualquer conversa — capability nova, separada do modelo de conversa da
    §9 de propósito (ver "Decisões que divergem" acima para a base legal e a
    decisão de nunca enviar pela API).
+5. **`importacao-conversas-whatsapp`** — proposto em 2026-08-27, pedido do
+   usuário: contato deixou de acontecer só pelo número da Camu, e a
+   exportação de conversa do próprio WhatsApp (`.txt`) precisa de um lado
+   de importação para essas conversas entrarem no mesmo funil/regras. Sem
+   dependência das anteriores. Reaproveita `backfill.importar_conversas`
+   e `origem='backfill'` sem mudar schema (ver `design.md` do change para
+   o porquê) — disparo só pelo painel, decisão do usuário, sem comando CLI
+   dedicado.
 
 O painel não é mais candidato — é change ativo, antecipado. Ver os seis
 changes `painel-leitura`, `painel-tempo-real`, `acoes-no-painel`,
