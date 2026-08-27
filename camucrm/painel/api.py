@@ -34,7 +34,11 @@ clicar, nunca automática").
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -44,6 +48,8 @@ from .. import acoes, config, metrics, summaries
 from ..db import Database
 from ..drafts import PROMPT_VERSAO, RascunhoInvalidoError
 from ..drafts import gerar as gerar_rascunho
+from ..evaluation.dataset import DatasetInvalidoError, TAMANHO_MINIMO, avisos_de_tamanho, carregar, validar_entrada
+from ..evaluation.runner import rodar as rodar_eval
 from ..llm import LlmIndisponivelError, criar_llm
 from ..pipeline import recalcular
 from ..rules.fila import Candidato, montar_fila
@@ -277,6 +283,7 @@ def get_o_que_funciona(dias: int = 90, db: Database = Depends(_db)):
         padrao_correcoes=metrics.padrao_correcoes(db, desde=desde),
         retorno_followup=metrics.retorno_por_followup(db),
         ab_rascunhos=metrics.ab_rascunhos(db),
+        resultado_eval=_ler_cache_resultado_eval(),
     )
 
 
@@ -565,3 +572,299 @@ def resumo_da_conversa(conversa_id: int, db: Database = Depends(_db)):
         return views.resumo_para_json(None, mensagens_desde=None)
     pendentes = db.mensagens_desde(conversa_id, cache.ultima_mensagem_id)
     return views.resumo_para_json(cache, mensagens_desde=pendentes)
+
+
+# --------------------------------------------------------------------------
+# Ground truth / eval (§7) — change `ground-truth-no-painel`
+#
+# O dataset continua sendo o arquivo `data/eval/conversas.jsonl` (`design.md`
+# deste change: não migra para Postgres, mesma fronteira file-based do
+# playbook). `dataset.validar_entrada` é o único lugar que valida uma
+# entrada — nenhuma regra é reimplementada aqui, só leitura/escrita do
+# arquivo e tradução de erro para HTTP.
+#
+# `POST /eval/rodar` é a única rota desta seção que chama LLM (via
+# `evaluation.runner.rodar`, que por sua vez chama `extraction.prompt` — não
+# é um quarto lugar de LLM, é o mesmo caminho de `extraction/` exercitado
+# pelo harness de eval). Por isso é `POST`, nunca `GET`, e recusa com 422
+# abaixo de `TAMANHO_MINIMO` — estrutural, não só de UI.
+# --------------------------------------------------------------------------
+
+# Ground truth pede a conversa inteira, não as últimas 200 (o corte de
+# `LIMITE_CONVERSAS_PADRAO`/rota de mensagens é sobre outra tela, ver
+# backlog `painel-mensagens-recentes-e-acoes-seguras`) — o teto aqui é só
+# uma rede de segurança contra uma conversa anormalmente longa.
+LIMITE_MENSAGENS_EVAL = 2000
+
+
+def _caminho_dataset_eval() -> Path:
+    return config.eval_dataset_caminho()
+
+
+def _caminho_resultado_eval() -> Path:
+    """Cache de `POST /eval/rodar` — sempre irmão do dataset (nunca um
+    caminho fixo separado), para um teste que aponta `CAMU_EVAL_DATASET`
+    para um arquivo temporário nunca escrever no cache real por acidente.
+    """
+    return _caminho_dataset_eval().parent / "ultimo_resultado.json"
+
+
+def _carregar_dataset_eval():
+    """`dataset.carregar`, mas tolerante a dataset ainda inexistente —
+    antes da primeira entrada, o arquivo não existe, e isso não é erro."""
+    caminho = _caminho_dataset_eval()
+    if not caminho.exists():
+        return []
+    return carregar(caminho)
+
+
+def _ler_entradas_brutas_eval(caminho: Path) -> list[dict[str, Any]]:
+    if not caminho.exists():
+        return []
+    entradas = []
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha or linha.startswith("//"):
+            continue
+        entradas.append(json.loads(linha))
+    return entradas
+
+
+def _escrever_entradas_brutas_eval(caminho: Path, entradas: list[dict[str, Any]]) -> None:
+    """Grava o dataset inteiro de uma vez — só chamada depois que a entrada
+    nova/editada já passou por `validar_entrada` (requirement "Entrada
+    malformada nunca corrompe o arquivo": a validação vem sempre antes da
+    escrita, nunca depois).
+    """
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    conteudo = "\n".join(json.dumps(e, ensure_ascii=False) for e in entradas)
+    if conteudo:
+        conteudo += "\n"
+    caminho.write_text(conteudo, encoding="utf-8")
+
+
+def _indice_entrada_eval(entradas: list[dict[str, Any]], entrada_id: str) -> int | None:
+    for i, entrada in enumerate(entradas):
+        if str(entrada.get("id")) == entrada_id:
+            return i
+    return None
+
+
+def _mensagens_de_conversa_para_bruto(db: Database, conversa_id: int) -> list[dict[str, Any]]:
+    registros = db.listar_mensagens_registradas(
+        conversa_id=conversa_id, limite=LIMITE_MENSAGENS_EVAL
+    )
+    return [
+        {"direcao": m.direcao, "texto": m.texto, "enviada_em": m.enviada_em.isoformat()}
+        for m in registros
+    ]
+
+
+def _ler_cache_resultado_eval() -> dict[str, Any] | None:
+    caminho = _caminho_resultado_eval()
+    if not caminho.exists():
+        return None
+    return json.loads(caminho.read_text(encoding="utf-8"))
+
+
+class NovaEntradaEvalBody(BaseModel):
+    id: str | None = None
+    funil: str | None = None
+    conversa_id: int | None = None
+    mensagens: list[dict[str, Any]] | None = None
+    rotulo: dict[str, Any]
+    nota: str | None = None
+
+
+class RodarEvalBody(BaseModel):
+    por: str | None = None
+
+
+@router.get("/eval/status")
+def status_eval():
+    """Contagem, `completo`, lista resumida e avisos — requirement "Status
+    do dataset reflete completude real"."""
+    try:
+        conversas = _carregar_dataset_eval()
+    except DatasetInvalidoError as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), "§7"))
+    return views.status_eval_para_json(conversas, avisos_de_tamanho(conversas))
+
+
+@router.get("/eval/rotulos/{entrada_id}")
+def detalhe_rotulo_eval(entrada_id: str):
+    """Detalhe completo (mensagens + rótulo) de uma entrada, para edição."""
+    entradas = _ler_entradas_brutas_eval(_caminho_dataset_eval())
+    indice = _indice_entrada_eval(entradas, entrada_id)
+    if indice is None:
+        return views.erro(f"entrada {entrada_id!r} não existe", "§7")
+    try:
+        entrada = validar_entrada(entradas[indice], entrada_id)
+    except DatasetInvalidoError as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), "§7"))
+    return views.entrada_eval_detalhe_para_json(entrada)
+
+
+@router.post("/eval/rotulos")
+def criar_rotulo_eval(corpo: NovaEntradaEvalBody, db: Database = Depends(_db)):
+    """Cria uma entrada nova — `conversa_id` puxa mensagens reais do CRM
+    (requirement "Criar entrada a partir de conversa real puxa as
+    mensagens"), ou `mensagens[]` digitadas como fallback. Valida via
+    `dataset.validar_entrada` antes de gravar (requirement "Entrada
+    malformada nunca corrompe o arquivo").
+    """
+    if corpo.conversa_id is None and not corpo.mensagens:
+        return JSONResponse(
+            status_code=422,
+            content=views.erro("informe `conversa_id` ou `mensagens[]`", "§7"),
+        )
+
+    if corpo.conversa_id is not None:
+        conversa = db.get_conversa(corpo.conversa_id)
+        if conversa is None:
+            return JSONResponse(
+                status_code=422,
+                content=views.erro(f"conversa {corpo.conversa_id} não existe", None),
+            )
+        mensagens_bruto = _mensagens_de_conversa_para_bruto(db, corpo.conversa_id)
+        funil = corpo.funil or conversa.funil
+        identificador = corpo.id or f"conversa-{corpo.conversa_id}"
+    else:
+        mensagens_bruto = corpo.mensagens
+        funil = corpo.funil or B2C
+        identificador = corpo.id or uuid4().hex[:8]
+
+    bruto = {
+        "id": identificador,
+        "funil": funil,
+        "mensagens": mensagens_bruto,
+        "rotulo": corpo.rotulo,
+        "nota": corpo.nota,
+    }
+    try:
+        entrada = validar_entrada(bruto, "painel")
+    except DatasetInvalidoError as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), "§7"))
+
+    caminho = _caminho_dataset_eval()
+    entradas = _ler_entradas_brutas_eval(caminho)
+    if _indice_entrada_eval(entradas, identificador) is not None:
+        return JSONResponse(
+            status_code=422, content=views.erro(f"id {identificador!r} já existe", "§7")
+        )
+    entradas.append(bruto)
+    _escrever_entradas_brutas_eval(caminho, entradas)
+    return {"ok": True, "entrada": views.entrada_eval_detalhe_para_json(entrada)}
+
+
+@router.put("/eval/rotulos/{entrada_id}")
+def editar_rotulo_eval(entrada_id: str, corpo: NovaEntradaEvalBody, db: Database = Depends(_db)):
+    """Edita o rótulo de uma entrada existente, revalidando (requirement
+    "Detalhe de entrada é editável" — o `id` é sempre preservado, vem do
+    path, nunca do corpo).
+    """
+    caminho = _caminho_dataset_eval()
+    entradas = _ler_entradas_brutas_eval(caminho)
+    indice = _indice_entrada_eval(entradas, entrada_id)
+    if indice is None:
+        return JSONResponse(
+            status_code=422, content=views.erro(f"entrada {entrada_id!r} não existe", "§7")
+        )
+    existente = entradas[indice]
+
+    if corpo.conversa_id is not None:
+        conversa = db.get_conversa(corpo.conversa_id)
+        if conversa is None:
+            return JSONResponse(
+                status_code=422,
+                content=views.erro(f"conversa {corpo.conversa_id} não existe", None),
+            )
+        mensagens_bruto = _mensagens_de_conversa_para_bruto(db, corpo.conversa_id)
+        funil = corpo.funil or conversa.funil
+    elif corpo.mensagens is not None:
+        mensagens_bruto = corpo.mensagens
+        funil = corpo.funil or existente.get("funil")
+    else:
+        mensagens_bruto = existente.get("mensagens")
+        funil = corpo.funil or existente.get("funil")
+
+    bruto = {
+        "id": entrada_id,
+        "funil": funil,
+        "mensagens": mensagens_bruto,
+        "rotulo": corpo.rotulo,
+        "nota": corpo.nota if corpo.nota is not None else existente.get("nota"),
+    }
+    try:
+        entrada = validar_entrada(bruto, entrada_id)
+    except DatasetInvalidoError as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), "§7"))
+
+    entradas[indice] = bruto
+    _escrever_entradas_brutas_eval(caminho, entradas)
+    return {"ok": True, "entrada": views.entrada_eval_detalhe_para_json(entrada)}
+
+
+@router.delete("/eval/rotulos/{entrada_id}")
+def excluir_rotulo_eval(entrada_id: str):
+    """Remove uma entrada (requirement "Detalhe de entrada é editável")."""
+    caminho = _caminho_dataset_eval()
+    entradas = _ler_entradas_brutas_eval(caminho)
+    indice = _indice_entrada_eval(entradas, entrada_id)
+    if indice is None:
+        return JSONResponse(
+            status_code=422, content=views.erro(f"entrada {entrada_id!r} não existe", "§7")
+        )
+    del entradas[indice]
+    _escrever_entradas_brutas_eval(caminho, entradas)
+    return {"ok": True}
+
+
+@router.post("/eval/rodar")
+def rodar_eval_route(corpo: RodarEvalBody):
+    """Roda `evaluation.rodar()` contra o dataset inteiro — gasta cota de
+    LLM, por isso `POST`, nunca `GET`. Recusa com 422 abaixo de
+    `TAMANHO_MINIMO` (requirement "Rodar eval abaixo do tamanho mínimo é
+    estruturalmente recusado") sem chamar o LLM. Resultado é cacheado em
+    arquivo, nunca em tabela (design.md). Autenticação já vem do
+    `Depends(exigir_token)` do `router` (não precisa de `Database`: o
+    dataset é lido do arquivo, não do Postgres).
+    """
+    try:
+        conversas = _carregar_dataset_eval()
+    except DatasetInvalidoError as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), "§7"))
+
+    if len(conversas) < TAMANHO_MINIMO:
+        return JSONResponse(
+            status_code=422,
+            content=views.erro(
+                f"dataset com {len(conversas)} conversa(s); §7 exige "
+                f"{TAMANHO_MINIMO} para rodar o eval",
+                "§7",
+            ),
+        )
+
+    try:
+        llm = criar_llm()
+        relatorio = rodar_eval(llm, conversas)
+    except LlmIndisponivelError as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), "§7"))
+
+    cache = views.relatorio_eval_para_cache(relatorio)
+    caminho_resultado = _caminho_resultado_eval()
+    caminho_resultado.parent.mkdir(parents=True, exist_ok=True)
+    caminho_resultado.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return views.resultado_eval_para_json(cache)
+
+
+@router.get("/eval/resultado")
+def resultado_eval_route():
+    """Lê o cache de `POST /eval/rodar`; `disponivel: false` antes da
+    primeira execução."""
+    cache = _ler_cache_resultado_eval()
+    if cache is None:
+        return {"disponivel": False}
+    return views.resultado_eval_para_json(cache)

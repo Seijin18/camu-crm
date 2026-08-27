@@ -44,6 +44,7 @@ _carregar_env()
 ENV_DSN = "CAMU_DB_DSN"
 ENV_PLAYBOOK = "CAMU_PLAYBOOK"
 ENV_OPERADOR = "CAMU_OPERADOR"
+ENV_EVAL_DATASET = "CAMU_EVAL_DATASET"
 
 DSN_PADRAO = "postgresql://camu:camu@localhost:5433/camucrm"
 
@@ -51,6 +52,11 @@ DSN_PADRAO = "postgresql://camu:camu@localhost:5433/camucrm"
 # O caminho é configurável porque o playbook vive no repositório de operação,
 # não neste.
 PLAYBOOK_PADRAO = "docs/playbook-tom.md"
+
+# §7: as 30 conversas de ground truth. Change `ground-truth-no-painel` —
+# permite a suíte de testes apontar para um arquivo temporário sem tocar o
+# dataset real, mesmo padrão de `CAMU_PLAYBOOK`.
+EVAL_DATASET_PADRAO = "data/eval/conversas.jsonl"
 
 
 def dsn() -> str:
@@ -72,3 +78,14 @@ def playbook() -> str | None:
     if caminho.exists():
         return caminho.read_text(encoding="utf-8")
     return None
+
+
+def eval_dataset_caminho() -> Path:
+    """Caminho do dataset de ground truth (§7).
+
+    O cache de `POST /eval/rodar` (`ultimo_resultado.json`, change
+    `ground-truth-no-painel`) vive no mesmo diretório deste arquivo — assim
+    um teste que aponta `CAMU_EVAL_DATASET` para um arquivo temporário nunca
+    grava o cache junto do dataset real por acidente.
+    """
+    return Path(os.getenv(ENV_EVAL_DATASET, EVAL_DATASET_PADRAO))

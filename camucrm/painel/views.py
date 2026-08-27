@@ -28,6 +28,8 @@ from ..db import (
     ResumoConversa,
 )
 from .. import metrics
+from ..evaluation.dataset import TAMANHO_MINIMO, ConversaRotulada
+from ..evaluation.runner import META_FALSOS_POSITIVOS, META_FATOS, META_OBJECAO, RelatorioEval
 from ..pipeline import EstadoConversa
 from ..rules.estagio import ORIGEM_BACKFILL
 from ..rules.fila import ItemFila
@@ -517,6 +519,31 @@ def _ab_rascunhos_para_json(dados: "metrics.AbRascunhos") -> dict[str, Any]:
     }
 
 
+def _acuracia_extracao_para_json(cache: dict[str, Any] | None) -> dict[str, Any]:
+    """Bloco "Acurácia de extração (§7)" — change `ground-truth-no-painel`.
+
+    Populado só quando há cache de `POST /eval/rodar` disponível
+    (`disponivel: False` sem cache — a restrição de `project.md` some daqui
+    pra dentro, mas a ausência de cache continua não afirmando nada).
+    """
+    if cache is None:
+        return {"disponivel": False}
+    return {
+        "disponivel": True,
+        "prompt_versao": cache.get("prompt_versao"),
+        "rodado_em": cache.get("rodado_em"),
+        "n_conversas": cache.get("n_conversas"),
+        "concordancia_fatos": cache.get("concordancia_fatos"),
+        "meta_fatos": META_FATOS,
+        "acerto_objecao": cache.get("acerto_objecao"),
+        "meta_objecao": META_OBJECAO,
+        "n_falsos_positivos": cache.get("n_falsos_positivos"),
+        "meta_falsos_positivos": META_FALSOS_POSITIVOS,
+        "falsos_positivos": cache.get("falsos_positivos"),
+        "aprovado": cache.get("aprovado"),
+    }
+
+
 def o_que_funciona_para_json(
     *,
     metricas_chave,
@@ -529,15 +556,19 @@ def o_que_funciona_para_json(
     padrao_correcoes,
     retorno_followup,
     ab_rascunhos,
+    resultado_eval: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Payload de `GET /api/o-que-funciona` (change `analise-desempenho`).
 
-    Restrição herdada de `openspec/project.md`: nenhuma chave aqui é
+    Restrição herdada de `openspec/project.md`: nenhuma chave de funil aqui é
     "acurácia de extração" — conversão e tempo por estágio são os únicos
-    números de funil mostrados porque não dependem de `ground-truth-marcos`.
-    Toda porcentagem sai acompanhada de `n` e `amostra_suficiente`
-    (§7/CLAUDE.md); é a tela, não este dicionário, que decide esconder o
-    número — o valor calculado nunca é omitido.
+    números de funil mostrados porque não dependem do eval. `acuracia_
+    extracao` (change `ground-truth-no-painel`) é a exceção controlada: só
+    aparece populada quando `resultado_eval` (o cache de `POST /eval/rodar`)
+    existe; sem cache, `disponivel: False` e a tela mantém o texto de
+    restrição. Toda porcentagem sai acompanhada de `n` e `amostra_
+    suficiente` (§7/CLAUDE.md); é a tela, não este dicionário, que decide
+    esconder o número — o valor calculado nunca é omitido.
     """
     return {
         "funil": {
@@ -570,7 +601,92 @@ def o_que_funciona_para_json(
         "correcoes": _padrao_correcoes_para_json(padrao_correcoes),
         "followups": {"retorno": _retorno_followup_para_json(retorno_followup)},
         "rascunhos": _ab_rascunhos_para_json(ab_rascunhos),
+        "acuracia_extracao": _acuracia_extracao_para_json(resultado_eval),
     }
+
+
+# --------------------------------------------------------------------------
+# Ground truth / eval (§7) — change `ground-truth-no-painel`
+# --------------------------------------------------------------------------
+
+
+def entrada_eval_resumo_para_json(entrada: ConversaRotulada) -> dict[str, Any]:
+    """Uma linha da lista de `GET /api/eval/status` — sem transcrição."""
+    return {
+        "id": entrada.id,
+        "funil": entrada.funil,
+        "estagio_final": entrada.estagio_final,
+        "estagio_final_label": estagio_label(entrada.estagio_final),
+        "objecao": entrada.objecao,
+        "nota": entrada.nota,
+        "n_mensagens": len(entrada.mensagens),
+    }
+
+
+def entrada_eval_detalhe_para_json(entrada: ConversaRotulada) -> dict[str, Any]:
+    """Detalhe completo (mensagens + rótulo) — `GET /api/eval/rotulos/{id}`
+    e a resposta de criar/editar. A transcrição aqui é a mesma que a tela de
+    rotulagem mostra somente-leitura (design.md)."""
+    return {
+        "id": entrada.id,
+        "funil": entrada.funil,
+        "mensagens": [
+            {"direcao": m.direcao, "texto": m.texto, "enviada_em": m.enviada_em.isoformat()}
+            for m in entrada.mensagens
+        ],
+        "rotulo": {
+            "estagio_final": entrada.estagio_final,
+            "objecao": entrada.objecao,
+            "fatos": dict(entrada.fatos),
+            "marcos": sorted(entrada.marcos),
+        },
+        "nota": entrada.nota,
+    }
+
+
+def status_eval_para_json(conversas, avisos) -> dict[str, Any]:
+    """Payload de `GET /api/eval/status` (requirement "Status do dataset
+    reflete completude real")."""
+    conversas = list(conversas)
+    return {
+        "total": len(conversas),
+        "minimo": TAMANHO_MINIMO,
+        "completo": len(conversas) >= TAMANHO_MINIMO,
+        "avisos": list(avisos),
+        "entradas": [entrada_eval_resumo_para_json(c) for c in conversas],
+    }
+
+
+def relatorio_eval_para_cache(relatorio: RelatorioEval) -> dict[str, Any]:
+    """`RelatorioEval` -> dict seguro para gravar em
+    `data/eval/ultimo_resultado.json` (design.md: só métricas agregadas,
+    nunca texto de mensagem — `ResultadoConversa` já não carrega texto)."""
+    return {
+        "prompt_versao": relatorio.prompt_versao,
+        "rodado_em": relatorio.rodado_em.isoformat(),
+        "n_conversas": len(relatorio.resultados),
+        "concordancia_fatos": relatorio.concordancia_fatos,
+        "acerto_objecao": relatorio.acerto_objecao,
+        "acerto_estagio": relatorio.acerto_estagio,
+        "aprovado": relatorio.aprovado,
+        "n_falsos_positivos": len(relatorio.falsos_positivos),
+        "falsos_positivos": [
+            {
+                "id": r.id,
+                "estagio_esperado": r.estagio_esperado,
+                "estagio_obtido": r.estagio_obtido,
+            }
+            for r in relatorio.falsos_positivos
+        ],
+        "avisos": list(relatorio.avisos),
+        "erros": [{"id": r.id, "erro": r.erro} for r in relatorio.resultados if r.erro],
+    }
+
+
+def resultado_eval_para_json(cache: dict[str, Any]) -> dict[str, Any]:
+    """Payload de `GET`/`POST /api/eval/resultado(/rodar)` a partir do
+    cache já lido do arquivo."""
+    return {**cache, "disponivel": True}
 
 
 def metricas_para_json(metricas_chave, tempo_por_estagio, saude_taxonomia) -> dict[str, Any]:

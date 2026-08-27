@@ -159,20 +159,25 @@ class TesteRotas(unittest.TestCase):
 
     def test_o_que_funciona_smoke(self):
         """Change `analise-desempenho`: rota nova, banco vazio — nenhum bloco
-        pode quebrar com n=0, e nenhum campo de acurácia de extração."""
+        pode quebrar com n=0.
+
+        Change `ground-truth-no-painel`: o bloco `acuracia_extracao` agora
+        existe sempre, mas sem cache de `POST /eval/rodar` ele só carrega
+        `disponivel: False` — nenhum número de acurácia é afirmado (a
+        restrição de `project.md`), o que esta suíte confere mais abaixo em
+        `TesteEvalPainel`.
+        """
         resposta = self.cliente.get("/api/o-que-funciona")
         self.assertEqual(resposta.status_code, 200)
         corpo = resposta.json()
         for chave in ("funil", "tempo_por_estagio", "objecoes", "correcoes",
-                      "followups", "rascunhos"):
+                      "followups", "rascunhos", "acuracia_extracao"):
             self.assertIn(chave, corpo)
         self.assertIn("onde_morrem", corpo["funil"])
         self.assertEqual(corpo["funil"]["onde_morrem"]["n"], 0)
         self.assertIn("bloqueado", corpo["rascunhos"])
         self.assertTrue(corpo["rascunhos"]["bloqueado"])
-        texto = json.dumps(corpo).lower()
-        self.assertNotIn("acuracia", texto)
-        self.assertNotIn("acurácia", texto)
+        self.assertEqual(corpo["acuracia_extracao"], {"disponivel": False})
 
     def test_o_que_funciona_respeita_dias(self):
         resposta = self.cliente.get("/api/o-que-funciona?dias=7")

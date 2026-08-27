@@ -68,11 +68,20 @@ def carregar(caminho: str | Path) -> list[ConversaRotulada]:
             bruto = json.loads(linha)
         except json.JSONDecodeError as exc:
             raise DatasetInvalidoError(f"{caminho}:{numero} JSON inválido: {exc}") from exc
-        conversas.append(_para_conversa(bruto, f"{caminho}:{numero}"))
+        conversas.append(validar_entrada(bruto, f"{caminho}:{numero}"))
     return conversas
 
 
-def _para_conversa(bruto: Mapping[str, Any], onde: str) -> ConversaRotulada:
+def validar_entrada(bruto: Mapping[str, Any], onde: str) -> ConversaRotulada:
+    """Valida e converte uma entrada bruta (arquivo OU painel) em `ConversaRotulada`.
+
+    Change `ground-truth-no-painel`: único lugar do sistema que valida uma
+    entrada de ground truth — `carregar()` (lendo do arquivo) e as rotas
+    `/api/eval/*` do painel (recebendo JSON do formulário/`conversa_id`)
+    chamam esta função, nunca reimplementam a regra (mesma disciplina de
+    `db.py` ser o único lugar com SQL). `onde` é só para a mensagem de erro
+    apontar a origem (linha do arquivo, ou o id da entrada no painel).
+    """
     identificador = str(bruto.get("id") or onde)
     funil = str(bruto.get("funil") or B2C).lower()
     if funil not in (B2B, B2C):

@@ -415,3 +415,72 @@ main {
   letter-spacing: 0.04em;
   margin-bottom: 0.5rem;
 }
+
+/* Ground truth (§7) — change `ground-truth-no-painel` */
+
+.gt-progresso {
+  margin-bottom: 0.75rem;
+}
+
+.gt-rodar {
+  margin: 0.75rem 0;
+}
+
+.gt-resultado {
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  padding: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.gt-lista {
+  margin-top: 1.25rem;
+}
+
+.gt-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--borda);
+}
+
+.gt-item .gt-id {
+  font-weight: 700;
+  min-width: 8rem;
+}
+
+.gt-transcricao {
+  max-height: 16rem;
+  overflow-y: auto;
+}
+
+.gt-form {
+  max-width: 40rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.gt-form label {
+  font-weight: 600;
+}
+
+.gt-form input[type="text"],
+.gt-form select,
+.gt-form textarea {
+  width: 100%;
+  padding: 0.35rem;
+  border: 1px solid var(--borda);
+  border-radius: 4px;
+  background: var(--bg-elev);
+  color: var(--texto);
+}
+
+.gt-fatos div,
+.gt-marcos div {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}

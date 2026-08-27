@@ -64,18 +64,20 @@ async function chamarApi(caminho) {
 }
 
 /**
- * POST de uma ação humana (marco, funil, correção — change `acoes-no-painel`).
- * Mesmo formato de erro de `chamarApi`: `erro.regra` carrega a seção citada
- * pelo servidor (ex.: "§3") quando a ação é recusada com 422.
+ * Escreve uma ação humana (marco, funil, correção — change `acoes-no-painel`;
+ * também usada por `/eval/rotulos` — change `ground-truth-no-painel`, que
+ * precisa de `PUT`/`DELETE` além de `POST`). Mesmo formato de erro de
+ * `chamarApi`: `erro.regra` carrega a seção citada pelo servidor (ex.:
+ * "§3"/"§7") quando a ação é recusada com 422.
  */
-async function chamarApiEscrever(caminho, corpo) {
+async function chamarApiEscrever(caminho, corpo, metodo) {
   const resposta = await fetch(`/api${caminho}`, {
-    method: "POST",
+    method: metodo || "POST",
     headers: {
       "X-Camu-Token": obterToken(),
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(corpo),
+    body: corpo === undefined ? undefined : JSON.stringify(corpo),
   });
   const dados = await resposta.json();
   if (!resposta.ok) {
@@ -444,6 +446,20 @@ async function renderizarDetalhe(container, id) {
 
   await renderizarRascunhos(container, id);
   await renderizarMensagens(container, id);
+
+  // Change `ground-truth-no-painel`: atalho para rotular esta conversa —
+  // abre o formulário de `#/groundtruth` com a transcrição real já
+  // pré-carregada (somente leitura), campos de julgamento em branco.
+  const secaoGroundTruth = el("div", { class: "secao" });
+  const botaoGroundTruth = el("button", {
+    class: "secundario",
+    texto: "Usar para ground truth (§7)",
+  });
+  botaoGroundTruth.addEventListener("click", () => {
+    window.location.hash = `#/groundtruth/novo/${id}`;
+  });
+  secaoGroundTruth.appendChild(botaoGroundTruth);
+  container.appendChild(secaoGroundTruth);
 }
 
 /**
@@ -919,6 +935,395 @@ async function renderizarFunciona(container) {
   container.appendChild(blocoRascunhos(dados.rascunhos));
 }
 
+/*
+ * Change `ground-truth-no-painel` (§7): rotular pelo painel em vez de editar
+ * `data/eval/conversas.jsonl` num editor de texto. Duas telas:
+ *   - `#/groundtruth` — progresso, avisos, lista com editar/excluir, botão
+ *     "rodar eval" (habilitado só com `completo: true`).
+ *   - `#/groundtruth/novo/{conversa_id}` e `#/groundtruth/editar/{entrada_id}`
+ *     — o mesmo formulário de rotulagem: transcrição somente-leitura em
+ *     cima, campos de julgamento embaixo.
+ *
+ * Taxonomias abaixo espelham `camucrm/taxonomia.py`/`extraction/contract.py`
+ * (fechadas, §0/§2/§3/§4) — só para montar `<select>`/checkboxes; a
+ * validação de verdade é sempre do servidor (`dataset.validar_entrada`).
+ */
+
+const GT_ESTAGIOS_B2C = ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "SX"];
+const GT_ESTAGIOS_B2B = ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "PX"];
+const GT_OBJECOES = [
+  "preco", "frete", "prazo", "confianca", "momento", "alternativa", "sem_resposta", "outro",
+];
+const GT_FATOS = [
+  "foto_pet_recebida", "preco_apresentado", "previa_enviada",
+  "intencao_compra_explicita", "recusa_explicita", "autorizou_envio_material",
+  "visita_aceita",
+];
+const GT_MARCOS = ["ganho", "consignacao_assinada", "primeira_reposicao"];
+
+function gtSelectEstagio(funilAtual, valorAtual) {
+  const sel = el("select", { id: "gt-estagio-final" });
+  const estagios = funilAtual === "b2b" ? GT_ESTAGIOS_B2B : GT_ESTAGIOS_B2C;
+  estagios.forEach((e) => {
+    const opt = el("option", { value: e, texto: `${e} — ${estagio_label_js(e)}` });
+    if (e === valorAtual) opt.setAttribute("selected", "selected");
+    sel.appendChild(opt);
+  });
+  return sel;
+}
+
+// Rótulos mínimos, só para o `<select>` ficar legível — a fonte de verdade
+// continua `camucrm/taxonomia.py::ESTAGIO_LABELS` (servidor).
+const GT_ESTAGIO_LABELS = {
+  S0: "Lead", S1: "Respondeu", S2: "Foto recebida", S3: "Prévia enviada",
+  S4: "Preço apresentado", S5: "Negociação", S6: "Ganho", SX: "Perdido",
+  P0: "Não abordado", P1: "Msg 1 enviada", P2: "Autorizou",
+  P3: "Proposta apresentada", P4: "Visita agendada",
+  P5: "Consignação assinada", P6: "Primeira reposição", PX: "Descartado",
+};
+function estagio_label_js(e) {
+  return GT_ESTAGIO_LABELS[e] || e;
+}
+
+function gtCabecalhoProgresso(status) {
+  const texto = status.completo
+    ? `✓ ${status.total}/${status.minimo} completo`
+    : `${status.total}/${status.minimo} rotuladas`;
+  const bloco = el("div", { class: "gt-progresso" }, [
+    el("strong", { texto }),
+  ]);
+  status.avisos.forEach((a) => {
+    bloco.appendChild(el("p", { class: "aviso", texto: a }));
+  });
+  return bloco;
+}
+
+async function renderizarGroundTruth(container) {
+  container.appendChild(el("h2", { texto: "Ground truth (§7)" }));
+  container.appendChild(
+    el("p", {
+      class: "aviso",
+      texto:
+        "As conversas rotuladas aqui alimentam `make eval` — §7 pede 30, " +
+        "rotuladas à mão, uma por uma. Nenhum campo de julgamento é " +
+        "sugerido pelo sistema.",
+    })
+  );
+
+  const status = await chamarApi("/eval/status");
+  container.appendChild(gtCabecalhoProgresso(status));
+
+  const botaoNova = el("button", { texto: "Nova entrada (mensagens digitadas)" });
+  botaoNova.addEventListener("click", () => {
+    window.location.hash = "#/groundtruth/novo";
+  });
+  container.appendChild(botaoNova);
+
+  const areaRodar = el("div", { class: "gt-rodar" });
+  const botaoRodar = el("button", {
+    class: status.completo ? "" : "secundario",
+    texto: "Rodar eval (chama o LLM)",
+  });
+  botaoRodar.disabled = !status.completo;
+  if (!status.completo) {
+    areaRodar.appendChild(
+      el("p", {
+        class: "aviso",
+        texto: `precisa de ${status.minimo} entradas completas para rodar; hoje há ${status.total}`,
+      })
+    );
+  }
+  const areaResultadoRodar = el("div");
+  botaoRodar.addEventListener("click", async () => {
+    botaoRodar.disabled = true;
+    areaResultadoRodar.textContent = "Rodando eval (chama o LLM)…";
+    try {
+      const resultado = await chamarApiEscrever("/eval/rodar", { por: obterOperador() });
+      areaResultadoRodar.textContent = "";
+      areaResultadoRodar.appendChild(gtResultadoEval(resultado));
+    } catch (erro) {
+      areaResultadoRodar.textContent = `Erro: ${erro.message}${erro.regra ? ` (${erro.regra})` : ""}`;
+    } finally {
+      botaoRodar.disabled = !status.completo;
+    }
+  });
+  areaRodar.appendChild(botaoRodar);
+  areaRodar.appendChild(areaResultadoRodar);
+  container.appendChild(areaRodar);
+
+  const resultadoAtual = await chamarApi("/eval/resultado");
+  if (resultadoAtual.disponivel) {
+    areaResultadoRodar.appendChild(gtResultadoEval(resultadoAtual));
+  }
+
+  const lista = el("div", { class: "gt-lista" }, [el("h3", { texto: "Entradas" })]);
+  if (status.entradas.length === 0) {
+    lista.appendChild(el("p", { class: "aviso", texto: "nenhuma entrada ainda" }));
+  }
+  status.entradas.forEach((entrada) => {
+    const linha = el("div", { class: "gt-item" }, [
+      el("span", { class: "gt-id", texto: entrada.id }),
+      el("span", {
+        texto: `${entrada.funil.toUpperCase()} — ${entrada.estagio_final_label} ` +
+          `(${entrada.estagio_final})${entrada.objecao ? ` — ${entrada.objecao}` : ""} — ` +
+          `${entrada.n_mensagens} msg`,
+      }),
+    ]);
+    const botaoEditar = el("button", { class: "secundario", texto: "Editar" });
+    botaoEditar.addEventListener("click", () => {
+      window.location.hash = `#/groundtruth/editar/${entrada.id}`;
+    });
+    const botaoExcluir = el("button", { class: "secundario", texto: "Excluir" });
+    botaoExcluir.addEventListener("click", async () => {
+      if (!window.confirm(`Excluir a entrada ${entrada.id}?`)) return;
+      try {
+        await chamarApiEscrever(`/eval/rotulos/${entrada.id}`, undefined, "DELETE");
+        await renderizarRotaSegura();
+      } catch (erro) {
+        window.alert(`Erro: ${erro.message}`);
+      }
+    });
+    linha.appendChild(botaoEditar);
+    linha.appendChild(botaoExcluir);
+    lista.appendChild(linha);
+  });
+  container.appendChild(lista);
+}
+
+function gtResultadoEval(resultado) {
+  const bloco = el("div", { class: "gt-resultado" });
+  bloco.appendChild(
+    el("p", {
+      texto: `${resultado.aprovado ? "APROVADO" : "REPROVADO"} — prompt v${resultado.prompt_versao} — ` +
+        `${new Date(resultado.rodado_em).toLocaleString()}`,
+    })
+  );
+  bloco.appendChild(
+    el("p", {
+      class: "aviso",
+      texto:
+        `fatos: ${resultado.concordancia_fatos === null ? "sem amostra" : formatarPercentual(resultado.concordancia_fatos)} · ` +
+        `objeção: ${resultado.acerto_objecao === null ? "sem amostra" : formatarPercentual(resultado.acerto_objecao)} · ` +
+        `falsos positivos de avanço: ${resultado.n_falsos_positivos}`,
+    })
+  );
+  return bloco;
+}
+
+/** Transcrição somente-leitura — igual em `#/groundtruth/novo/{id}` (mensagens
+ * reais da conversa) e `#/groundtruth/editar/{id}` (mensagens já gravadas). */
+function gtTranscricao(mensagens) {
+  const bloco = el("div", { class: "secao gt-transcricao" }, [
+    el("h4", { texto: "Transcrição (somente leitura)" }),
+  ]);
+  mensagens.forEach((m) => {
+    bloco.appendChild(el("div", { class: `msg ${m.direcao}`, texto: m.texto }));
+  });
+  return bloco;
+}
+
+function gtCampoFatos(fatosAtuais) {
+  const bloco = el("div", { class: "gt-fatos" }, [el("h4", { texto: "Fatos (§2)" })]);
+  GT_FATOS.forEach((chave) => {
+    const id = `gt-fato-${chave}`;
+    const check = el("input", { type: "checkbox", id });
+    if (fatosAtuais && fatosAtuais[chave]) check.setAttribute("checked", "checked");
+    const label = el("label", { for: id, texto: ` ${chave}` });
+    const linha = el("div", {}, [check, label]);
+    bloco.appendChild(linha);
+  });
+  return bloco;
+}
+
+function gtCampoMarcos(marcosAtuais) {
+  const bloco = el("div", { class: "gt-marcos" }, [el("h4", { texto: "Marcos (§3)" })]);
+  GT_MARCOS.forEach((marco) => {
+    const id = `gt-marco-${marco}`;
+    const check = el("input", { type: "checkbox", id });
+    if (marcosAtuais && marcosAtuais.includes(marco)) check.setAttribute("checked", "checked");
+    const label = el("label", { for: id, texto: ` ${marco}` });
+    bloco.appendChild(el("div", {}, [check, label]));
+  });
+  return bloco;
+}
+
+function gtLerFatosMarcados() {
+  const fatos = {};
+  GT_FATOS.forEach((chave) => {
+    fatos[chave] = document.getElementById(`gt-fato-${chave}`).checked;
+  });
+  return fatos;
+}
+
+function gtLerMarcosMarcados() {
+  return GT_MARCOS.filter((m) => document.getElementById(`gt-marco-${m}`).checked);
+}
+
+/**
+ * Formulário de rotulagem — três modos:
+ *   - `{conversaId}` — nova entrada a partir de uma conversa real do CRM
+ *     (`conversa_id`, requirement "Criar entrada a partir de conversa real
+ *     puxa as mensagens").
+ *   - `{}` (nem conversaId nem entradaId) — nova entrada com mensagens
+ *     digitadas (fallback do README, para histórico que já não está no CRM).
+ *   - `{entradaId}` — edição de uma entrada já existente.
+ */
+async function renderizarFormularioEval(container, { conversaId, entradaId } = {}) {
+  const modoEdicao = Boolean(entradaId);
+  container.appendChild(
+    el("h2", { texto: modoEdicao ? `Editar ground truth — ${entradaId}` : "Nova entrada de ground truth (§7)" })
+  );
+
+  let mensagens = [];
+  let funilAtual = "b2c";
+  let rotuloAtual = null;
+  let notaAtual = "";
+  let mensagensDigitadasTexto = "";
+
+  if (modoEdicao) {
+    const detalhe = await chamarApi(`/eval/rotulos/${entradaId}`);
+    mensagens = detalhe.mensagens;
+    funilAtual = detalhe.funil;
+    rotuloAtual = detalhe.rotulo;
+    notaAtual = detalhe.nota || "";
+  } else if (conversaId) {
+    const detalheConversa = await chamarApi(`/conversas/${conversaId}`);
+    funilAtual = detalheConversa.card ? detalheConversa.card.funil : "b2c";
+    const dadosMensagens = await chamarApi(`/conversas/${conversaId}/mensagens`);
+    mensagens = dadosMensagens.mensagens;
+  }
+
+  if (mensagens.length > 0) {
+    container.appendChild(gtTranscricao(mensagens));
+  }
+
+  const form = el("div", { class: "gt-form" });
+
+  const linhaId = el("div", {}, [
+    el("label", { texto: "Id: " }),
+    (() => {
+      const campo = el("input", { type: "text", id: "gt-id" });
+      campo.value = modoEdicao ? entradaId : (conversaId ? `conversa-${conversaId}` : "");
+      if (modoEdicao) campo.setAttribute("disabled", "disabled");
+      return campo;
+    })(),
+  ]);
+  form.appendChild(linhaId);
+
+  const linhaFunil = el("div", {}, [
+    el("label", { texto: "Funil: " }),
+    (() => {
+      const sel = el("select", { id: "gt-funil" });
+      ["b2c", "b2b"].forEach((f) => {
+        const opt = el("option", { value: f, texto: f.toUpperCase() });
+        if (f === funilAtual) opt.setAttribute("selected", "selected");
+        sel.appendChild(opt);
+      });
+      sel.addEventListener("change", () => {
+        const novoSel = gtSelectEstagio(sel.value, null);
+        const antigo = document.getElementById("gt-estagio-final");
+        antigo.replaceWith(novoSel);
+      });
+      return sel;
+    })(),
+  ]);
+  form.appendChild(linhaFunil);
+
+  if (!conversaId && !modoEdicao) {
+    const linhaMensagens = el("div", { class: "gt-mensagens-digitadas" }, [
+      el("label", { texto: "Mensagens (uma por linha: \"in|texto\" ou \"out|texto\")" }),
+    ]);
+    const textarea = el("textarea", { id: "gt-mensagens-digitadas", rows: "6" });
+    textarea.value = mensagensDigitadasTexto;
+    linhaMensagens.appendChild(textarea);
+    form.appendChild(linhaMensagens);
+  }
+
+  const linhaEstagio = el("div", {}, [
+    el("label", { texto: "Estágio final: " }),
+    gtSelectEstagio(funilAtual, rotuloAtual ? rotuloAtual.estagio_final : null),
+  ]);
+  form.appendChild(linhaEstagio);
+
+  const linhaObjecao = el("div", {}, [
+    el("label", { texto: "Objeção: " }),
+    (() => {
+      const sel = el("select", { id: "gt-objecao" });
+      sel.appendChild(el("option", { value: "", texto: "(nenhuma)" }));
+      GT_OBJECOES.forEach((o) => {
+        const opt = el("option", { value: o, texto: o });
+        if (rotuloAtual && rotuloAtual.objecao === o) opt.setAttribute("selected", "selected");
+        sel.appendChild(opt);
+      });
+      return sel;
+    })(),
+  ]);
+  form.appendChild(linhaObjecao);
+
+  form.appendChild(gtCampoFatos(rotuloAtual ? rotuloAtual.fatos : null));
+  form.appendChild(gtCampoMarcos(rotuloAtual ? rotuloAtual.marcos : null));
+
+  const linhaNota = el("div", {}, [
+    el("label", { texto: "Nota: " }),
+    (() => {
+      const campo = el("input", { type: "text", id: "gt-nota" });
+      campo.value = notaAtual;
+      return campo;
+    })(),
+  ]);
+  form.appendChild(linhaNota);
+
+  const areaErro = el("p", { class: "aviso" });
+  const botaoSalvar = el("button", { texto: modoEdicao ? "Salvar edição" : "Criar entrada" });
+  botaoSalvar.addEventListener("click", async () => {
+    areaErro.textContent = "";
+    const corpo = {
+      id: document.getElementById("gt-id").value.trim() || undefined,
+      funil: document.getElementById("gt-funil").value,
+      rotulo: {
+        estagio_final: document.getElementById("gt-estagio-final").value,
+        objecao: document.getElementById("gt-objecao").value || null,
+        fatos: gtLerFatosMarcados(),
+        marcos: gtLerMarcosMarcados(),
+      },
+      nota: document.getElementById("gt-nota").value.trim() || null,
+    };
+    if (conversaId) {
+      corpo.conversa_id = Number(conversaId);
+    } else if (!modoEdicao) {
+      const linhas = document.getElementById("gt-mensagens-digitadas").value
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      corpo.mensagens = linhas.map((linha) => {
+        const [direcao, ...resto] = linha.split("|");
+        return {
+          direcao: direcao.trim(),
+          texto: resto.join("|").trim(),
+          enviada_em: new Date().toISOString(),
+        };
+      });
+    }
+    botaoSalvar.disabled = true;
+    try {
+      if (modoEdicao) {
+        await chamarApiEscrever(`/eval/rotulos/${entradaId}`, corpo, "PUT");
+      } else {
+        await chamarApiEscrever("/eval/rotulos", corpo, "POST");
+      }
+      window.location.hash = "#/groundtruth";
+    } catch (erro) {
+      areaErro.textContent = `Erro: ${erro.message}${erro.regra ? ` (${erro.regra})` : ""}`;
+    } finally {
+      botaoSalvar.disabled = false;
+    }
+  });
+  form.appendChild(botaoSalvar);
+  form.appendChild(areaErro);
+
+  container.appendChild(form);
+}
+
 // -- Roteador ----------------------------------------------------------------
 
 // Cada render limpa o container e só faz `appendChild` depois de um `await`
@@ -977,6 +1382,13 @@ async function renderizarRota() {
     } else if (partes[0] === "funciona") {
       marcarAbaAtiva("/funciona");
       await renderizarFunciona(conteudo);
+    } else if (partes[0] === "groundtruth" && partes.length === 1) {
+      marcarAbaAtiva("/groundtruth");
+      await renderizarGroundTruth(conteudo);
+    } else if (partes[0] === "groundtruth" && partes[1] === "novo") {
+      await renderizarFormularioEval(conteudo, { conversaId: partes[2] });
+    } else if (partes[0] === "groundtruth" && partes[1] === "editar" && partes[2]) {
+      await renderizarFormularioEval(conteudo, { entradaId: partes[2] });
     } else {
       conteudo.appendChild(el("p", { class: "aviso", texto: "rota desconhecida" }));
     }

@@ -377,13 +377,33 @@ class TesteOQueFuncionaParaJson(unittest.TestCase):
         payload = self._payload(ab_rascunhos=ab)
         self.assertFalse(payload["rascunhos"]["bloqueado"])
 
-    def test_nenhum_campo_de_acuracia_de_extracao(self):
+    def test_sem_resultado_eval_bloco_de_acuracia_fica_indisponivel(self):
         """Restrição herdada de `openspec/project.md`: `/funciona` não pode
-        afirmar acurácia de extração antes de `ground-truth-marcos`."""
+        afirmar acurácia de extração sem cache de `POST /eval/rodar` (change
+        `ground-truth-no-painel`). O bloco `acuracia_extracao` sempre existe,
+        mas sem `resultado_eval` ele só carrega `disponivel: False` — nenhum
+        número de acurácia é afirmado."""
         payload = self._payload()
-        texto = str(payload).lower()
-        self.assertNotIn("acuracia", texto)
-        self.assertNotIn("acurácia", texto)
+        self.assertEqual(payload["acuracia_extracao"], {"disponivel": False})
+
+    def test_com_resultado_eval_bloco_de_acuracia_e_populado(self):
+        cache = {
+            "prompt_versao": "v1",
+            "rodado_em": "2026-08-27T00:00:00+00:00",
+            "n_conversas": 30,
+            "concordancia_fatos": 0.95,
+            "acerto_objecao": 0.85,
+            "n_falsos_positivos": 0,
+            "falsos_positivos": [],
+            "aprovado": True,
+        }
+        payload = self._payload(resultado_eval=cache)
+        bloco = payload["acuracia_extracao"]
+        self.assertTrue(bloco["disponivel"])
+        self.assertEqual(bloco["concordancia_fatos"], 0.95)
+        self.assertIn("meta_fatos", bloco)
+        self.assertIn("meta_objecao", bloco)
+        self.assertIn("meta_falsos_positivos", bloco)
 
 
 if __name__ == "__main__":
