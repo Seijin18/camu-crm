@@ -31,7 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from .db import Database
+from .db import Database, _condicao_teste
 from .rules.estagio import ORIGEM_LIVE
 from .taxonomia import (
     ESTAGIOS_POR_FUNIL,
@@ -91,23 +91,40 @@ class Conversao:
 
 
 def conversao(
-    db: Database, de: str, para: str, *, desde: datetime | None = None
+    db: Database,
+    de: str,
+    para: str,
+    *,
+    desde: datetime | None = None,
+    incluir_teste: bool = False,
+    apenas_teste: bool = False,
 ) -> Conversao:
     """Quantas conversas que chegaram a `de` também chegaram a `para`.
 
     Conta por conversa e por estágio *alcançado*, não pelo estágio atual: uma
     conversa hoje em S5 chegou em S2 no caminho, e ignorá-la subestimaria a
     conversão de quem avançou rápido.
+
+    Change `contatos-de-teste-isolados`: exclui contato de teste por padrão
+    — junta até `contatos` (via `conversas`) para aplicar `_condicao_teste`,
+    já que `eventos_estagio` só carrega `conversa_id`.
     """
-    filtro = "AND em >= %s" if desde else ""
+    condicao = _condicao_teste("ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste)
+    filtro = "AND ee.em >= %s" if desde else ""
+    filtro_b = "AND b.em >= %s" if desde else ""
     args_de = (de, desde) if desde else (de,)
     args_para = (de, para, desde) if desde else (de, para)
 
     with db._conn() as conn:  # noqa: SLF001 - módulo de leitura do próprio pacote
         with conn.cursor() as cur:
             cur.execute(
-                f"SELECT COUNT(DISTINCT conversa_id) FROM eventos_estagio "
-                f"WHERE para = %s {filtro}",
+                f"""
+                SELECT COUNT(DISTINCT ee.conversa_id)
+                  FROM eventos_estagio ee
+                  JOIN conversas c ON c.id = ee.conversa_id
+                  JOIN contatos ct ON ct.id = c.contato_id
+                 WHERE ee.para = %s {filtro} {condicao}
+                """,
                 args_de,
             )
             alcancaram_de = cur.fetchone()[0] or 0
@@ -116,7 +133,9 @@ def conversao(
                 SELECT COUNT(DISTINCT a.conversa_id)
                   FROM eventos_estagio a
                   JOIN eventos_estagio b ON b.conversa_id = a.conversa_id
-                 WHERE a.para = %s AND b.para = %s {filtro.replace('em', 'b.em')}
+                  JOIN conversas c ON c.id = a.conversa_id
+                  JOIN contatos ct ON ct.id = c.contato_id
+                 WHERE a.para = %s AND b.para = %s {filtro_b} {condicao}
                 """,
                 args_para,
             )
@@ -124,13 +143,27 @@ def conversao(
     return Conversao(de, para, alcancaram_de, alcancaram_para)
 
 
-def metricas_chave(db: Database, *, desde: datetime | None = None) -> list[Conversao]:
+def metricas_chave(
+    db: Database,
+    *,
+    desde: datetime | None = None,
+    incluir_teste: bool = False,
+    apenas_teste: bool = False,
+) -> list[Conversao]:
     """Os três números da §14, na ordem."""
-    return [conversao(db, de, para, desde=desde) for de, para in METRICAS_CHAVE]
+    return [
+        conversao(db, de, para, desde=desde, incluir_teste=incluir_teste, apenas_teste=apenas_teste)
+        for de, para in METRICAS_CHAVE
+    ]
 
 
 def conversao_adjacente(
-    db: Database, funil: str, *, desde: datetime | None = None
+    db: Database,
+    funil: str,
+    *,
+    desde: datetime | None = None,
+    incluir_teste: bool = False,
+    apenas_teste: bool = False,
 ) -> list[Conversao]:
     """Conversão de TODO par adjacente do funil, não só os três da §14
     (change `analise-desempenho`) — S0→S1, S1→S2, ..., S5→S6 no B2C (e o
@@ -140,7 +173,10 @@ def conversao_adjacente(
         raise ValueError(f"funil inválido: {funil!r} (use {FUNIS})")
     estagios = ESTAGIOS_POR_FUNIL[funil]
     return [
-        conversao(db, de, para, desde=desde) for de, para in zip(estagios, estagios[1:])
+        conversao(
+            db, de, para, desde=desde, incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
+        for de, para in zip(estagios, estagios[1:])
     ]
 
 
@@ -159,22 +195,31 @@ class TempoNoEstagio:
         )
 
 
-def tempo_por_estagio(db: Database) -> list[TempoNoEstagio]:
+def tempo_por_estagio(
+    db: Database, *, incluir_teste: bool = False, apenas_teste: bool = False
+) -> list[TempoNoEstagio]:
     """Quanto tempo as conversas passam em cada estágio — só eventos ao vivo.
 
     §8: eventos de backfill ficam de fora. O filtro está no SQL de propósito,
     e não numa checagem opcional em Python — a exclusão precisa ser difícil de
     esquecer, porque esquecê-la produz um número plausível e errado.
+
+    Change `contatos-de-teste-isolados`: mesma disciplina para contato de
+    teste — exclui por padrão, junto ao filtro de origem, dentro do próprio
+    CTE (`_condicao_teste`).
     """
+    condicao = _condicao_teste("ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste)
     with db._conn() as conn:  # noqa: SLF001
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 WITH transicoes AS (
-                    SELECT conversa_id, para AS estagio, em,
-                           LEAD(em) OVER (PARTITION BY conversa_id ORDER BY em) AS proximo
-                      FROM eventos_estagio
-                     WHERE origem = '{ORIGEM_LIVE}'
+                    SELECT ee.conversa_id, ee.para AS estagio, ee.em,
+                           LEAD(ee.em) OVER (PARTITION BY ee.conversa_id ORDER BY ee.em) AS proximo
+                      FROM eventos_estagio ee
+                      JOIN conversas c ON c.id = ee.conversa_id
+                      JOIN contatos ct ON ct.id = c.contato_id
+                     WHERE ee.origem = '{ORIGEM_LIVE}' {condicao}
                 )
                 SELECT estagio,
                        COUNT(*),
@@ -218,15 +263,21 @@ class OndeConversasMorrem:
         return f"onde as conversas morrem (n={self.n}): {partes}"
 
 
-def onde_morrem(db: Database) -> OndeConversasMorrem:
+def onde_morrem(
+    db: Database, *, incluir_teste: bool = False, apenas_teste: bool = False
+) -> OndeConversasMorrem:
     """Maior rank de estágio alcançado, entre conversas encerradas.
 
     A ordenação por rank é feita aqui, em Python, com `taxonomia.
     rank_estagio` — mesma regra de `db.estagio_maximo_alcancado`, não
     duplicada em SQL (`db.estagios_de_conversas_encerradas` só devolve os
     eventos crus).
+
+    Change `contatos-de-teste-isolados`: exclui contato de teste por padrão.
     """
-    por_conversa = db.estagios_de_conversas_encerradas()
+    por_conversa = db.estagios_de_conversas_encerradas(
+        incluir_teste=incluir_teste, apenas_teste=apenas_teste
+    )
     distribuicao: dict[str, int] = {}
     for estagios in por_conversa.values():
         nao_terminais = [e for e in estagios if not is_terminal(e)]
@@ -267,8 +318,18 @@ class SaudeTaxonomia:
         return f"`outro` em {proporcao:.0%}: taxonomia saudável"
 
 
-def saude_taxonomia(db: Database, *, desde: datetime | None = None) -> SaudeTaxonomia:
-    distribuicao = db.distribuicao_objecoes(desde)
+def saude_taxonomia(
+    db: Database,
+    *,
+    desde: datetime | None = None,
+    incluir_teste: bool = False,
+    apenas_teste: bool = False,
+) -> SaudeTaxonomia:
+    """Change `contatos-de-teste-isolados`: exclui contato de teste por
+    padrão (propagado a `db.distribuicao_objecoes`)."""
+    distribuicao = db.distribuicao_objecoes(
+        desde, incluir_teste=incluir_teste, apenas_teste=apenas_teste
+    )
     total = sum(distribuicao.values())
     return SaudeTaxonomia(total, distribuicao.get(OBJECAO_OUTRO, 0), distribuicao)
 
@@ -289,9 +350,17 @@ class ObjecaoPorEstagio:
 
 
 def objecao_por_estagio(
-    db: Database, *, desde: datetime | None = None
+    db: Database,
+    *,
+    desde: datetime | None = None,
+    incluir_teste: bool = False,
+    apenas_teste: bool = False,
 ) -> ObjecaoPorEstagio:
-    contagem = db.distribuicao_objecoes_por_estagio(desde)
+    """Change `contatos-de-teste-isolados`: exclui contato de teste por
+    padrão (propagado a `db.distribuicao_objecoes_por_estagio`)."""
+    contagem = db.distribuicao_objecoes_por_estagio(
+        desde, incluir_teste=incluir_teste, apenas_teste=apenas_teste
+    )
     return ObjecaoPorEstagio(contagem, sum(contagem.values()))
 
 
@@ -311,11 +380,19 @@ class PadraoCorrecao:
 
 
 def padrao_correcoes(
-    db: Database, *, desde: datetime | None = None
+    db: Database,
+    *,
+    desde: datetime | None = None,
+    incluir_teste: bool = False,
+    apenas_teste: bool = False,
 ) -> list[PadraoCorrecao]:
+    """Change `contatos-de-teste-isolados`: exclui contato de teste por
+    padrão (propagado a `db.padrao_correcoes`)."""
     return [
         PadraoCorrecao(campo, antes, depois, n)
-        for campo, antes, depois, n in db.padrao_correcoes(desde)
+        for campo, antes, depois, n in db.padrao_correcoes(
+            desde, incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
     ]
 
 
@@ -337,8 +414,14 @@ class RetornoFollowup:
         return self.com_retorno / self.n if self.n else None
 
 
-def retorno_por_followup(db: Database) -> list[RetornoFollowup]:
-    dados = db.retorno_por_numero_followup()
+def retorno_por_followup(
+    db: Database, *, incluir_teste: bool = False, apenas_teste: bool = False
+) -> list[RetornoFollowup]:
+    """Change `contatos-de-teste-isolados`: exclui contato de teste por
+    padrão (propagado a `db.retorno_por_numero_followup`)."""
+    dados = db.retorno_por_numero_followup(
+        incluir_teste=incluir_teste, apenas_teste=apenas_teste
+    )
     return [
         RetornoFollowup(numero, total, com_retorno)
         for numero, (total, com_retorno) in sorted(dados.items())
@@ -390,11 +473,17 @@ class AbRascunhos:
         return self.avancou_72h / self.n_avaliavel_avanco if self.n_avaliavel_avanco else None
 
 
-def ab_rascunhos(db: Database) -> AbRascunhos:
+def ab_rascunhos(
+    db: Database, *, incluir_teste: bool = False, apenas_teste: bool = False
+) -> AbRascunhos:
     """Compõe `db.rascunhos_vinculados_para_analise` — a comparação de rank
     (avançou ou não) é regra de domínio e mora aqui, não em SQL.
+
+    Change `contatos-de-teste-isolados`: exclui contato de teste por padrão.
     """
-    linhas = db.rascunhos_vinculados_para_analise()
+    linhas = db.rascunhos_vinculados_para_analise(
+        incluir_teste=incluir_teste, apenas_teste=apenas_teste
+    )
     escolha_1 = escolha_2 = escreveu_do_zero = 0
     editado = sem_edicao = 0
     avancou_72h = 0

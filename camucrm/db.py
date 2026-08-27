@@ -80,6 +80,39 @@ def _normalizar_texto(texto: str | None) -> str:
     return " ".join(texto.split()).casefold()
 
 
+def _condicao_teste(coluna: str, *, incluir_teste: bool, apenas_teste: bool) -> str:
+    """Fragmento SQL (começando com `AND`) que decide quais contatos entram
+    numa leitura agregada (change `contatos-de-teste-isolados`).
+
+    `coluna` é a referência qualificada de `contatos.e_teste` na consulta
+    (ex. `"ct.e_teste"`). Três modos, nunca dois juntos:
+
+    - Padrão (os dois `False`): exclui teste — kanban/fila/métricas reais.
+    - `apenas_teste=True`: mostra só teste — painel com "Modo teste" ligado.
+    - `incluir_teste=True` (sem `apenas_teste`): mostra os dois juntos, sem
+      filtro nenhum — só a CLI expõe isso (`camucrm fila --incluir-teste`),
+      para depuração via terminal; o painel nunca usa este modo, porque o
+      requirement "Modo teste nunca mistura as duas visões na mesma tela"
+      proíbe uma tela com os dois ao mesmo tempo.
+
+    Os literais `TRUE`/`FALSE` vão embutidos no SQL, não como parâmetro
+    (`%s`) — não há dado de usuário aqui, só um enum interno de dois
+    valores, e isso evita threading um parâmetro extra por toda consulta
+    que usa este fragmento.
+    """
+    if incluir_teste and apenas_teste:
+        raise ValueError(
+            "incluir_teste e apenas_teste não podem ser usados ao mesmo tempo "
+            "(nunca misturar as duas visões — requirement do change "
+            "`contatos-de-teste-isolados`)"
+        )
+    if apenas_teste:
+        return f"AND {coluna} = TRUE"
+    if incluir_teste:
+        return ""
+    return f"AND {coluna} = FALSE"
+
+
 # --------------------------------------------------------------------------
 # Dataclasses de linha
 # --------------------------------------------------------------------------
@@ -94,6 +127,11 @@ class Contato:
     tipo: str
     origem: str | None
     criado_em: datetime
+    # ADIÇÃO (change `contatos-de-teste-isolados`): marca por CONTATO, não
+    # por conversa — toda conversa passada e futura do contato fica de teste
+    # junto. `default=False` para não quebrar construções posicionais
+    # antigas deste dataclass que ainda não conhecem a coluna.
+    e_teste: bool = False
 
     @property
     def label(self) -> str:
@@ -223,6 +261,9 @@ class ContatoResumido:
     tipo: str
     tem_telefone: bool
     criado_em: datetime
+    # ADIÇÃO (change `contatos-de-teste-isolados`): o botão "marcar/desmarcar
+    # contato de teste" do detalhe da conversa precisa saber o estado atual.
+    e_teste: bool = False
 
 
 @dataclass
@@ -338,7 +379,13 @@ CREATE TABLE IF NOT EXISTS contatos (
     telefone        VARCHAR(32),
     tipo            VARCHAR(8) NOT NULL CHECK (tipo IN ('b2b', 'b2c')),
     origem          VARCHAR(64),
-    criado_em       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+    criado_em       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    -- ADIÇÃO (change `contatos-de-teste-isolados`): marca por CONTATO — toda
+    -- conversa passada e futura do contato fica de teste junto, sem marcar
+    -- conversa por conversa. Só manual (§1, mesmo princípio estendido):
+    -- nenhuma heurística decide isso sozinha, e por isso não há default
+    -- calculado, só `FALSE` fixo.
+    e_teste         BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS conversas (
@@ -672,6 +719,21 @@ class Database:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
+                # DIVERGÊNCIA registrada (CLAUDE.md): `CREATE TABLE IF NOT
+                # EXISTS` não adiciona coluna a uma tabela `contatos` já
+                # existente — todo o resto deste arquivo assume banco novo
+                # (nenhum `ALTER TABLE` no repo até este change). Um banco de
+                # desenvolvimento já em uso (com contatos/conversas reais de
+                # teste manual, como os desta sessão) perderia dado se
+                # `make init` exigisse recriar o volume a cada change de
+                # schema. `ADD COLUMN IF NOT EXISTS` é idempotente e não
+                # apaga nada — única forma de `make init` cumprir o que a
+                # instrução de execução pede ("aplica a coluna nova") sem
+                # destruir uma base já populada.
+                cur.execute(
+                    "ALTER TABLE contatos ADD COLUMN IF NOT EXISTS "
+                    "e_teste BOOLEAN NOT NULL DEFAULT FALSE"
+                )
 
     def _conn_ou(self, conn):
         """Devolve `conn` (via `nullcontext`, sem abrir/fechar nada) quando já
@@ -733,7 +795,8 @@ class Database:
                         nome = COALESCE(EXCLUDED.nome, contatos.nome),
                         telefone = COALESCE(EXCLUDED.telefone, contatos.telefone),
                         origem = COALESCE(contatos.origem, EXCLUDED.origem)
-                    RETURNING id, nome, telefone_hash, telefone, tipo, origem, criado_em
+                    RETURNING id, nome, telefone_hash, telefone, tipo, origem, criado_em,
+                              e_teste
                     """,
                     (nome, telefone_hash, telefone, tipo, origem),
                 )
@@ -747,6 +810,57 @@ class Database:
                 cur.execute(
                     "UPDATE contatos SET tipo = %s WHERE id = %s", (tipo, contato_id)
                 )
+
+    def marcar_contato_teste(
+        self, contato_id: int, e_teste: bool, *, por: str | None = None
+    ) -> None:
+        """Marca/desmarca um contato como teste (change
+        `contatos-de-teste-isolados`).
+
+        A marca é por CONTATO — toda conversa passada e futura do contato
+        fica de teste junto, sem precisar marcar conversa por conversa
+        (requirement "Marca de teste é por contato"). Só ação manual chama
+        isto: nenhuma heurística de `camucrm/` decide sozinha que um contato
+        é de teste (§1, mesmo princípio estendido).
+
+        Grava em `correcoes` (§7), nunca em `marcos_manuais` — "teste" não é
+        o conceito de S6/P5/P6/perdido que `marcos_manuais` existe para
+        guardar (requirement "Marcação de teste é sempre manual e
+        registrada"). `correcoes.conversa_id` é NOT NULL (a tabela é sobre
+        correção de UMA conversa); como a marca aqui é por contato, usamos a
+        conversa mais recente do contato — a aberta, se houver, senão a mais
+        recente encerrada — só para satisfazer essa FK. Um contato sem
+        nenhuma conversa ainda (nunca trocou mensagem) não tem onde gravar a
+        correção; a marca em `contatos.e_teste` acontece de qualquer forma
+        (não há nada para filtrar ainda), só a correção fica sem registro
+        nesse caso raro — divergência aceita, não silenciosa.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT e_teste FROM contatos WHERE id = %s FOR UPDATE",
+                    (contato_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise ValueError(f"contato {contato_id} não existe")
+                antes = row[0]
+                cur.execute(
+                    "UPDATE contatos SET e_teste = %s WHERE id = %s",
+                    (e_teste, contato_id),
+                )
+                cur.execute(
+                    "SELECT id FROM conversas WHERE contato_id = %s "
+                    "ORDER BY (resultado IS NULL) DESC, id DESC LIMIT 1",
+                    (contato_id,),
+                )
+                conversa_row = cur.fetchone()
+                if conversa_row is not None:
+                    cur.execute(
+                        "INSERT INTO correcoes (conversa_id, campo, antes, depois, por) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (conversa_row[0], "e_teste", _texto(antes), _texto(e_teste), por),
+                    )
 
     def set_funil_conversa(self, conversa_id: int, funil: str) -> None:
         """Move a conversa aberta para o outro funil.
@@ -840,12 +954,25 @@ class Database:
                 row = cur.fetchone()
                 return Conversa(*row) if row else None
 
-    def listar_conversas_abertas(self, limite: int = 500) -> list[Conversa]:
-        """Conversas sem resultado — as candidatas à fila do dia."""
+    def listar_conversas_abertas(
+        self,
+        limite: int = 500,
+        *,
+        incluir_teste: bool = False,
+        apenas_teste: bool = False,
+    ) -> list[Conversa]:
+        """Conversas sem resultado — as candidatas à fila do dia.
+
+        Change `contatos-de-teste-isolados`: exclui contato de teste por
+        padrão (kanban/fila reais). Ver `_condicao_teste` para os três modos.
+        """
+        condicao = _condicao_teste(
+            "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"{self._CONVERSA_SELECT} WHERE c.resultado IS NULL "
+                    f"{self._CONVERSA_SELECT} WHERE c.resultado IS NULL {condicao} "
                     "ORDER BY c.atualizado_em DESC LIMIT %s",
                     (limite,),
                 )
@@ -1120,7 +1247,9 @@ class Database:
                 estagios = [p for (p,) in cur.fetchall() if not is_terminal(p)]
         return max(estagios, key=rank_estagio) if estagios else None
 
-    def estagios_de_conversas_encerradas(self) -> dict[int, list[str]]:
+    def estagios_de_conversas_encerradas(
+        self, *, incluir_teste: bool = False, apenas_teste: bool = False
+    ) -> dict[int, list[str]]:
         """`conversa_id -> estágios (`para`) alcançados`, só para conversas
         com `resultado IS NOT NULL` (change `analise-desempenho`).
 
@@ -1129,15 +1258,22 @@ class Database:
         estágio máximo com `taxonomia.rank_estagio`, mesma regra de
         `estagio_maximo_alcancado` — a ordenação de estágio não é duplicada
         aqui em SQL.
+
+        Change `contatos-de-teste-isolados`: exclui contato de teste por
+        padrão — ver `_condicao_teste`.
         """
+        condicao = _condicao_teste(
+            "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT ee.conversa_id, ee.para
                       FROM eventos_estagio ee
                       JOIN conversas c ON c.id = ee.conversa_id
-                     WHERE c.resultado IS NOT NULL
+                      JOIN contatos ct ON ct.id = c.contato_id
+                     WHERE c.resultado IS NOT NULL {condicao}
                     """
                 )
                 resultado: dict[int, list[str]] = {}
@@ -1226,41 +1362,68 @@ class Database:
                     (conversa_id, categoria, estagio, trecho, em),
                 )
 
-    def distribuicao_objecoes(self, desde: datetime | None = None) -> dict[str, int]:
-        """Contagem por categoria — insumo da revisão mensal da §4."""
+    def distribuicao_objecoes(
+        self,
+        desde: datetime | None = None,
+        *,
+        incluir_teste: bool = False,
+        apenas_teste: bool = False,
+    ) -> dict[str, int]:
+        """Contagem por categoria — insumo da revisão mensal da §4.
+
+        Change `contatos-de-teste-isolados`: exclui contato de teste por
+        padrão — junta até `contatos` para aplicar `_condicao_teste`, já que
+        `objecoes` só carrega `conversa_id`.
+        """
+        condicao = _condicao_teste(
+            "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
+        base = (
+            "SELECT o.categoria, COUNT(*) FROM objecoes o "
+            "JOIN conversas c ON c.id = o.conversa_id "
+            "JOIN contatos ct ON ct.id = c.contato_id "
+            f"WHERE 1=1 {condicao} "
+        )
         with self._conn() as conn:
             with conn.cursor() as cur:
                 if desde:
-                    cur.execute(
-                        "SELECT categoria, COUNT(*) FROM objecoes WHERE em >= %s "
-                        "GROUP BY categoria",
-                        (desde,),
-                    )
+                    cur.execute(base + "AND o.em >= %s GROUP BY o.categoria", (desde,))
                 else:
-                    cur.execute("SELECT categoria, COUNT(*) FROM objecoes GROUP BY categoria")
+                    cur.execute(base + "GROUP BY o.categoria")
                 return dict(cur.fetchall())
 
     def distribuicao_objecoes_por_estagio(
-        self, desde: datetime | None = None
+        self,
+        desde: datetime | None = None,
+        *,
+        incluir_teste: bool = False,
+        apenas_teste: bool = False,
     ) -> dict[tuple[str | None, str], int]:
         """Contagem por (estagio, categoria) — `objecoes.estagio` já é
         coletado desde o início mas `distribuicao_objecoes` o descarta
         (change `analise-desempenho`: "frete concentrado em S4" é mudança de
         playbook, não de código).
+
+        Change `contatos-de-teste-isolados`: exclui contato de teste por
+        padrão — mesmo join de `distribuicao_objecoes`.
         """
+        condicao = _condicao_teste(
+            "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
+        base = (
+            "SELECT o.estagio, o.categoria, COUNT(*) FROM objecoes o "
+            "JOIN conversas c ON c.id = o.conversa_id "
+            "JOIN contatos ct ON ct.id = c.contato_id "
+            f"WHERE 1=1 {condicao} "
+        )
         with self._conn() as conn:
             with conn.cursor() as cur:
                 if desde:
                     cur.execute(
-                        "SELECT estagio, categoria, COUNT(*) FROM objecoes "
-                        "WHERE em >= %s GROUP BY estagio, categoria",
-                        (desde,),
+                        base + "AND o.em >= %s GROUP BY o.estagio, o.categoria", (desde,)
                     )
                 else:
-                    cur.execute(
-                        "SELECT estagio, categoria, COUNT(*) FROM objecoes "
-                        "GROUP BY estagio, categoria"
-                    )
+                    cur.execute(base + "GROUP BY o.estagio, o.categoria")
                 return {(estagio, categoria): n for estagio, categoria, n in cur.fetchall()}
 
     # -- follow-ups (§6) --------------------------------------------------
@@ -1311,18 +1474,26 @@ class Database:
                 )
                 return cur.fetchone()[0]
 
-    def retorno_por_numero_followup(self) -> dict[int, tuple[int, int]]:
+    def retorno_por_numero_followup(
+        self, *, incluir_teste: bool = False, apenas_teste: bool = False
+    ) -> dict[int, tuple[int, int]]:
         """`numero (1 ou 2) -> (total_enviados, com_resposta_depois)`.
 
         "Com resposta" é qualquer mensagem `in` na mesma conversa depois do
         `enviado_em` do follow-up — responde "o 2º toque funciona alguma
         vez" (plano: "decide se o teto devia ser 1"), change
         `analise-desempenho`.
+
+        Change `contatos-de-teste-isolados`: exclui contato de teste por
+        padrão — ver `_condicao_teste`.
         """
+        condicao = _condicao_teste(
+            "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT f.numero,
                            COUNT(*),
                            COUNT(*) FILTER (
@@ -1334,6 +1505,9 @@ class Database:
                                )
                            )
                       FROM followups f
+                      JOIN conversas c ON c.id = f.conversa_id
+                      JOIN contatos ct ON ct.id = c.contato_id
+                     WHERE 1=1 {condicao}
                      GROUP BY f.numero
                      ORDER BY f.numero
                     """
@@ -1411,26 +1585,46 @@ class Database:
                 return list(cur.fetchall())
 
     def padrao_correcoes(
-        self, desde: datetime | None = None
+        self,
+        desde: datetime | None = None,
+        *,
+        incluir_teste: bool = False,
+        apenas_teste: bool = False,
     ) -> list[tuple[str, str | None, str | None, int]]:
         """Contagem por campo + par (antes, depois) (change
         `analise-desempenho`). Plano: "funil corrigido 9× de b2c para b2b"
         diz que a classificação B2B falha na ingestão — o padrão, não a
         correção isolada, é o que aponta o defeito.
+
+        Change `contatos-de-teste-isolados`: exclui contato de teste por
+        padrão. Efeito colateral aceito: a própria correção que
+        `marcar_contato_teste` grava (`campo='e_teste'`) some do padrão
+        assim que o contato é marcado, porque a conversa que carrega essa
+        correção já pertence a um contato agora `e_teste=TRUE` — o que é
+        correto, não um bug: a marcação de teste não devia poluir o padrão
+        de correções de negócio.
         """
+        condicao = _condicao_teste(
+            "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
+        base = (
+            "SELECT co.campo, co.antes, co.depois, COUNT(*) FROM correcoes co "
+            "JOIN conversas c ON c.id = co.conversa_id "
+            "JOIN contatos ct ON ct.id = c.contato_id "
+            f"WHERE 1=1 {condicao} "
+        )
         with self._conn() as conn:
             with conn.cursor() as cur:
                 if desde:
                     cur.execute(
-                        "SELECT campo, antes, depois, COUNT(*) FROM correcoes "
-                        "WHERE em >= %s GROUP BY campo, antes, depois "
+                        base + "AND co.em >= %s GROUP BY co.campo, co.antes, co.depois "
                         "ORDER BY COUNT(*) DESC",
                         (desde,),
                     )
                 else:
                     cur.execute(
-                        "SELECT campo, antes, depois, COUNT(*) FROM correcoes "
-                        "GROUP BY campo, antes, depois ORDER BY COUNT(*) DESC"
+                        base + "GROUP BY co.campo, co.antes, co.depois "
+                        "ORDER BY COUNT(*) DESC"
                     )
                 return list(cur.fetchall())
 
@@ -1581,7 +1775,8 @@ class Database:
                 cur.execute(
                     """
                     SELECT ct.id, ct.nome, ct.tipo,
-                           (ct.telefone IS NOT NULL) AS tem_telefone, ct.criado_em
+                           (ct.telefone IS NOT NULL) AS tem_telefone, ct.criado_em,
+                           ct.e_teste
                       FROM conversas c
                       JOIN contatos ct ON ct.id = c.contato_id
                      WHERE c.id = %s
@@ -1772,7 +1967,9 @@ class Database:
                 )
                 return [RascunhoRegistro(*row) for row in cur.fetchall()]
 
-    def rascunhos_vinculados_para_analise(self) -> list[RascunhoVinculadoRegistro]:
+    def rascunhos_vinculados_para_analise(
+        self, *, incluir_teste: bool = False, apenas_teste: bool = False
+    ) -> list[RascunhoVinculadoRegistro]:
         """Insumo do A/B natural de rascunho (§10, change `analise-desempenho`
         — bloqueado por `rascunho-registrado`).
 
@@ -1781,21 +1978,29 @@ class Database:
         estágios alcançados nela representam AVANÇO (comparar rank) é regra
         de domínio e fica em `metrics.py` via `taxonomia.rank_estagio` — não
         duplicamos a ordenação de estágio em SQL.
+
+        Change `contatos-de-teste-isolados`: exclui contato de teste por
+        padrão — ver `_condicao_teste`.
         """
+        condicao = _condicao_teste(
+            "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT r.id, r.escolhida, r.texto_final IS NOT NULL,
                            r.estagio_no_envio,
                            ee.para
                       FROM rascunhos r
                       JOIN mensagens m ON m.id = r.mensagem_id
+                      JOIN conversas c ON c.id = r.conversa_id
+                      JOIN contatos ct ON ct.id = c.contato_id
                       LEFT JOIN eventos_estagio ee
                         ON ee.conversa_id = r.conversa_id
                        AND ee.em > m.enviada_em
                        AND ee.em <= m.enviada_em + interval '72 hours'
-                     WHERE r.mensagem_id IS NOT NULL
+                     WHERE r.mensagem_id IS NOT NULL {condicao}
                      ORDER BY r.id
                     """
                 )

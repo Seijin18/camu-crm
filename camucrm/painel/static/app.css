@@ -71,6 +71,24 @@ nav.abas a.ativa {
   width: 10rem;
 }
 
+/* Change `contatos-de-teste-isolados`: toggle "Modo teste". */
+.modo-teste {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--texto-fraco);
+  font-size: 0.85rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+/* Aviso visual persistente enquanto o painel mostra só teste — o requirement
+   "nunca misturar as duas visões" também vale para o operador não esquecer
+   em qual modo está. */
+body.modo-teste-ativo header {
+  border-bottom: 2px solid orange;
+}
+
 button {
   background: var(--acento);
   color: white;

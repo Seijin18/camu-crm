@@ -58,14 +58,37 @@ class _FakeCursor:
     def __exit__(self, *exc) -> bool:
         return False
 
+    def _modo_teste(self, q: str) -> str:
+        """Lê o fragmento de `_condicao_teste` embutido no texto do SQL
+        (change `contatos-de-teste-isolados`) — os literais `TRUE`/`FALSE`
+        vão direto no texto (ver docstring de `db._condicao_teste`), sem
+        parâmetro `%s`, então o fake também decide olhando o texto, não os
+        `params`.
+        """
+        if "ct.e_teste = TRUE" in q:
+            return "apenas"
+        if "ct.e_teste = FALSE" in q:
+            return "excluir"
+        return "incluir"
+
+    def _passa_teste(self, modo: str, conversa_id: int) -> bool:
+        e_teste = self._db._e_teste_da_conversa(conversa_id)
+        if modo == "apenas":
+            return e_teste
+        if modo == "excluir":
+            return not e_teste
+        return True
+
     def execute(self, query: str, params: tuple = ()) -> None:
         q = " ".join(query.split())
-        if "COUNT(DISTINCT conversa_id) FROM eventos_estagio" in q:
+        modo = self._modo_teste(q)
+        if "COUNT(DISTINCT ee.conversa_id)" in q:
             de = params[0]
             desde = params[1] if len(params) > 1 else None
             ids = {
                 e["conversa_id"] for e in self._db.eventos
                 if e["para"] == de and (desde is None or e["em"] >= desde)
+                and self._passa_teste(modo, e["conversa_id"])
             }
             self._resultado = [(len(ids),)]
         elif "COUNT(DISTINCT a.conversa_id)" in q:
@@ -76,11 +99,16 @@ class _FakeCursor:
                 e["conversa_id"] for e in self._db.eventos
                 if e["para"] == para and (desde is None or e["em"] >= desde)
             }
-            self._resultado = [(len(ids_de & ids_para),)]
+            ids = {
+                cid for cid in (ids_de & ids_para) if self._passa_teste(modo, cid)
+            }
+            self._resultado = [(len(ids),)]
         elif "WITH transicoes AS" in q:
             por_conversa: dict[int, list[dict]] = {}
             for e in self._db.eventos:
                 if e["origem"] != "live":
+                    continue
+                if not self._passa_teste(modo, e["conversa_id"]):
                     continue
                 por_conversa.setdefault(e["conversa_id"], []).append(e)
             pares: dict[str, list[float]] = {}
@@ -172,11 +200,12 @@ class FakeDatabase:
         estagio: str = "S0",
         nome: str = "Teste",
         telefone: str | None = "5511900000000",
+        e_teste: bool = False,
     ) -> Conversa:
         contato_id = self._novo_id()
         self.contatos[contato_id] = Contato(
             contato_id, nome, f"hash{contato_id}", telefone, funil, None,
-            datetime.now(timezone.utc),
+            datetime.now(timezone.utc), e_teste,
         )
         conversa_id = self._novo_id()
         conversa = Conversa(
@@ -206,8 +235,66 @@ class FakeDatabase:
         if conversa is not None:
             conversa.funil = funil
 
-    def listar_conversas_abertas(self, limite: int = 500) -> list[Conversa]:
-        return [c for c in self.conversas.values() if c.resultado is None][:limite]
+    # -- contato de teste (change `contatos-de-teste-isolados`) -----------
+
+    def _e_teste_da_conversa(self, conversa_id: int) -> bool:
+        conversa = self.conversas.get(conversa_id)
+        if conversa is None:
+            return False
+        contato = self.contatos.get(conversa.contato_id)
+        return bool(contato and contato.e_teste)
+
+    def _filtro_teste(self, *, incluir_teste: bool, apenas_teste: bool):
+        """Espelha `db._condicao_teste`: mesmos três modos (excluir/apenas/
+        incluir), mesma recusa de usar os dois parâmetros juntos. Devolve um
+        predicado `conversa_id -> bool` para os métodos abaixo filtrarem."""
+        if incluir_teste and apenas_teste:
+            raise ValueError(
+                "incluir_teste e apenas_teste não podem ser usados ao mesmo tempo"
+            )
+
+        def passa(conversa_id: int) -> bool:
+            if apenas_teste:
+                return self._e_teste_da_conversa(conversa_id)
+            if incluir_teste:
+                return True
+            return not self._e_teste_da_conversa(conversa_id)
+
+        return passa
+
+    def marcar_contato_teste(
+        self, contato_id: int, e_teste: bool, *, por: str | None = None
+    ) -> None:
+        """Espelha `db.Database.marcar_contato_teste`: grava em `correcoes`
+        (via `self.registrar_correcao`, sem tabela nova no fake), nunca em
+        `self.marcos`/`self.marcos_por`. Usa a conversa aberta do contato, se
+        houver, senão a mais recente encerrada — mesma ordem do SQL real
+        (`ORDER BY (resultado IS NULL) DESC, id DESC`); sem nenhuma conversa,
+        a marca em `contato.e_teste` ainda acontece, só a correção fica sem
+        onde gravar (mesma divergência aceita da `Database` real).
+        """
+        contato = self.contatos.get(contato_id)
+        if contato is None:
+            raise ValueError(f"contato {contato_id} não existe")
+        antes = contato.e_teste
+        contato.e_teste = e_teste
+        candidatas = [c for c in self.conversas.values() if c.contato_id == contato_id]
+        if not candidatas:
+            return
+        candidatas.sort(key=lambda c: (c.resultado is not None, -c.id))
+        self.registrar_correcao(candidatas[0].id, "e_teste", antes, e_teste, por=por)
+
+    def listar_conversas_abertas(
+        self,
+        limite: int = 500,
+        *,
+        incluir_teste: bool = False,
+        apenas_teste: bool = False,
+    ) -> list[Conversa]:
+        passa = self._filtro_teste(incluir_teste=incluir_teste, apenas_teste=apenas_teste)
+        return [
+            c for c in self.conversas.values() if c.resultado is None and passa(c.id)
+        ][:limite]
 
     @contextmanager
     def transacao(self):
@@ -318,16 +405,20 @@ class FakeDatabase:
         eventos = [e for e in self.eventos if e["conversa_id"] == conversa_id]
         return eventos[-1]["para"] if eventos else None
 
-    def estagios_de_conversas_encerradas(self) -> dict[int, list[str]]:
+    def estagios_de_conversas_encerradas(
+        self, *, incluir_teste: bool = False, apenas_teste: bool = False
+    ) -> dict[int, list[str]]:
         """Change `analise-desempenho`: espelha `db.py`, eventos crus de
         conversas com `resultado IS NOT NULL` — a ordenação por rank fica em
-        `metrics.onde_morrem`, não aqui."""
+        `metrics.onde_morrem`, não aqui. Change `contatos-de-teste-isolados`:
+        exclui contato de teste por padrão."""
+        passa = self._filtro_teste(incluir_teste=incluir_teste, apenas_teste=apenas_teste)
         encerradas = {
             c.id for c in self.conversas.values() if c.resultado is not None
         }
         resultado: dict[int, list[str]] = {}
         for e in self.eventos:
-            if e["conversa_id"] in encerradas:
+            if e["conversa_id"] in encerradas and passa(e["conversa_id"]):
                 resultado.setdefault(e["conversa_id"], []).append(e["para"])
         return resultado
 
@@ -359,20 +450,28 @@ class FakeDatabase:
              "estagio": estagio, "trecho": trecho, "em": em or datetime.now(timezone.utc)}
         )
 
-    def distribuicao_objecoes(self, desde=None) -> dict[str, int]:
+    def distribuicao_objecoes(
+        self, desde=None, *, incluir_teste: bool = False, apenas_teste: bool = False
+    ) -> dict[str, int]:
+        passa = self._filtro_teste(incluir_teste=incluir_teste, apenas_teste=apenas_teste)
         contagem: dict[str, int] = {}
         for o in self.objecoes:
             if desde is not None and o["em"] < desde:
+                continue
+            if not passa(o["conversa_id"]):
                 continue
             contagem[o["categoria"]] = contagem.get(o["categoria"], 0) + 1
         return contagem
 
     def distribuicao_objecoes_por_estagio(
-        self, desde=None
+        self, desde=None, *, incluir_teste: bool = False, apenas_teste: bool = False
     ) -> dict[tuple[str | None, str], int]:
+        passa = self._filtro_teste(incluir_teste=incluir_teste, apenas_teste=apenas_teste)
         contagem: dict[tuple[str | None, str], int] = {}
         for o in self.objecoes:
             if desde is not None and o["em"] < desde:
+                continue
+            if not passa(o["conversa_id"]):
                 continue
             chave = (o["estagio"], o["categoria"])
             contagem[chave] = contagem.get(chave, 0) + 1
@@ -444,12 +543,18 @@ class FakeDatabase:
             for numero, texto, enviado_em in sorted(enviados, key=lambda f: f[0])
         ]
 
-    def retorno_por_numero_followup(self) -> dict[int, tuple[int, int]]:
+    def retorno_por_numero_followup(
+        self, *, incluir_teste: bool = False, apenas_teste: bool = False
+    ) -> dict[int, tuple[int, int]]:
         """Change `analise-desempenho`: qualquer mensagem `in` na mesma
         conversa depois de `enviado_em` conta como retorno — mesmo critério
-        de `db.py`."""
+        de `db.py`. Change `contatos-de-teste-isolados`: exclui contato de
+        teste por padrão."""
+        passa = self._filtro_teste(incluir_teste=incluir_teste, apenas_teste=apenas_teste)
         contagem: dict[int, list[int]] = {}
         for conversa_id, enviados in self.followups.items():
+            if not passa(conversa_id):
+                continue
             mensagens_in = [
                 enviada_em
                 for _, direcao, _, enviada_em in self.mensagens.get(conversa_id, [])
@@ -506,11 +611,14 @@ class FakeDatabase:
         return sorted(linhas, key=lambda c: c.em, reverse=True)
 
     def padrao_correcoes(
-        self, desde=None
+        self, desde=None, *, incluir_teste: bool = False, apenas_teste: bool = False
     ) -> list[tuple[str, str | None, str | None, int]]:
+        passa = self._filtro_teste(incluir_teste=incluir_teste, apenas_teste=apenas_teste)
         contagem: dict[tuple[str, str | None, str | None], int] = {}
         for c in self.correcoes:
             if desde is not None and c["em"] < desde:
+                continue
+            if not passa(c["conversa_id"]):
                 continue
             chave = (c["campo"], c["antes"], c["depois"])
             contagem[chave] = contagem.get(chave, 0) + 1
@@ -557,7 +665,7 @@ class FakeDatabase:
             return None
         return ContatoResumido(
             contato.id, contato.nome, contato.tipo,
-            contato.telefone is not None, contato.criado_em,
+            contato.telefone is not None, contato.criado_em, contato.e_teste,
         )
 
     def upsert_contato(self, telefone, *, nome=None, tipo="b2c", origem=None, conn=None) -> Contato:
@@ -698,9 +806,13 @@ class FakeDatabase:
         linhas.sort(key=lambda r: r.gerado_em, reverse=True)
         return linhas[:limite]
 
-    def rascunhos_vinculados_para_analise(self) -> list[RascunhoVinculadoRegistro]:
+    def rascunhos_vinculados_para_analise(
+        self, *, incluir_teste: bool = False, apenas_teste: bool = False
+    ) -> list[RascunhoVinculadoRegistro]:
         """Change `analise-desempenho`: mesma janela de 72h de `db.py`,
-        calculada em Python sobre as mensagens em memória."""
+        calculada em Python sobre as mensagens em memória. Change
+        `contatos-de-teste-isolados`: exclui contato de teste por padrão."""
+        passa = self._filtro_teste(incluir_teste=incluir_teste, apenas_teste=apenas_teste)
         # mensagem_id -> (conversa_id, enviada_em)
         por_mensagem: dict[int, tuple[int, datetime]] = {}
         for conversa_id, linhas in self.mensagens.items():
@@ -710,6 +822,8 @@ class FakeDatabase:
         resultado = []
         for r in self.rascunhos.values():
             if r.mensagem_id is None:
+                continue
+            if not passa(r.conversa_id):
                 continue
             info = por_mensagem.get(r.mensagem_id)
             if info is None:

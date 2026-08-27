@@ -65,11 +65,23 @@ def cmd_init(args) -> int:
 
 
 def cmd_fila(args) -> int:
-    """A fila do dia. O comando que precisa ser rodado toda manhã."""
+    """A fila do dia. O comando que precisa ser rodado toda manhã.
+
+    Change `contatos-de-teste-isolados`: exclui contato de teste por
+    padrão. `--incluir-teste` mostra os dois juntos (depuração via
+    terminal); `--somente-teste` mostra só teste. Nunca as duas juntas — a
+    CLI recusa antes de tocar no banco (`_condicao_teste`, chamado por
+    `db.listar_conversas_abertas`, levanta `ValueError`).
+    """
     banco = _db()
+    if args.incluir_teste and args.somente_teste:
+        raise SystemExit("--incluir-teste e --somente-teste não podem ser usados juntos")
     agora = datetime.now(timezone.utc)
     candidatos = []
-    for conversa in banco.listar_conversas_abertas():
+    conversas = banco.listar_conversas_abertas(
+        incluir_teste=args.incluir_teste, apenas_teste=args.somente_teste
+    )
+    for conversa in conversas:
         estado = recalcular(banco, conversa, agora=agora, persistir=not args.simular)
         candidatos.append(
             Candidato(
@@ -251,6 +263,27 @@ def cmd_marcar(args) -> int:
         f"#{resultado.conversa_id}: marco `{resultado.marco}` por {quem} "
         f"-> estágio {resultado.estado.estagio}"
     )
+    return 0
+
+
+def cmd_marcar_teste(args) -> int:
+    """Marca/desmarca um contato como teste (change
+    `contatos-de-teste-isolados`).
+
+    Comando dedicado, não reaproveita `camucrm corrigir` — "teste" não é
+    correção de classificação de negócio (§7), é uma flag operacional
+    distinta que tira o contato do kanban/fila/métricas reais por padrão.
+    Marcação é sempre manual (§1, mesmo princípio estendido).
+    """
+    quem = _operador(args)
+    banco = _db()
+    e_teste = not args.desfazer
+    try:
+        banco.marcar_contato_teste(args.contato, e_teste, por=quem)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    acao = "desmarcado como" if args.desfazer else "marcado como"
+    print(f"Contato {args.contato} {acao} teste (por {quem}).")
     return 0
 
 
@@ -576,6 +609,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limite", type=int, default=FILA_TAMANHO_MAXIMO)
     p.add_argument("--motivos", action="store_true", help="mostra o sinal que disparou")
     p.add_argument("--simular", action="store_true", help="não grava o recálculo")
+    p.add_argument(
+        "--incluir-teste",
+        action="store_true",
+        dest="incluir_teste",
+        help="mostra contato de teste junto com os reais (depuração via terminal)",
+    )
+    p.add_argument(
+        "--somente-teste",
+        action="store_true",
+        dest="somente_teste",
+        help="mostra só contato de teste",
+    )
     p.set_defaults(func=cmd_fila)
 
     p = sub.add_parser("extrair", help="roda a extração sobre o bloco novo")
@@ -612,6 +657,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("marco", choices=MARCOS_MANUAIS)
     p.add_argument("--por")
     p.set_defaults(func=cmd_marcar)
+
+    p = sub.add_parser(
+        "marcar-teste", help="marca/desmarca um contato como teste (isolado do kanban/fila/métricas)"
+    )
+    p.add_argument("contato", type=int)
+    p.add_argument("--desfazer", action="store_true", help="desmarca o contato como teste")
+    p.add_argument("--por")
+    p.set_defaults(func=cmd_marcar_teste)
 
     p = sub.add_parser("tipo", help="classifica a conversa como b2b ou b2c")
     p.add_argument("conversa", type=int)

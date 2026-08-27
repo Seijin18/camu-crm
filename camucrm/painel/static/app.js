@@ -17,6 +17,11 @@
 
 const CHAVE_TOKEN = "camu_painel_token";
 const CHAVE_OPERADOR = "camu_painel_operador";
+// Change `contatos-de-teste-isolados`: "Modo teste" é o toggle binário do
+// topo do painel — ligado mostra só contato de teste, desligado (padrão) só
+// os reais, nunca os dois juntos na mesma tela (mesmo padrão de persistência
+// de CHAVE_TOKEN/CHAVE_OPERADOR acima).
+const CHAVE_MODO_TESTE = "camu_painel_modo_teste";
 
 function obterToken() {
   try {
@@ -50,8 +55,39 @@ function salvarOperador(valor) {
   }
 }
 
+function modoTesteAtivo() {
+  try {
+    return localStorage.getItem(CHAVE_MODO_TESTE) === "1";
+  } catch (e) {
+    return false;
+  }
+}
+
+function salvarModoTeste(ativo) {
+  try {
+    localStorage.setItem(CHAVE_MODO_TESTE, ativo ? "1" : "0");
+  } catch (e) {
+    /* idem obterToken/salvarToken. */
+  }
+}
+
+/**
+ * Acrescenta `apenas_teste=1` na URL quando "Modo teste" está ligado (change
+ * `contatos-de-teste-isolados`) — chamado de dentro de `chamarApi`, nunca
+ * espalhado tela por tela, para nenhuma rota de leitura escapar do
+ * requirement "Modo teste nunca mistura as duas visões na mesma tela".
+ * Rotas que não declaram este parâmetro (`/conversas/{id}`, `/stream`,
+ * `/eval/*`) simplesmente ignoram a query extra — FastAPI não reclama de
+ * parâmetro desconhecido.
+ */
+function comModoTeste(caminho) {
+  if (!modoTesteAtivo()) return caminho;
+  const separador = caminho.includes("?") ? "&" : "?";
+  return `${caminho}${separador}apenas_teste=1`;
+}
+
 async function chamarApi(caminho) {
-  const resposta = await fetch(`/api${caminho}`, {
+  const resposta = await fetch(`/api${comModoTeste(caminho)}`, {
     headers: { "X-Camu-Token": obterToken() },
   });
   const corpo = await resposta.json();
@@ -379,9 +415,32 @@ async function renderizarDetalhe(container, id) {
       el("p", {
         class: "aviso",
         texto: `Contato: ${contato.nome || "(sem nome)"} — ${contato.tipo.toUpperCase()} — ` +
-          (contato.tem_telefone ? "tem telefone cadastrado" : "sem telefone cadastrado"),
+          (contato.tem_telefone ? "tem telefone cadastrado" : "sem telefone cadastrado") +
+          (contato.e_teste ? " — TESTE" : ""),
       })
     );
+
+    // Change `contatos-de-teste-isolados`: botão dedicado, sem misturar com
+    // a correção genérica de campo — marcar/desmarcar teste é uma flag
+    // operacional, não uma correção de classificação de negócio (§7).
+    const botaoTeste = el("button", {
+      class: "secundario",
+      texto: contato.e_teste ? "Desmarcar contato de teste" : "Marcar contato de teste",
+    });
+    botaoTeste.addEventListener("click", async () => {
+      try {
+        await chamarApiEscrever(`/conversas/${id}/teste`, {
+          e_teste: !contato.e_teste,
+          por: obterOperador(),
+        });
+        await renderizarRotaSegura();
+      } catch (erro) {
+        container.appendChild(
+          el("p", { class: "aviso", texto: `Erro: ${erro.message}` })
+        );
+      }
+    });
+    container.appendChild(botaoTeste);
   }
 
   const secaoFatos = el("div", { class: "secao" }, [el("h3", { texto: "Fatos (com evidência)" })]);
@@ -1480,6 +1539,14 @@ async function conectarStream() {
 function iniciar() {
   document.getElementById("campo-token").value = obterToken();
   document.getElementById("campo-operador").value = obterOperador();
+  const campoModoTeste = document.getElementById("campo-modo-teste");
+  campoModoTeste.checked = modoTesteAtivo();
+  document.body.classList.toggle("modo-teste-ativo", modoTesteAtivo());
+  campoModoTeste.addEventListener("change", () => {
+    salvarModoTeste(campoModoTeste.checked);
+    document.body.classList.toggle("modo-teste-ativo", campoModoTeste.checked);
+    renderizarRotaSegura();
+  });
   document.getElementById("botao-salvar-token").addEventListener("click", () => {
     salvarToken(document.getElementById("campo-token").value.trim());
     salvarOperador(document.getElementById("campo-operador").value.trim());

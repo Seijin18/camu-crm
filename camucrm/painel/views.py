@@ -250,6 +250,9 @@ def _contato_para_json(contato: ContatoResumido | None) -> dict[str, Any] | None
         "tipo": contato.tipo,
         "tem_telefone": contato.tem_telefone,
         "criado_em": contato.criado_em.isoformat(),
+        # Change `contatos-de-teste-isolados`: o botão de marcar/desmarcar no
+        # detalhe da conversa precisa saber o estado atual para rotular-se.
+        "e_teste": contato.e_teste,
     }
 
 

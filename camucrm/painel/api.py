@@ -77,14 +77,21 @@ def _db() -> Database:
     return server.get_db()
 
 
-def _carregar_candidatos(db: Database, *, limite: int = LIMITE_CONVERSAS_PADRAO):
+def _carregar_candidatos(
+    db: Database, *, limite: int = LIMITE_CONVERSAS_PADRAO, apenas_teste: bool = False
+):
     """Conversas abertas, recalculadas, prontas para virar card ou item de fila.
 
     Um recálculo por conversa (N+1 aceito, ver docstring do módulo). O aviso
     de log acima de `LIMITE_AVISO_N1` é o que o plano pede: sinalizar o custo
     sem bloquear a rota por causa dele.
+
+    `apenas_teste` (change `contatos-de-teste-isolados`) é o toggle "Modo
+    teste" do painel — sempre binário aqui (nunca `incluir_teste`, que é só
+    da CLI): ligado mostra só contato de teste, desligado (padrão) só os
+    reais, nunca os dois juntos na mesma tela.
     """
-    conversas = db.listar_conversas_abertas(limite=limite)
+    conversas = db.listar_conversas_abertas(limite=limite, apenas_teste=apenas_teste)
     if len(conversas) > LIMITE_AVISO_N1:
         import logging
 
@@ -113,16 +120,19 @@ def _candidato_de(conversa, estado) -> Candidato:
 
 
 @router.get("/kanban")
-def get_kanban(funil: str | None = None, db: Database = Depends(_db)):
+def get_kanban(funil: str | None = None, apenas_teste: bool = False, db: Database = Depends(_db)):
     """Kanban de um funil, ou dos dois quando `funil` não é passado.
 
     B2C primeiro por ser o funil principal do documento — decisão registrada
     no plano de execução, não uma preferência arbitrária de ordenação.
+
+    `apenas_teste` (change `contatos-de-teste-isolados`): o toggle "Modo
+    teste" do painel, propagado até `db.listar_conversas_abertas`.
     """
     if funil is not None and funil not in FUNIS:
         return views.erro(f"funil inválido: {funil!r}", "§3")
 
-    pares = _carregar_candidatos(db)
+    pares = _carregar_candidatos(db, apenas_teste=apenas_teste)
     cards = [views.card_conversa(c, e) for c, e in pares]
 
     funis = [funil] if funil else [B2C, B2B]
@@ -140,9 +150,12 @@ def listar_conversas(
     direcao: str = "desc",
     limite: int = 50,
     offset: int = 0,
+    apenas_teste: bool = False,
     db: Database = Depends(_db),
 ):
-    pares = _carregar_candidatos(db)
+    """Change `contatos-de-teste-isolados`: `apenas_teste` é o toggle "Modo
+    teste" do painel, propagado até `db.listar_conversas_abertas`."""
+    pares = _carregar_candidatos(db, apenas_teste=apenas_teste)
     cards = [views.card_conversa(c, e) for c, e in pares]
     if funil:
         cards = [c for c in cards if c["funil"] == funil]
@@ -210,8 +223,10 @@ def mensagens_da_conversa(
 
 
 @router.get("/fila")
-def get_fila(limite: int = 10, db: Database = Depends(_db)):
-    pares = _carregar_candidatos(db)
+def get_fila(limite: int = 10, apenas_teste: bool = False, db: Database = Depends(_db)):
+    """Change `contatos-de-teste-isolados`: `apenas_teste` é o toggle "Modo
+    teste" do painel."""
+    pares = _carregar_candidatos(db, apenas_teste=apenas_teste)
     candidatos = [_candidato_de(c, e) for c, e in pares]
     itens = montar_fila(candidatos, limite=limite)
     return {"itens": [views.item_fila_para_json(i) for i in itens]}
@@ -244,17 +259,19 @@ async def stream(desde_id: int | None = None, db: Database = Depends(_db)):
 
 
 @router.get("/metricas")
-def get_metricas(dias: int = 30, db: Database = Depends(_db)):
+def get_metricas(dias: int = 30, apenas_teste: bool = False, db: Database = Depends(_db)):
+    """Change `contatos-de-teste-isolados`: `apenas_teste` é o toggle "Modo
+    teste" do painel, propagado a toda métrica desta rota."""
     desde = datetime.now(timezone.utc) - timedelta(days=dias) if dias else None
     return views.metricas_para_json(
-        metrics.metricas_chave(db, desde=desde),
-        metrics.tempo_por_estagio(db),
-        metrics.saude_taxonomia(db, desde=desde),
+        metrics.metricas_chave(db, desde=desde, apenas_teste=apenas_teste),
+        metrics.tempo_por_estagio(db, apenas_teste=apenas_teste),
+        metrics.saude_taxonomia(db, desde=desde, apenas_teste=apenas_teste),
     )
 
 
 @router.get("/o-que-funciona")
-def get_o_que_funciona(dias: int = 90, db: Database = Depends(_db)):
+def get_o_que_funciona(dias: int = 90, apenas_teste: bool = False, db: Database = Depends(_db)):
     """Tela `/funciona` (change `analise-desempenho`) — agrega tudo que é
     respondível hoje sem depender de `ground-truth-marcos` (restrição
     herdada de `openspec/project.md`: esta rota nunca devolve acurácia de
@@ -270,19 +287,24 @@ def get_o_que_funciona(dias: int = 90, db: Database = Depends(_db)):
     conversas morrem" e o A/B de rascunho olham o histórico inteiro de
     propósito — cortar por `dias` uma pergunta sobre conversas já encerradas
     ou rascunhos já vinculados descartaria amostra sem necessidade.
+
+    `apenas_teste` (change `contatos-de-teste-isolados`): o toggle "Modo
+    teste" do painel, propagado a CADA uma das métricas abaixo — nenhum
+    bloco desta tela escapa do filtro (requirement "Leitura agregada exclui
+    teste por padrão").
     """
     desde = datetime.now(timezone.utc) - timedelta(days=dias) if dias else None
     return views.o_que_funciona_para_json(
-        metricas_chave=metrics.metricas_chave(db, desde=desde),
-        conversao_b2c=metrics.conversao_adjacente(db, B2C, desde=desde),
-        conversao_b2b=metrics.conversao_adjacente(db, B2B, desde=desde),
-        onde_morrem=metrics.onde_morrem(db),
-        tempo_por_estagio=metrics.tempo_por_estagio(db),
-        objecao_por_estagio=metrics.objecao_por_estagio(db, desde=desde),
-        saude_taxonomia=metrics.saude_taxonomia(db, desde=desde),
-        padrao_correcoes=metrics.padrao_correcoes(db, desde=desde),
-        retorno_followup=metrics.retorno_por_followup(db),
-        ab_rascunhos=metrics.ab_rascunhos(db),
+        metricas_chave=metrics.metricas_chave(db, desde=desde, apenas_teste=apenas_teste),
+        conversao_b2c=metrics.conversao_adjacente(db, B2C, desde=desde, apenas_teste=apenas_teste),
+        conversao_b2b=metrics.conversao_adjacente(db, B2B, desde=desde, apenas_teste=apenas_teste),
+        onde_morrem=metrics.onde_morrem(db, apenas_teste=apenas_teste),
+        tempo_por_estagio=metrics.tempo_por_estagio(db, apenas_teste=apenas_teste),
+        objecao_por_estagio=metrics.objecao_por_estagio(db, desde=desde, apenas_teste=apenas_teste),
+        saude_taxonomia=metrics.saude_taxonomia(db, desde=desde, apenas_teste=apenas_teste),
+        padrao_correcoes=metrics.padrao_correcoes(db, desde=desde, apenas_teste=apenas_teste),
+        retorno_followup=metrics.retorno_por_followup(db, apenas_teste=apenas_teste),
+        ab_rascunhos=metrics.ab_rascunhos(db, apenas_teste=apenas_teste),
         resultado_eval=_ler_cache_resultado_eval(),
     )
 
@@ -314,6 +336,11 @@ class CorrecaoBody(BaseModel):
     campo: str
     antes: str | None = None
     depois: str | None = None
+    por: str | None = None
+
+
+class ContatoTesteBody(BaseModel):
+    e_teste: bool
     por: str | None = None
 
 
@@ -349,6 +376,28 @@ def mudar_funil(conversa_id: int, corpo: FunilBody, db: Database = Depends(_db))
     conversa = db.get_conversa(conversa_id)
     estado = recalcular(db, conversa, persistir=False)
     return {"ok": True, "card": views.card_conversa(conversa, estado)}
+
+
+@router.post("/conversas/{conversa_id}/teste")
+def marcar_contato_teste(
+    conversa_id: int, corpo: ContatoTesteBody, db: Database = Depends(_db)
+):
+    """Botão "marcar/desmarcar contato de teste" no detalhe da conversa
+    (change `contatos-de-teste-isolados`). A marca é por CONTATO — resolvida
+    aqui a partir da conversa que a tela já tem aberta — não por conversa
+    (requirement "Marca de teste é por contato"). Delega a
+    `db.marcar_contato_teste`, que grava a correção (§7) sempre.
+    """
+    conversa = db.get_conversa(conversa_id)
+    if conversa is None:
+        return JSONResponse(
+            status_code=422, content=views.erro(f"conversa {conversa_id} não existe", None)
+        )
+    try:
+        db.marcar_contato_teste(conversa.contato_id, corpo.e_teste, por=corpo.por)
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), None))
+    return {"ok": True, "contato_id": conversa.contato_id, "e_teste": corpo.e_teste}
 
 
 @router.post("/conversas/{conversa_id}/correcoes")
