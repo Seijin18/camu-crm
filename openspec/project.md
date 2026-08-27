@@ -113,33 +113,93 @@ Todas justificadas no ponto de uso; listadas aqui para não se perderem.
   regra a lê, e apagar a tabela inteira não muda estágio, temperatura nem
   fila de nenhuma conversa — existe só para leitura humana mais rápida.
 
+## Correções pendentes — auditoria completa do pipeline (2026-08)
+
+Antes de operar com petshops e consumidores de verdade, o usuário pediu uma
+auditoria completa do pipeline (recepção → ingestão → extração → regras →
+fila/rascunho → painel → purga) para garantir que nenhuma mensagem some,
+nenhum dado seja corrompido e a tela nunca minta sobre o estado real do
+banco. Três agentes de exploração cobriram o pipeline inteiro por leitura
+completa (não amostra); os achados mais críticos foram confirmados por
+leitura direta adicional, não só relato de agente. O resultado são 9
+changes novos, agrupados por causa raiz, na ordem de prioridade/dependência
+abaixo — mais a ampliação de `mensagem-sem-texto-preservada` (já existente)
+para cobrir um segundo caso de mensagem descartada, encontrado na mesma
+auditoria.
+
+| # | Change | Severidade | Por que existe | O que NÃO resolve |
+|---|---|---|---|---|
+| 1 | `literalidade-e-idempotencia-da-extracao` | 🔴 crítico | `_fold` colapsa o `\n` que protege a fronteira entre mensagens (contradiz o próprio docstring de `build_corpus`); evidência não distingue lado (cliente vs. Camu); watermark de extração sem `GREATEST`; `gravar_objecao` sem proteção de idempotência | Não mexe em `rules/`; não cobre chunking de histórico grande (isso é o item 9) |
+| 2 | `mensagem-sem-texto-preservada` (ampliação) | 🔴 crítico | Já cobria áudio/figurinha/contato/localização; auditoria ampliou para `ephemeralMessage`/`viewOnceMessage`/`viewOnceMessageV2` (texto puro, não só mídia) e `deviceSentMessage` (eco de outro dispositivo) | `editedMessage`/`protocolMessage` (REVOKE) continuam fora — ver backlog abaixo |
+| 3 | `identificacao-e-relogio-confiaveis` | 🔴/🟡 | `@lid`/`@broadcast`/`status@broadcast` não filtrados (risco de contato fantasma ou histórico splitado); timestamp futuro "trava" `ultimo_inbound`/`ultimo_outbound` para sempre | Não faz reconciliação de LID↔PN já existente (ver backlog) |
+| 4 | `ingestao-a-prova-de-falha` | 🔴 estrutural | `webhook.get_db()` sem `ensure_schema()` no boot; exceção em `ingerir()` engolida sem fila de reprocessamento; sem transação única contato→conversa→mensagem; dedupe parcial; `cmd_ingerir` sem `--transporte` finge sucesso | Não implementa fila externa (Redis/SQS) — staging fica em Postgres, ver `design.md` do change |
+| 5 | `estagio-reabertura-manual-e-relogio` | 🔴/🟡 | Falso positivo de `recusa_explicita` é irreversível por design, hoje sem nenhum caminho de recuperação; `reabrir()` não valida sozinha; `mudar_funil_conversa` lê estágio cache em vez de reconciliar; "avançou hoje" classifica QUENTE mesmo quando quem avançou foi a Camu | Não enfraquece a prioridade de `recusa_explicita` como primeira condição verificada — só adiciona uma exceção explícita e registrada |
+| 6 | `painel-mensagens-recentes-e-acoes-seguras` | 🔴 | `listar_mensagens_registradas` mostra as mensagens MAIS ANTIGAS em conversa >200 mensagens; kanban/fila cortam sem expor `total`; ações concorrentes sem trava podem corromper `marcos_manuais`; `vincular_rascunho` sem `WHERE mensagem_id IS NULL` | Não implementa paginação completa de kanban/fila além de expor `total` |
+| 7 | `purga-cobre-rascunhos-sem-vinculo` | 🔴 conformidade §12 | Purga nunca anonimiza rascunho com `mensagem_id IS NULL` — a maioria dos rascunhos gerados sobrevive com texto pessoal em claro, contrariando a própria docstring da função | Não muda a política de quando purgar, só o alcance da anonimização já prometida |
+| 8 | `backfill-seguro-para-reexecucao` | 🟡 | Reimportar dump sem `externa_id` duplica mensagem; sem chunking para histórico grande; ordem de `id` vs. `enviada_em` pode divergir; `_trilha_de_backfill` não considera origem | **Bloqueado por `literalidade-e-idempotencia-da-extracao`** — a idempotência de `gravar_objecao` é resolvida lá; este change só adiciona teste de regressão do caminho de backfill |
+
+Duas features entram como changes à parte, fora desta tabela de correções,
+mas com a mesma disciplina de `proposal.md`/`tasks.md`/`spec.md`:
+
+- **`contatos-de-teste-isolados`** — feature pedida durante o planejamento:
+  contato marcado como teste (manual, nunca inferido) some do
+  kanban/fila/conversas/métricas por padrão, só aparecendo quando "modo
+  teste" é ativado no painel. Sem dependência das correções acima; faz
+  sentido entrar antes do item 6 (`painel-mensagens-recentes-e-acoes-
+  seguras`) — os dois tocam as mesmas rotas de leitura do painel.
+- **`ground-truth-no-painel`** — substitui o candidato `ground-truth-marcos`
+  abaixo (ver nota na seção seguinte). Rotular pelo painel em vez de editar
+  `data/eval/conversas.jsonl` à mão, puxando mensagens reais de uma conversa
+  existente. Pode entrar logo após o item 1 desta tabela — desbloquear a
+  métrica de acurácia é o que dá sentido a rodar o eval com confiança depois
+  das correções de `_fold`/corpus por direção.
+
+Ordem de implementação recomendada: 1 → 2 → 3 → 4 antes de liberar tráfego
+real de produção (protegem contra dado errado/perdido desde a primeira
+mensagem); 5 → 6 → 7 podem seguir logo depois, já com o sistema em operação
+real; 8 é o de menor urgência (só importa quando um backfill for de fato
+reexecutado). As duas features podem entrar em paralelo, nos pontos
+indicados acima.
+
+### Itens deliberadamente fora de escopo desta auditoria (backlog, não silenciados)
+
+- **`editedMessage`/`protocolMessage` (REVOKE) ignorados** — edição/
+  apagamento do cliente não reflete no CRM. Impacto: retenção maior que o
+  esperado, não perda de dado. Sem change dedicado por enquanto.
+- **Fragilidade de `rank_estagio`** (`rules/estagio.py`) buscar em ambos os
+  dicionários de funil sem tomar `funil` como parâmetro — nunca exercitada
+  na prática porque rótulos `S*`/`P*` não colidem. Registrado como nota de
+  design, não como bug ativo.
+- **Payload em lote da Evolution API** — não é item à parte; é tarefa de
+  investigação dentro do change `ingestao-a-prova-de-falha` (confirmar
+  contra documentação/comportamento real antes de decidir se vale
+  desmembrar).
+
 ## Próximos changes candidatos
 
-`ground-truth-marcos` e `midia-foto-pet` continuam à frente **em valor** —
-nenhuma das duas depende do painel, e ambas seguem bloqueando afirmações
-mais fortes do que o painel pretende fazer. O custo aceito de o painel ter
-sido antecipado (ver nota acima) é registrado de forma verificável, não só
-prometido: **a tela `/funciona` (change `analise-desempenho`) fica proibida
-de afirmar qualquer coisa sobre acurácia de extração até
-`ground-truth-marcos` entrar** — conversão de estágio e tempo por estágio
-podem ser exibidos, porque não dependem do eval.
+`midia-foto-pet` continua à frente **em valor** — não depende do painel, e
+segue bloqueando afirmações mais fortes do que o painel pretende fazer. O
+custo aceito de o painel ter sido antecipado (ver nota acima) é registrado
+de forma verificável, não só prometido: **a tela `/funciona` (change
+`analise-desempenho`) fica proibida de afirmar qualquer coisa sobre
+acurácia de extração até `ground-truth-no-painel` entrar** — conversão de
+estágio e tempo por estágio podem ser exibidos, porque não dependem do
+eval.
+
+`ground-truth-marcos` não é mais candidato — o pedido do usuário durante o
+planejamento da auditoria de 2026-08 (rotular pelo painel em vez de editar
+o JSONL à mão) transformou esse candidato num change com desenho e
+implementação próprios: **`ground-truth-no-painel`**, na tabela acima. Deixa
+de ser pendência externa manual (esperar o Marcos rotular 30 conversas num
+editor de texto) e vira um fluxo do próprio painel.
 
 Nesta ordem de dependência:
 
-1. **`mensagem-sem-texto-preservada`** — sem dependência, sem bloqueio a
-   ninguém. Auditoria pedida pelo usuário antes de operar com petshops e
-   consumidores de verdade encontrou que `audioMessage`, `stickerMessage`,
-   `contactMessage` e `locationMessage`/`liveLocationMessage` são descartados
-   inteiros na recepção (`transport/evolution.py::_texto_da_mensagem`
-   devolve `None`) — nenhuma linha em `mensagens`, `bola_com` não muda. Não
-   é decisão deliberada como a de mídia em `midia-foto-pet`: é o sistema se
-   comportando como se o cliente não tivesse dito nada, o que corrompe
-   silenciosamente a temperatura (§5) de qualquer conversa em que isso
-   acontece. Prioridade alta por ser barato e por já ter acontecido de
-   verdade num teste manual do usuário.
-2. **`ground-truth-marcos`** — as 30 conversas rotuladas (§7). Bloqueia
-   qualquer afirmação sobre qualidade de extração, incluindo a tela
-   `/funciona` do painel.
+1. **`mensagem-sem-texto-preservada`** — já ativo (ver tabela acima),
+   ampliado pela auditoria de 2026-08.
+2. **`ground-truth-no-painel`** — as 30 conversas rotuladas (§7), agora
+   pelo painel. Bloqueia qualquer afirmação sobre qualidade de extração,
+   incluindo a tela `/funciona` do painel.
 3. **`midia-foto-pet`** — S2 é o estágio-chave e hoje depende de o cliente
    escrever algo junto da foto. Tratar mídia traz retenção e LGPD (§12) junto,
    e por isso é capability própria.

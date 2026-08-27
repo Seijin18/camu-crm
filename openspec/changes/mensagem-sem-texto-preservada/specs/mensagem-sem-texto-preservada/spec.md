@@ -52,3 +52,42 @@ não apareça litteralmente associado ao fato alegado.
   de áudio
 - **THEN** a extração sobre esse bloco não afirma nenhum fato com esse
   marcador como evidência
+
+### Requirement: Envelope efêmero/view-once é desembrulhado recursivamente
+
+Uma mensagem cujo tipo é `ephemeralMessage`, `viewOnceMessage` ou
+`viewOnceMessageV2` DEVE ter seu `.message` interno extraído e reprocessado
+pela mesma função de reconhecimento (`_texto_da_mensagem`), recursivamente.
+O conteúdo real do envelope — texto puro ou mídia — DEVE ser tratado
+exatamente como seria se tivesse chegado sem o envelope: texto puro é
+preservado como texto; mídia sem legenda gera o marcador correspondente;
+conteúdo não reconhecido resulta em `None`, do mesmo jeito que resultaria
+sem o envelope.
+
+#### Scenario: Texto puro dentro de mensagem efêmera não é descartado
+
+- **WHEN** chega um evento cujo `message` é `ephemeralMessage` (ou
+  `viewOnceMessage`/`viewOnceMessageV2`) envolvendo um texto puro
+- **THEN** `receber()` devolve um `EventoRecebido` com esse texto, não
+  `None`
+
+#### Scenario: Mídia sem legenda dentro de envelope efêmero gera marcador
+
+- **WHEN** o `.message` interno de um envelope efêmero/view-once é um dos
+  tipos de mídia sem legenda cobertos por este change
+- **THEN** `receber()` devolve um `EventoRecebido` com o marcador
+  correspondente, do mesmo jeito que devolveria sem o envelope
+
+### Requirement: deviceSentMessage é desembrulhado e conta como eco de saída
+
+Uma mensagem cujo tipo é `deviceSentMessage` DEVE ter seu `.message` interno
+extraído e reprocessado recursivamente, preservando `direcao=SAIDA` — é a
+Camu falando por outro dispositivo linkado, não uma mensagem nova do
+cliente.
+
+#### Scenario: Eco de outro dispositivo continua contando como saída
+
+- **WHEN** chega um evento cujo `message` é `deviceSentMessage` envolvendo
+  texto
+- **THEN** `receber()` devolve um `EventoRecebido` com esse texto e
+  `direcao=SAIDA`
