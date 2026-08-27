@@ -46,6 +46,23 @@ JANELA_RECONCILIACAO_HORAS = 48
 # fechar ou morrer, nos dois funis.
 _MARCOS_SO_B2B = {"consignacao_assinada", "primeira_reposicao"}
 
+# Change `painel-mensagens-recentes-e-acoes-seguras`: os únicos dois marcos
+# que se contradizem entre si — uma conversa não pode ser "ganho" E "perdido"
+# ao mesmo tempo. `consignacao_assinada`/`primeira_reposicao` não têm oposto
+# (não existe "não assinou"/"não repôs" como marco manual), então não entram
+# neste mapa.
+_MARCOS_CONTRADITORIOS = {"ganho": "perdido", "perdido": "ganho"}
+
+
+def _marco_conflitante(existentes: set[str], marco: str) -> str | None:
+    """O marco já registrado que torna `marco` contraditório, ou `None`.
+
+    Função pura — quem chama decide o que fazer com o conflito (aqui,
+    `marcar_marco` recusa com `AcaoInvalidaError` antes de gravar).
+    """
+    oposto = _MARCOS_CONTRADITORIOS.get(marco)
+    return oposto if oposto in existentes else None
+
 
 class AcaoInvalidaError(ValueError):
     """Ação recusada antes de tocar no banco — nada foi gravado."""
@@ -111,22 +128,46 @@ def marcar_marco(
     (`marco_permitido`) *antes* de qualquer escrita — a versão antiga
     chamava `db.registrar_marco` antes mesmo de checar se a conversa
     existia, e não validava o marco contra o funil.
+
+    Change `painel-mensagens-recentes-e-acoes-seguras`: leitura + validação +
+    escrita rodam dentro de `db.transacao()`, com a linha de `conversas`
+    travada por `get_conversa_for_update` (`SELECT ... FOR UPDATE`) —
+    requirement "Ações concorrentes no mesmo card não corrompem
+    marcos_manuais". Duas chamadas quase simultâneas para a mesma conversa
+    serializam nesta trava: a segunda só lê depois que a primeira commitou, e
+    então enxerga o marco que a primeira já gravou — `_marco_conflitante`
+    recusa a segunda com `AcaoInvalidaError` antes de tocar no banco, em vez
+    de gravar "ganho" e "perdido" juntos.
+
+    `recalcular` roda DEPOIS de a transação da marcação commitar, fora dela —
+    mesmo padrão de `ingest.ingerir` (recalcular não participa da transação
+    crítica de escrita; lê o estado já committido em conexões próprias).
     """
-    conversa = db.get_conversa(conversa_id)
-    if conversa is None:
-        raise AcaoInvalidaError(f"conversa {conversa_id} não existe")
+    with db.transacao() as conn:
+        conversa = db.get_conversa_for_update(conversa_id, conn)
+        if conversa is None:
+            raise AcaoInvalidaError(f"conversa {conversa_id} não existe")
 
-    motivo = marco_permitido(conversa.funil, marco)
-    if motivo:
-        raise MarcoNaoPermitidoError(motivo)
+        motivo = marco_permitido(conversa.funil, marco)
+        if motivo:
+            raise MarcoNaoPermitidoError(motivo)
 
-    db.registrar_marco(conversa_id, marco, por=por)
-    if marco == "perdido":
-        db.atualizar_estado_conversa(conversa_id, resultado="perdido")
-    elif marco == "ganho":
-        db.atualizar_estado_conversa(conversa_id, resultado="ganho")
+        conflito = _marco_conflitante(db.marcos_da_conversa(conversa_id, conn=conn), marco)
+        if conflito:
+            raise AcaoInvalidaError(
+                f"conversa {conversa_id} já tem o marco '{conflito}' registrado — "
+                f"'{marco}' seria contraditório com ele (§3)"
+            )
 
-    estado = recalcular(db, conversa)
+        db.registrar_marco(conversa_id, marco, por=por, conn=conn)
+        if marco == "perdido":
+            db.atualizar_estado_conversa(conversa_id, resultado="perdido", conn=conn)
+        elif marco == "ganho":
+            db.atualizar_estado_conversa(conversa_id, resultado="ganho", conn=conn)
+
+    atualizada = db.get_conversa(conversa_id)
+    assert atualizada is not None
+    estado = recalcular(db, atualizada)
     return ResultadoMarco(conversa_id=conversa_id, marco=marco, por=por, estado=estado)
 
 
@@ -148,23 +189,64 @@ def mudar_funil_conversa(
     desalinhado (a regressão de watermark que `literalidade-e-idempotencia-
     da-extracao` corrigiu é um jeito real de chegar lá) gravaria um `de`
     errado no evento desta reclassificação.
+
+    Change `painel-mensagens-recentes-e-acoes-seguras`:
+
+    1. Leitura + validação + as três escritas que precisam da trava
+       (`set_tipo_contato`, `set_funil_conversa`, `registrar_correcao`)
+       rodam dentro de `db.transacao()`, com a linha de `conversas` travada
+       por `get_conversa_for_update` — mesma trava que `marcar_marco` usa,
+       requirement "Ações concorrentes no mesmo card não corrompem
+       marcos_manuais" (aqui, contra uma corrida entre duas mudanças de
+       funil ou entre uma mudança de funil e um marco no mesmo card): das
+       duas chamadas concorrentes, só a primeira vê `anterior != novo_funil`
+       e escreve; a segunda, ao adquirir a trava depois do commit da
+       primeira, já lê o funil novo e sai cedo por `anterior == novo_funil`.
+    2. A reclassificação de estágio (`mudar_funil`/`gravar_evento_estagio`)
+       e `recalcular(persistir=True)` (requirement "mudar_funil_conversa
+       persiste temperatura" — substituindo o antigo `UPDATE` parcial que
+       nunca tocava `temperatura`) rodam DEPOIS que a transação acima já
+       commitou, **fora** da trava. Isto não é uma segunda corrida: a
+       trava já serializou a parte que precisava dela (linha 1), e daqui
+       em diante `gravar_evento_estagio` é `ON CONFLICT DO NOTHING`
+       (idempotente) e as leituras (`fatos_da_conversa`/`carregar_sinais`/
+       `estagio_de_partida`) leem o estado já committido.
+
+       Isto NÃO é só estilo: a primeira versão deste change fazia todo o
+       resto — `fatos_da_conversa`, `carregar_sinais`, `estagio_de_partida`
+       — dentro da mesma `with db.transacao()`, e nenhuma dessas funções
+       aceita `conn=` (pedem conexão nova do pool a cada chamada). Sob
+       concorrência real, isso significava manter a conexão da transação
+       (travada, esperando ela mesma ser a próxima a rodar) aberta enquanto
+       pedia MAIS conexões do mesmo pool para essas leituras — com
+       `max_size` pequeno e chamadas concorrentes suficientes na mesma
+       conversa, o pool esgotava e a "trava para segurança" produzia
+       exatamente o oposto: `PoolTimeout`/`DeadlockDetected` contra Postgres
+       real (reproduzido em
+       `tests/integration/test_acoes_concorrentes_postgres.py` antes deste
+       ajuste). Mover a parte idempotente para fora da trava resolve sem
+       precisar espalhar `conn=` por toda a cadeia de leitura de sinais.
     """
-    conversa = db.get_conversa(conversa_id)
-    if conversa is None:
-        raise AcaoInvalidaError(f"conversa {conversa_id} não existe")
     if novo_funil not in (B2B, B2C):
         raise AcaoInvalidaError(f"funil inválido: {novo_funil!r}")
 
-    anterior = conversa.funil
-    if anterior == novo_funil:
-        return ResultadoFunil(conversa_id, anterior, novo_funil, movimento=None)
+    with db.transacao() as conn:
+        conversa = db.get_conversa_for_update(conversa_id, conn)
+        if conversa is None:
+            raise AcaoInvalidaError(f"conversa {conversa_id} não existe")
 
-    db.set_tipo_contato(conversa.contato_id, novo_funil)
-    db.set_funil_conversa(conversa_id, novo_funil)
-    # A reclassificação é uma correção (§7): o padrão delas mostra o que o
-    # sistema não está vendo na hora de classificar.
-    db.registrar_correcao(conversa_id, "funil", anterior, novo_funil, por=por)
+        anterior = conversa.funil
+        if anterior == novo_funil:
+            return ResultadoFunil(conversa_id, anterior, novo_funil, movimento=None)
 
+        db.set_tipo_contato(conversa.contato_id, novo_funil, conn=conn)
+        db.set_funil_conversa(conversa_id, novo_funil, conn=conn)
+        # A reclassificação é uma correção (§7): o padrão delas mostra o que o
+        # sistema não está vendo na hora de classificar.
+        db.registrar_correcao(conversa_id, "funil", anterior, novo_funil, por=por, conn=conn)
+
+    # Trava já liberada (commit acima). Lê o estado já committido em
+    # conexões próprias — ver a nota de concorrência na docstring.
     atualizada = db.get_conversa(conversa_id)
     assert atualizada is not None
     fatos = db.fatos_da_conversa(conversa_id)
@@ -179,7 +261,8 @@ def mudar_funil_conversa(
             motivo=movimento.motivo,
             causada_por=movimento.causada_por,
         )
-        db.atualizar_estado_conversa(conversa_id, estagio=movimento.para)
+
+    recalcular(db, atualizada, persistir=True)
 
     return ResultadoFunil(conversa_id, anterior, novo_funil, movimento=movimento)
 

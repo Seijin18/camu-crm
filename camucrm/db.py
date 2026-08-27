@@ -822,10 +822,15 @@ class Database:
                 )
                 return Contato(*cur.fetchone())
 
-    def set_tipo_contato(self, contato_id: int, tipo: str) -> None:
+    def set_tipo_contato(self, contato_id: int, tipo: str, *, conn=None) -> None:
+        """`conn=` opcional (change `painel-mensagens-recentes-e-acoes-
+        seguras`): ver `Database._conn_ou` — usado por
+        `acoes.mudar_funil_conversa` para rodar dentro da mesma transação
+        travada por `get_conversa_for_update`.
+        """
         if tipo not in (B2B, B2C):
             raise ValueError(f"tipo inválido: {tipo!r}")
-        with self._conn() as conn:
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE contatos SET tipo = %s WHERE id = %s", (tipo, contato_id)
@@ -882,17 +887,22 @@ class Database:
                         (conversa_row[0], "e_teste", _texto(antes), _texto(e_teste), por),
                     )
 
-    def set_funil_conversa(self, conversa_id: int, funil: str) -> None:
+    def set_funil_conversa(self, conversa_id: int, funil: str, *, conn=None) -> None:
         """Move a conversa aberta para o outro funil.
 
         `conversas.funil` é copiado de `contatos.tipo` na criação e não
         acompanha mudanças depois — a conversa é a unidade de análise, e
         reescrever o funil de conversas encerradas mudaria retroativamente as
         métricas de conversão já apuradas.
+
+        `conn=` opcional (change `painel-mensagens-recentes-e-acoes-
+        seguras`): ver `Database._conn_ou` — usado por
+        `acoes.mudar_funil_conversa` para rodar dentro da mesma transação
+        travada por `get_conversa_for_update`.
         """
         if funil not in (B2B, B2C):
             raise ValueError(f"funil inválido: {funil!r}")
-        with self._conn() as conn:
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE conversas SET funil = %s, atualizado_em = now() WHERE id = %s",
@@ -967,12 +977,51 @@ class Database:
                     )
                 return Conversa(*perdida)
 
-    def get_conversa(self, conversa_id: int) -> Conversa | None:
-        with self._conn() as conn:
+    def get_conversa(self, conversa_id: int, *, conn=None) -> Conversa | None:
+        """`conn=` opcional (change `painel-mensagens-recentes-e-acoes-
+        seguras`): ver `Database._conn_ou` — precisa ler a mesma transação
+        quando chamado depois de uma escrita ainda não commitada (ex.
+        `acoes.mudar_funil_conversa` relendo a conversa logo após
+        `set_funil_conversa(conn=conn)`, dentro da mesma transação travada).
+        """
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(f"{self._CONVERSA_SELECT} WHERE c.id = %s", (conversa_id,))
                 row = cur.fetchone()
                 return Conversa(*row) if row else None
+
+    def get_conversa_for_update(self, conversa_id: int, conn) -> Conversa | None:
+        """`SELECT ... FOR UPDATE OF c` na linha de `conversas` (change
+        `painel-mensagens-recentes-e-acoes-seguras`, requirement "Ações
+        concorrentes no mesmo card não corrompem marcos_manuais").
+
+        `conn` é OBRIGATÓRIO (vem de `with db.transacao() as conn:`) — a
+        trava só vale enquanto a transação que a tomou está aberta; chamar
+        isto fora de uma transação explícita não trava nada de útil, e por
+        isso não há um default `None` com `_conn_ou` aqui, diferente do
+        resto do arquivo.
+
+        `FOR UPDATE OF c` (não `FOR UPDATE` puro): `_CONVERSA_SELECT` faz
+        `JOIN` com `contatos`, e `FOR UPDATE` sem `OF` tentaria travar a
+        linha de `contatos` também — travar só `conversas` é o que o
+        requirement pede, e é a única tabela que
+        `acoes.marcar_marco`/`acoes.mudar_funil_conversa` escrevem sob esta
+        trava.
+
+        `acoes.marcar_marco`/`acoes.mudar_funil_conversa` chamam isto
+        primeiro, dentro de `db.transacao()`: uma segunda chamada quase
+        simultânea para a MESMA conversa bloqueia neste `SELECT ... FOR
+        UPDATE` até a primeira transação commitar (ou reverter), serializando
+        as duas em vez de intercalar leitura e escrita — é isso que impede
+        `marcos_manuais` contraditório (duas gravações "ganho"/"perdido" na
+        mesma conversa) sem recusar a segunda ação de cara.
+        """
+        with conn.cursor() as cur:
+            cur.execute(
+                f"{self._CONVERSA_SELECT} WHERE c.id = %s FOR UPDATE OF c", (conversa_id,)
+            )
+            row = cur.fetchone()
+            return Conversa(*row) if row else None
 
     def listar_conversas_abertas(
         self,
@@ -985,6 +1034,18 @@ class Database:
 
         Change `contatos-de-teste-isolados`: exclui contato de teste por
         padrão (kanban/fila reais). Ver `_condicao_teste` para os três modos.
+
+        Change `painel-mensagens-recentes-e-acoes-seguras`: `ORDER BY
+        atualizado_em ASC` (não mais `DESC`) — quando há mais conversas
+        abertas que `limite`, o corte precisa cair nas conversas TOCADAS
+        recentemente (pelo painel ou por mensagem nova), não nas mais
+        NEGLIGENCIADAS. `atualizado_em DESC` fazia o oposto: cortava
+        primeiro exatamente as conversas que nunca foram tocadas, as que
+        mais precisam de atenção. A ordem de exibição final (kanban/fila) é
+        recalculada por `views.ordenar_conversas`/`rules.fila.montar_fila` —
+        esta ordem aqui só decide o que sobrevive ao corte, não o que a
+        tela mostra primeiro. Ver `contar_conversas_abertas` para o `total`
+        real, que a rota expõe mesmo quando o corte acontece.
         """
         condicao = _condicao_teste(
             "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
@@ -993,10 +1054,32 @@ class Database:
             with conn.cursor() as cur:
                 cur.execute(
                     f"{self._CONVERSA_SELECT} WHERE c.resultado IS NULL {condicao} "
-                    "ORDER BY c.atualizado_em DESC LIMIT %s",
+                    "ORDER BY c.atualizado_em ASC LIMIT %s",
                     (limite,),
                 )
                 return [Conversa(*row) for row in cur.fetchall()]
+
+    def contar_conversas_abertas(
+        self, *, incluir_teste: bool = False, apenas_teste: bool = False
+    ) -> int:
+        """Total real de conversas abertas, sem o corte de `limite` — o que
+        `listar_conversas_abertas` sozinha não expõe (change
+        `painel-mensagens-recentes-e-acoes-seguras`, requirement "Kanban e
+        fila expõem contagem real"). Mesmo filtro de teste que
+        `listar_conversas_abertas` usa, para os dois números (total exibido
+        vs. total real) falarem da mesma população.
+        """
+        condicao = _condicao_teste(
+            "ct.e_teste", incluir_teste=incluir_teste, apenas_teste=apenas_teste
+        )
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM conversas c "
+                    "JOIN contatos ct ON ct.id = c.contato_id "
+                    f"WHERE c.resultado IS NULL {condicao}"
+                )
+                return cur.fetchone()[0]
 
     def token_de_mudanca(self) -> str:
         """Cursor barato de "algo mudou" para o SSE do painel (change
@@ -1035,6 +1118,7 @@ class Database:
         bola_com: str | None = None,
         resultado: str | None = None,
         ultima_mensagem_processada_id: int | None = None,
+        conn=None,
     ) -> None:
         """Atualiza o estado derivado da conversa (cache do que as regras dizem).
 
@@ -1050,6 +1134,11 @@ class Database:
         `camucrm extrair` juntos, ou dois webhooks) podem gravar o menor dos
         dois valores por último, regredindo o watermark e reapresentando ao
         LLM um bloco de mensagens já processado.
+
+        `conn=` opcional (change `painel-mensagens-recentes-e-acoes-
+        seguras`): ver `Database._conn_ou` — usado por
+        `acoes.marcar_marco`/`acoes.mudar_funil_conversa` para escrever
+        dentro da mesma transação travada por `get_conversa_for_update`.
         """
         campos, valores = [], []
         for nome, valor in (
@@ -1072,7 +1161,7 @@ class Database:
             return
         campos.append("atualizado_em = now()")
         valores.append(conversa_id)
-        with self._conn() as conn:
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE conversas SET {', '.join(campos)} WHERE id = %s",
@@ -1243,8 +1332,14 @@ class Database:
         motivo: str | None = None,
         em: datetime | None = None,
         causada_por: str = "cliente",
+        conn=None,
     ) -> None:
-        with self._conn() as conn:
+        """`conn=` opcional (change `painel-mensagens-recentes-e-acoes-
+        seguras`): ver `Database._conn_ou` — usado por
+        `acoes.mudar_funil_conversa` para gravar dentro da mesma transação
+        travada por `get_conversa_for_update`.
+        """
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -1559,11 +1654,16 @@ class Database:
     # -- marcos manuais (§3) ----------------------------------------------
 
     def registrar_marco(
-        self, conversa_id: int, marco: str, *, por: str | None = None
+        self, conversa_id: int, marco: str, *, por: str | None = None, conn=None
     ) -> None:
+        """`conn=` opcional (change `painel-mensagens-recentes-e-acoes-
+        seguras`): ver `Database._conn_ou` — usado por `acoes.marcar_marco`
+        para gravar dentro da mesma transação travada por
+        `get_conversa_for_update`.
+        """
         if marco not in MARCOS_MANUAIS:
             raise ValueError(f"marco inválido: {marco!r} (use {MARCOS_MANUAIS})")
-        with self._conn() as conn:
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO marcos_manuais (conversa_id, marco, por) VALUES (%s, %s, %s) "
@@ -1582,8 +1682,17 @@ class Database:
                 row = cur.fetchone()
                 return row[0] if row else None
 
-    def marcos_da_conversa(self, conversa_id: int) -> set[str]:
-        with self._conn() as conn:
+    def marcos_da_conversa(self, conversa_id: int, *, conn=None) -> set[str]:
+        """`conn=` opcional (change `painel-mensagens-recentes-e-acoes-
+        seguras`): ver `Database._conn_ou`. Crítico para `acoes.marcar_marco`
+        chamar isto com `conn=conn` — sem isso, a checagem de conflito
+        pedia uma SEGUNDA conexão do pool enquanto a primeira (a da
+        transação, travada por `get_conversa_for_update`) continuava
+        aberta; sob concorrência real (N chamadas simultâneas na mesma
+        conversa >= `max_size` do pool), isso esgotava o pool e travava
+        (`PoolTimeout`) em vez de simplesmente serializar as chamadas.
+        """
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT marco FROM marcos_manuais WHERE conversa_id = %s",
@@ -1601,14 +1710,20 @@ class Database:
         depois: Any,
         *,
         por: str | None = None,
+        conn=None,
     ) -> None:
         """Grava uma correção humana. Chamada por *toda* correção, sem exceção.
 
         §7: correção que só ajusta a tela e não é gravada é informação jogada
         fora. As duas funções são alimentar o eval e revelar, pelo padrão, o
         que o prompt não está vendo.
+
+        `conn=` opcional (change `painel-mensagens-recentes-e-acoes-
+        seguras`): ver `Database._conn_ou` — usado por
+        `acoes.mudar_funil_conversa` para gravar dentro da mesma transação
+        travada por `get_conversa_for_update`.
         """
-        with self._conn() as conn:
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO correcoes (conversa_id, campo, antes, depois, por) "
@@ -1792,31 +1907,103 @@ class Database:
         *,
         conversa_id: int | None = None,
         desde_id: int | None = None,
+        antes_de: int | None = None,
         limite: int = 200,
+        mais_recentes: bool = True,
     ) -> list[MensagemRegistro]:
         """Mensagens gravadas, opcionalmente restritas a uma conversa.
 
-        Usada tanto por `GET /api/conversas/{id}/mensagens` (com
-        `conversa_id`) quanto, futuramente, por um feed global — mesma
-        consulta, um parâmetro a mais, para não duplicar SQL entre os dois
-        usos.
+        Três modos (change `painel-mensagens-recentes-e-acoes-seguras` —
+        antes deste change havia só um: `ORDER BY id ASC` sempre, o que fazia
+        `GET /api/conversas/{id}/mensagens` mostrar as MAIS ANTIGAS de uma
+        conversa longa, não o estado atual):
+
+        - **`desde_id` informado**: catch-up incremental — `id > desde_id`,
+          `ORDER BY id ASC`. Nunca muda: é o cursor de reconexão que
+          `painel/stream.py::gerador_sse` usa (change `painel-tempo-real`)
+          para não perder mensagem entre reconexões, sempre em ORDEM
+          CRESCENTE a partir de um id conhecido. `mais_recentes`/`antes_de`
+          são ignorados neste modo.
+        - **sem `desde_id`, `mais_recentes=True` (novo padrão)**: as
+          `limite` mensagens MAIS RECENTES — opcionalmente antes de
+          `antes_de` (cursor "antes de X" para paginar para trás no
+          histórico). A consulta busca por `id DESC` e o resultado é
+          revertido antes de devolver, para sair sempre em ordem
+          cronológica ascendente (a mais antiga da janela primeiro) — quem
+          consome (tela, `serializar_mensagens`) não precisa reordenar.
+        - **`mais_recentes=False`**: comportamento antigo, `ORDER BY id ASC
+          LIMIT limite` desde o início. Preservado para quem precisa da
+          conversa inteira desde o começo, não só a cauda recente — ver
+          `api._mensagens_de_conversa_para_bruto` (ground truth/eval:
+          "a conversa inteira, não as últimas 200", `limite` ali é só rede
+          de segurança contra uma conversa anormalmente longa, não um corte
+          intencional).
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
+                if desde_id is not None:
+                    if conversa_id is not None:
+                        cur.execute(
+                            "SELECT id, conversa_id, direcao, texto, enviada_em "
+                            "FROM mensagens WHERE conversa_id = %s AND id > %s "
+                            "ORDER BY id LIMIT %s",
+                            (conversa_id, desde_id, limite),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT id, conversa_id, direcao, texto, enviada_em "
+                            "FROM mensagens WHERE id > %s ORDER BY id LIMIT %s",
+                            (desde_id, limite),
+                        )
+                    return [MensagemRegistro(*row) for row in cur.fetchall()]
+
+                if not mais_recentes:
+                    if conversa_id is not None:
+                        cur.execute(
+                            "SELECT id, conversa_id, direcao, texto, enviada_em "
+                            "FROM mensagens WHERE conversa_id = %s "
+                            "ORDER BY id LIMIT %s",
+                            (conversa_id, limite),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT id, conversa_id, direcao, texto, enviada_em "
+                            "FROM mensagens ORDER BY id LIMIT %s",
+                            (limite,),
+                        )
+                    return [MensagemRegistro(*row) for row in cur.fetchall()]
+
+                condicoes = []
+                params: list[Any] = []
                 if conversa_id is not None:
-                    cur.execute(
-                        "SELECT id, conversa_id, direcao, texto, enviada_em "
-                        "FROM mensagens WHERE conversa_id = %s AND id > %s "
-                        "ORDER BY id LIMIT %s",
-                        (conversa_id, desde_id or 0, limite),
-                    )
-                else:
-                    cur.execute(
-                        "SELECT id, conversa_id, direcao, texto, enviada_em "
-                        "FROM mensagens WHERE id > %s ORDER BY id LIMIT %s",
-                        (desde_id or 0, limite),
-                    )
-                return [MensagemRegistro(*row) for row in cur.fetchall()]
+                    condicoes.append("conversa_id = %s")
+                    params.append(conversa_id)
+                if antes_de is not None:
+                    condicoes.append("id < %s")
+                    params.append(antes_de)
+                where = f"WHERE {' AND '.join(condicoes)}" if condicoes else ""
+                params.append(limite)
+                cur.execute(
+                    f"SELECT id, conversa_id, direcao, texto, enviada_em "
+                    f"FROM mensagens {where} ORDER BY id DESC LIMIT %s",
+                    tuple(params),
+                )
+                linhas = list(reversed(cur.fetchall()))
+                return [MensagemRegistro(*row) for row in linhas]
+
+    def contar_mensagens(self, conversa_id: int) -> int:
+        """Total real de mensagens de uma conversa — o que
+        `listar_mensagens_registradas` sozinha não expõe quando corta pelo
+        `limite` (change `painel-mensagens-recentes-e-acoes-seguras`,
+        requirement "Mensagens recentes aparecem por padrão").
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM mensagens WHERE conversa_id = %s",
+                    (conversa_id,),
+                )
+                return cur.fetchone()[0]
 
     def ultimas_mensagens_globais(
         self, limite: int = 8
@@ -1974,8 +2161,19 @@ class Database:
         segunda tentativa de vincular a mesma mensagem propaga
         `psycopg.errors.UniqueViolation`, não é traduzida aqui.
 
-        Devolve `False` quando `rascunho_id` não existe (nada para vincular);
-        `True` quando a linha foi encontrada e atualizada.
+        `WHERE mensagem_id IS NULL` (change
+        `painel-mensagens-recentes-e-acoes-seguras`): sem isto, uma corrida
+        entre duas reconciliações do MESMO rascunho (`acoes.
+        reconciliar_rascunho` chamado duas vezes quase juntas, ou uma
+        reconciliação automática cruzando com um registro manual) podia
+        sobrescrever um vínculo já feito, silenciosamente — a segunda escrita
+        vencia sem erro nenhum. Agora a segunda tentativa não afeta a linha
+        (rowcount 0), e é isso — não uma exceção — que `Database.rowcount >
+        0` abaixo traduz para `False`.
+
+        Devolve `False` quando `rascunho_id` não existe OU quando já tinha um
+        `mensagem_id` vinculado (nada mudou); `True` quando a linha foi
+        encontrada, ainda sem vínculo, e foi atualizada.
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -1984,7 +2182,7 @@ class Database:
                     UPDATE rascunhos
                        SET mensagem_id = %s,
                            estagio_no_envio = COALESCE(%s, estagio_no_envio)
-                     WHERE id = %s
+                     WHERE id = %s AND mensagem_id IS NULL
                     """,
                     (mensagem_id, estagio_no_envio, rascunho_id),
                 )

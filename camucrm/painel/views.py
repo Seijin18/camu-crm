@@ -287,10 +287,23 @@ def detalhe_conversa(
 
 
 def serializar_mensagens(
-    mensagens: list[MensagemRegistro], *, desde_id: int | None
+    mensagens: list[MensagemRegistro], *, desde_id: int | None, total: int | None = None
 ) -> dict[str, Any]:
+    """Payload de `GET .../mensagens`.
+
+    `total` (change `painel-mensagens-recentes-e-acoes-seguras`, requirement
+    "Mensagens recentes aparecem por padrão"): contagem real de mensagens da
+    conversa, independente do corte pelo `limite` de exibição. `tem_mais` é
+    a leitura direta que a tela usa para decidir se mostra o indicador de
+    truncamento — `True` quando o que veio nesta página é menos que o
+    total real. `None` (não informado — ex. o catch-up incremental do SSE,
+    que não conta o total a cada chamada) mantém `tem_mais` também `None`,
+    sem afirmar nada sobre o que a tela já tem carregado.
+    """
     return {
         "desde_id": desde_id,
+        "total": total,
+        "tem_mais": None if total is None else len(mensagens) < total,
         "mensagens": [
             {
                 "id": m.id,

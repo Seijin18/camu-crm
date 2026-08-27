@@ -126,6 +126,25 @@ class TesteRotas(unittest.TestCase):
         self.assertEqual(resposta.status_code, 200)
         self.assertIn("erro", resposta.json())
 
+    def test_kanban_expoe_total_real_mesmo_cortado(self):
+        """Requirement "Kanban e fila expõem contagem real": `total` reflete
+        a contagem real de conversas abertas, mesmo quando
+        `_carregar_candidatos` corta pelo `LIMITE_CONVERSAS_PADRAO`."""
+        for i in range(3):
+            self.fake.criar_conversa(funil="b2c", estagio="S0", nome=f"C{i}")
+        with patch.object(api, "LIMITE_CONVERSAS_PADRAO", 2):
+            resposta = self.cliente.get("/api/kanban")
+        corpo = resposta.json()
+        self.assertEqual(corpo["total"], 3)
+
+    def test_fila_expoe_total_real_mesmo_cortado(self):
+        for i in range(3):
+            self.fake.criar_conversa(funil="b2c", estagio="S0", nome=f"C{i}")
+        with patch.object(api, "LIMITE_CONVERSAS_PADRAO", 2):
+            resposta = self.cliente.get("/api/fila")
+        corpo = resposta.json()
+        self.assertEqual(corpo["total"], 3)
+
     def test_conversas_smoke(self):
         self.fake.criar_conversa(funil="b2c", estagio="S0", nome="Ana")
         resposta = self.cliente.get("/api/conversas")
@@ -203,6 +222,72 @@ class TesteRotas(unittest.TestCase):
         corpo = resposta.json()
         self.assertEqual(len(corpo["mensagens"]), 1)
         self.assertEqual(corpo["mensagens"][0]["texto"], "oi")
+        self.assertEqual(corpo["total"], 1)
+        self.assertFalse(corpo["tem_mais"])
+
+    def test_mensagens_recentes_por_padrao_em_conversa_longa(self):
+        """Requirement "Mensagens recentes aparecem por padrão": conversa com
+        mais de 200 mensagens devolve, sem `desde_id`, as MAIS RECENTES — não
+        as 200 mais antigas (o bug que este change corrige)."""
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S0", nome="Ana")
+        for i in range(250):
+            self.fake.registrar_mensagem(conversa.id, "in", f"msg {i}")
+
+        resposta = self.cliente.get(f"/api/conversas/{conversa.id}/mensagens")
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertEqual(len(corpo["mensagens"]), 200)
+        self.assertEqual(corpo["total"], 250)
+        self.assertTrue(corpo["tem_mais"])
+        # As mais RECENTES: a última da janela é a msg 249 (a mais nova),
+        # não a msg 199 (o que o bug antigo, `ORDER BY id ASC LIMIT 200`,
+        # devolvia).
+        self.assertEqual(corpo["mensagens"][-1]["texto"], "msg 249")
+        self.assertEqual(corpo["mensagens"][0]["texto"], "msg 50")
+
+    def test_mensagens_desde_id_continua_incremental(self):
+        """Catch-up (usado pelo SSE, `painel/stream.py`) não regride: com
+        `desde_id`, continua ORDEM CRESCENTE a partir do id informado, nunca
+        as "mais recentes"."""
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S0", nome="Ana")
+        ids = [
+            self.fake.registrar_mensagem(conversa.id, "in", f"msg {i}")
+            for i in range(5)
+        ]
+        resposta = self.cliente.get(
+            f"/api/conversas/{conversa.id}/mensagens?desde_id={ids[1]}"
+        )
+        corpo = resposta.json()
+        self.assertEqual([m["texto"] for m in corpo["mensagens"]], ["msg 2", "msg 3", "msg 4"])
+
+    def test_mensagens_antes_de_pagina_para_tras(self):
+        """Requirement "Mensagens recentes aparecem por padrão": `antes_de` é
+        o cursor real para carregar histórico mais antigo sob demanda, depois
+        que a página inicial (mais recentes) já foi exibida."""
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S0", nome="Ana")
+        ids = [
+            self.fake.registrar_mensagem(conversa.id, "in", f"msg {i}")
+            for i in range(10)
+        ]
+
+        primeira_pagina = self.cliente.get(
+            f"/api/conversas/{conversa.id}/mensagens?limite=4"
+        ).json()
+        self.assertEqual(
+            [m["texto"] for m in primeira_pagina["mensagens"]],
+            ["msg 6", "msg 7", "msg 8", "msg 9"],
+        )
+        self.assertTrue(primeira_pagina["tem_mais"])
+
+        cursor = primeira_pagina["mensagens"][0]["id"]
+        self.assertEqual(cursor, ids[6])
+        segunda_pagina = self.cliente.get(
+            f"/api/conversas/{conversa.id}/mensagens?limite=4&antes_de={cursor}"
+        ).json()
+        self.assertEqual(
+            [m["texto"] for m in segunda_pagina["mensagens"]],
+            ["msg 2", "msg 3", "msg 4", "msg 5"],
+        )
 
 
 class TesteDetalheNuncaDevolveTelefone(unittest.TestCase):

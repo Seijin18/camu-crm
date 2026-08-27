@@ -168,6 +168,24 @@ class TesteVinculoPorFlagDaCli(unittest.TestCase):
         # A segunda mensagem, livre, ainda pode ser vinculada a outro rascunho.
         self.assertTrue(self.db.vincular_rascunho(outro_rascunho, m2))
 
+    def test_segunda_reconciliacao_do_mesmo_rascunho_nao_sobrescreve_o_vinculo(self):
+        """Requirement "Vínculo de rascunho não é sobrescrito por corrida":
+        `WHERE mensagem_id IS NULL` (change
+        `painel-mensagens-recentes-e-acoes-seguras`) — uma segunda tentativa
+        de vincular o MESMO rascunho a uma mensagem DIFERENTE não sobrescreve
+        o vínculo já feito; devolve `False`, silenciosamente, não uma
+        exceção. A garantia real do `UPDATE ... WHERE mensagem_id IS NULL` é
+        de Postgres; aqui só se prova que `FakeDatabase` espelha o mesmo
+        contrato do lado do Python que chama."""
+        m1 = self.db.registrar_mensagem(self.conversa.id, "out", "primeira")
+        m2 = self.db.registrar_mensagem(self.conversa.id, "out", "segunda")
+        self.assertTrue(self.db.vincular_rascunho(self.rascunho_id, m1))
+
+        segunda_tentativa = self.db.vincular_rascunho(self.rascunho_id, m2)
+        self.assertFalse(segunda_tentativa)
+        registro = self.db.rascunho(self.rascunho_id)
+        self.assertEqual(registro.mensagem_id, m1)
+
 
 class TesteReconciliacaoPeloEco(unittest.TestCase):
     """Caminho 2 (design.md): casamento EXATO de texto normalizado. A

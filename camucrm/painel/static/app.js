@@ -155,6 +155,18 @@ function tagTemperatura(temperatura) {
 async function renderizarFila(container) {
   const dados = await chamarApi("/fila");
   container.appendChild(el("h2", { texto: `Fila de hoje (${dados.itens.length})` }));
+  // Change `painel-mensagens-recentes-e-acoes-seguras`: `total` é a
+  // contagem real de conversas abertas, mesmo que o carregamento interno
+  // (`_carregar_candidatos`) tenha cortado antes de montar a fila — avisa o
+  // operador que existe mais conversa aberta do que a fila processou.
+  if (typeof dados.total === "number" && dados.total > dados.itens.length) {
+    container.appendChild(
+      el("p", {
+        class: "aviso",
+        texto: `${dados.total} conversa(s) aberta(s) no total — corte de carregamento pode não ter processado todas`,
+      })
+    );
+  }
   if (dados.itens.length === 0) {
     container.appendChild(el("p", { class: "aviso", texto: "Fila vazia — nada a fazer hoje." }));
     return;
@@ -214,6 +226,22 @@ function planoDoDrop(coluna, funilDoBoard) {
 
 async function renderizarKanban(container) {
   const dados = await chamarApi("/kanban");
+  // Change `painel-mensagens-recentes-e-acoes-seguras`: `total` é a
+  // contagem real de conversas abertas — o carregamento interno corta em
+  // `LIMITE_CONVERSAS_PADRAO`, e o operador precisa saber quando isso
+  // aconteceu (soma dos cards nas colunas < total real).
+  const totalNosCards = dados.kanbans.reduce(
+    (soma, k) => soma + k.colunas.reduce((s, c) => s + c.cards.length, 0),
+    0
+  );
+  if (typeof dados.total === "number" && dados.total > totalNosCards) {
+    container.appendChild(
+      el("p", {
+        class: "aviso",
+        texto: `${dados.total} conversa(s) aberta(s) no total — só ${totalNosCards} exibida(s) (corte de carregamento)`,
+      })
+    );
+  }
   dados.kanbans.forEach((kanban) => {
     container.appendChild(el("h2", { texto: `Kanban — ${kanban.funil.toUpperCase()}` }));
     const board = el("div", { class: "kanban" });
@@ -750,6 +778,18 @@ function montarRascunho(rascunho) {
 async function renderizarMensagens(container, id) {
   const secao = el("div", { class: "secao" }, [el("h3", { texto: "Mensagens" })]);
   const dados = await chamarApi(`/conversas/${id}/mensagens`);
+  // Change `painel-mensagens-recentes-e-acoes-seguras`: sem `desde_id`, a
+  // API agora traz as mais RECENTES (requirement "Mensagens recentes
+  // aparecem por padrão") — `tem_mais` avisa quando a conversa tem mais
+  // mensagens do que as exibidas, para a tela nunca fingir estar completa.
+  if (dados.tem_mais) {
+    secao.appendChild(
+      el("p", {
+        class: "aviso",
+        texto: `mostrando as ${dados.mensagens.length} mais recentes de ${dados.total} — histórico mais antigo não exibido`,
+      })
+    );
+  }
   dados.mensagens.forEach((m) => {
     secao.appendChild(el("div", { class: `msg ${m.direcao}`, texto: m.texto }));
   });

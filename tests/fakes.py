@@ -222,15 +222,26 @@ class FakeDatabase:
 
     # -- superfície de Database -------------------------------------------
 
-    def get_conversa(self, conversa_id: int) -> Conversa | None:
+    def get_conversa(self, conversa_id: int, *, conn=None) -> Conversa | None:
         return self.conversas.get(conversa_id)
 
-    def set_tipo_contato(self, contato_id: int, tipo: str) -> None:
+    def get_conversa_for_update(self, conversa_id: int, conn=None) -> Conversa | None:
+        """Espelha `db.Database.get_conversa_for_update`: o fake não tem
+        conexão real nem trava de linha (não há concorrência de verdade
+        num dict Python single-thread) — a garantia real é provada contra
+        Postgres em `tests/integration/` (change
+        `painel-mensagens-recentes-e-acoes-seguras`). Existe aqui só para
+        `acoes.marcar_marco`/`acoes.mudar_funil_conversa` chamarem o mesmo
+        método com ou sem banco real.
+        """
+        return self.conversas.get(conversa_id)
+
+    def set_tipo_contato(self, contato_id: int, tipo: str, *, conn=None) -> None:
         contato = self.contatos.get(contato_id)
         if contato is not None:
             contato.tipo = tipo
 
-    def set_funil_conversa(self, conversa_id: int, funil: str) -> None:
+    def set_funil_conversa(self, conversa_id: int, funil: str, *, conn=None) -> None:
         conversa = self.conversas.get(conversa_id)
         if conversa is not None:
             conversa.funil = funil
@@ -295,6 +306,17 @@ class FakeDatabase:
         return [
             c for c in self.conversas.values() if c.resultado is None and passa(c.id)
         ][:limite]
+
+    def contar_conversas_abertas(
+        self, *, incluir_teste: bool = False, apenas_teste: bool = False
+    ) -> int:
+        """Espelha `db.Database.contar_conversas_abertas` (change
+        `painel-mensagens-recentes-e-acoes-seguras`): total real, sem o corte
+        de `limite` que `listar_conversas_abertas` sozinha aplica."""
+        passa = self._filtro_teste(incluir_teste=incluir_teste, apenas_teste=apenas_teste)
+        return sum(
+            1 for c in self.conversas.values() if c.resultado is None and passa(c.id)
+        )
 
     @contextmanager
     def transacao(self):
@@ -381,7 +403,7 @@ class FakeDatabase:
 
     def gravar_evento_estagio(
         self, conversa_id, de, para, *, origem="live", motivo=None, em=None,
-        causada_por="cliente",
+        causada_por="cliente", conn=None,
     ):
         self.eventos.append(
             {"conversa_id": conversa_id, "de": de, "para": para,
@@ -507,7 +529,7 @@ class FakeDatabase:
         ]
         return sorted(linhas, key=lambda o: o.em)
 
-    def atualizar_estado_conversa(self, conversa_id, **campos):
+    def atualizar_estado_conversa(self, conversa_id, *, conn=None, **campos):
         # Espelha o `GREATEST` de `db.py`: o watermark de idempotência nunca
         # regride, mesmo que o chamador passe um id menor que o já gravado
         # (processamento concorrente/fora de ordem) — ver docstring do módulo.
@@ -581,7 +603,7 @@ class FakeDatabase:
                 contagem[numero] = [total, com_retorno + (1 if teve_retorno else 0)]
         return {numero: tuple(v) for numero, v in contagem.items()}
 
-    def registrar_marco(self, conversa_id, marco, *, por=None):
+    def registrar_marco(self, conversa_id, marco, *, por=None, conn=None):
         self.marcos.setdefault(conversa_id, set()).add(marco)
         self.marcos_por.setdefault(conversa_id, {})[marco] = (
             datetime.now(timezone.utc), por,
@@ -597,7 +619,7 @@ class FakeDatabase:
             else None
         )
 
-    def marcos_da_conversa(self, conversa_id: int) -> set[str]:
+    def marcos_da_conversa(self, conversa_id: int, *, conn=None) -> set[str]:
         return set(self.marcos.get(conversa_id, set()))
 
     def marcos_detalhados(self, conversa_id: int) -> list[MarcoRegistro]:
@@ -607,7 +629,7 @@ class FakeDatabase:
         ]
         return sorted(linhas, key=lambda m: m.em)
 
-    def registrar_correcao(self, conversa_id, campo, antes, depois, *, por=None):
+    def registrar_correcao(self, conversa_id, campo, antes, depois, *, por=None, conn=None):
         self.correcoes.append(
             {"id": self._novo_id(), "conversa_id": conversa_id, "campo": campo,
              "antes": antes, "depois": depois, "por": por,
@@ -661,19 +683,40 @@ class FakeDatabase:
 
     def listar_mensagens_registradas(
         self, *, conversa_id: int | None = None, desde_id: int | None = None,
-        limite: int = 200,
+        antes_de: int | None = None, limite: int = 200, mais_recentes: bool = True,
     ) -> list[MensagemRegistro]:
+        """Espelha `db.Database.listar_mensagens_registradas` (change
+        `painel-mensagens-recentes-e-acoes-seguras`): mesmos três modos —
+        `desde_id` (catch-up incremental, inalterado), `mais_recentes=True`
+        sem `desde_id` (novo padrão: as `limite` mais recentes, opcionalmente
+        antes de `antes_de`), `mais_recentes=False` (comportamento antigo,
+        desde o início — usado por `summaries`/eval)."""
         todas = []
         for c_id, linhas in self.mensagens.items():
             if conversa_id is not None and c_id != conversa_id:
                 continue
             for identificador, direcao, texto, enviada_em in linhas:
-                if identificador > (desde_id or 0):
-                    todas.append(
-                        MensagemRegistro(identificador, c_id, direcao, texto, enviada_em)
-                    )
+                todas.append(
+                    MensagemRegistro(identificador, c_id, direcao, texto, enviada_em)
+                )
         todas.sort(key=lambda m: m.id)
-        return todas[:limite]
+
+        if desde_id is not None:
+            return [m for m in todas if m.id > desde_id][:limite]
+
+        if not mais_recentes:
+            return todas[:limite]
+
+        if antes_de is not None:
+            todas = [m for m in todas if m.id < antes_de]
+        if limite <= 0:
+            return []
+        return todas[-limite:]
+
+    def contar_mensagens(self, conversa_id: int) -> int:
+        """Espelha `db.Database.contar_mensagens` (change
+        `painel-mensagens-recentes-e-acoes-seguras`)."""
+        return len(self.mensagens.get(conversa_id, []))
 
     def ultimas_mensagens_globais(
         self, limite: int = 8
@@ -805,6 +848,13 @@ class FakeDatabase:
                 raise ValueError(
                     f"mensagem {mensagem_id} já vinculada ao rascunho {outro.id}"
                 )
+        # Espelha `WHERE mensagem_id IS NULL` (change
+        # `painel-mensagens-recentes-e-acoes-seguras`): uma segunda tentativa
+        # de vincular o MESMO rascunho não sobrescreve um vínculo já feito —
+        # a corrida entre duas reconciliações perde em silêncio, sem exceção,
+        # exatamente como o `rowcount == 0` do `UPDATE` real.
+        if registro.mensagem_id is not None:
+            return False
         registro.mensagem_id = mensagem_id
         if estagio_no_envio is not None:
             registro.estagio_no_envio = estagio_no_envio

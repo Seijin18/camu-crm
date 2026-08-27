@@ -128,15 +128,22 @@ def get_kanban(funil: str | None = None, apenas_teste: bool = False, db: Databas
 
     `apenas_teste` (change `contatos-de-teste-isolados`): o toggle "Modo
     teste" do painel, propagado até `db.listar_conversas_abertas`.
+
+    `total` (change `painel-mensagens-recentes-e-acoes-seguras`, requirement
+    "Kanban e fila expõem contagem real"): a contagem REAL de conversas
+    abertas, mesmo quando `_carregar_candidatos` corta pelo
+    `LIMITE_CONVERSAS_PADRAO` — sem isto o operador não tinha como saber que
+    existem mais conversas abertas do que as exibidas nas colunas.
     """
     if funil is not None and funil not in FUNIS:
         return views.erro(f"funil inválido: {funil!r}", "§3")
 
     pares = _carregar_candidatos(db, apenas_teste=apenas_teste)
     cards = [views.card_conversa(c, e) for c, e in pares]
+    total = db.contar_conversas_abertas(apenas_teste=apenas_teste)
 
     funis = [funil] if funil else [B2C, B2B]
-    return {"kanbans": [views.montar_kanban(cards, f) for f in funis]}
+    return {"kanbans": [views.montar_kanban(cards, f) for f in funis], "total": total}
 
 
 @router.get("/conversas")
@@ -210,26 +217,46 @@ def detalhe_conversa(conversa_id: int, db: Database = Depends(_db)):
 def mensagens_da_conversa(
     conversa_id: int,
     desde_id: int | None = None,
+    antes_de: int | None = None,
     limite: int = 200,
     db: Database = Depends(_db),
 ):
+    """Change `painel-mensagens-recentes-e-acoes-seguras`: sem `desde_id`, o
+    padrão agora é trazer as `limite` mensagens MAIS RECENTES da conversa
+    (não mais as mais antigas) — requirement "Mensagens recentes aparecem
+    por padrão". `antes_de` é o cursor de paginação para trás ("antes desta
+    mensagem"), para a tela poder carregar mais histórico sob demanda.
+    `desde_id`, quando informado, continua servindo o catch-up incremental
+    do SSE (`painel/stream.py`) — comportamento inalterado, sempre em ordem
+    crescente a partir de um id conhecido.
+    """
     conversa = db.get_conversa(conversa_id)
     if conversa is None:
         return views.erro(f"conversa {conversa_id} não existe", None)
     mensagens = db.listar_mensagens_registradas(
-        conversa_id=conversa_id, desde_id=desde_id, limite=limite
+        conversa_id=conversa_id, desde_id=desde_id, antes_de=antes_de, limite=limite
     )
-    return views.serializar_mensagens(mensagens, desde_id=desde_id)
+    total = db.contar_mensagens(conversa_id)
+    return views.serializar_mensagens(mensagens, desde_id=desde_id, total=total)
 
 
 @router.get("/fila")
 def get_fila(limite: int = 10, apenas_teste: bool = False, db: Database = Depends(_db)):
     """Change `contatos-de-teste-isolados`: `apenas_teste` é o toggle "Modo
-    teste" do painel."""
+    teste" do painel.
+
+    `total` (change `painel-mensagens-recentes-e-acoes-seguras`, requirement
+    "Kanban e fila expõem contagem real"): a contagem REAL de conversas
+    abertas — a fila em si já é limitada por `limite` (prioridade dela, não
+    corte por volume), mas `_carregar_candidatos` corta antes disso pelo
+    `LIMITE_CONVERSAS_PADRAO`, e é esse corte que o operador precisa saber
+    que existe.
+    """
     pares = _carregar_candidatos(db, apenas_teste=apenas_teste)
     candidatos = [_candidato_de(c, e) for c, e in pares]
     itens = montar_fila(candidatos, limite=limite)
-    return {"itens": [views.item_fila_para_json(i) for i in itens]}
+    total = db.contar_conversas_abertas(apenas_teste=apenas_teste)
+    return {"itens": [views.item_fila_para_json(i) for i in itens], "total": total}
 
 
 @router.get("/stream")
@@ -726,8 +753,13 @@ def _indice_entrada_eval(entradas: list[dict[str, Any]], entrada_id: str) -> int
 
 
 def _mensagens_de_conversa_para_bruto(db: Database, conversa_id: int) -> list[dict[str, Any]]:
+    # `mais_recentes=False` (change `painel-mensagens-recentes-e-acoes-
+    # seguras`): `listar_mensagens_registradas` mudou o PADRÃO para "mais
+    # recentes" — o ground truth continua precisando da conversa inteira
+    # DESDE O INÍCIO (comentário de `LIMITE_MENSAGENS_EVAL` acima), não da
+    # cauda recente, então pede o comportamento antigo explicitamente.
     registros = db.listar_mensagens_registradas(
-        conversa_id=conversa_id, limite=LIMITE_MENSAGENS_EVAL
+        conversa_id=conversa_id, limite=LIMITE_MENSAGENS_EVAL, mais_recentes=False
     )
     return [
         {"direcao": m.direcao, "texto": m.texto, "enviada_em": m.enviada_em.isoformat()}

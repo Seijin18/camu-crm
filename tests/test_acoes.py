@@ -97,6 +97,41 @@ class TesteMarcarMarco(unittest.TestCase):
         with self.assertRaises(AcaoInvalidaError):
             marcar_marco(self.db, 999, "ganho", por="marcos")
 
+    def test_marco_contraditorio_e_recusado_sem_apagar_o_primeiro(self):
+        """Requirement "Ações concorrentes no mesmo card não corrompem
+        marcos_manuais": "ganho" e "perdido" são os únicos dois marcos que
+        se contradizem (§3) — a segunda marcação é recusada, e
+        `marcos_manuais` nunca fica com os dois juntos.
+
+        A trava real (`SELECT ... FOR UPDATE`) só serializa contra Postgres
+        de verdade — provada em `tests/integration/`. Aqui, contra
+        `FakeDatabase` (single-thread, sem concorrência real), o que se
+        prova é a metade determinística da garantia: mesmo quando a segunda
+        chamada CHEGA a rodar (a trava já teria serializado as duas antes
+        disso em produção), `_marco_conflitante` recusa antes de gravar.
+        """
+        conversa = self.db.criar_conversa(funil="b2c", estagio="S4")
+        marcar_marco(self.db, conversa.id, "ganho", por="marcos")
+        with self.assertRaises(AcaoInvalidaError):
+            marcar_marco(self.db, conversa.id, "perdido", por="marcos")
+        self.assertEqual(self.db.marcos_da_conversa(conversa.id), {"ganho"})
+        self.assertEqual(self.db.get_conversa(conversa.id).resultado, "ganho")
+
+    def test_marco_contraditorio_na_ordem_inversa_tambem_e_recusado(self):
+        conversa = self.db.criar_conversa(funil="b2c", estagio="S4")
+        marcar_marco(self.db, conversa.id, "perdido", por="marcos")
+        with self.assertRaises(AcaoInvalidaError):
+            marcar_marco(self.db, conversa.id, "ganho", por="marcos")
+        self.assertEqual(self.db.marcos_da_conversa(conversa.id), {"perdido"})
+        self.assertEqual(self.db.get_conversa(conversa.id).resultado, "perdido")
+
+    def test_mesmo_marco_repetido_nao_e_contraditorio_consigo(self):
+        """"Ganho" de novo não conflita com "ganho" — só o OPOSTO é recusado."""
+        conversa = self.db.criar_conversa(funil="b2c", estagio="S4")
+        marcar_marco(self.db, conversa.id, "ganho", por="marcos")
+        marcar_marco(self.db, conversa.id, "ganho", por="marcos")
+        self.assertEqual(self.db.marcos_da_conversa(conversa.id), {"ganho"})
+
 
 class TesteMudarFunilConversa(unittest.TestCase):
     def setUp(self):
@@ -119,6 +154,17 @@ class TesteMudarFunilConversa(unittest.TestCase):
         atualizada = self.db.get_conversa(conversa.id)
         self.assertEqual(atualizada.funil, "b2b")
         self.assertEqual(self.db.contatos[conversa.contato_id].tipo, "b2b")
+
+    def test_mudanca_de_funil_persiste_temperatura(self):
+        """Requirement "mudar_funil_conversa persiste temperatura": reusa
+        `recalcular(persistir=True)`, não um `UPDATE` parcial que só toca
+        `estagio` — a temperatura fica correta sem esperar a próxima
+        mensagem chegar."""
+        conversa = self.db.criar_conversa(funil="b2c", estagio="S0")
+        self.assertIsNone(conversa.temperatura)
+        mudar_funil_conversa(self.db, conversa.id, "b2b", por="marcos")
+        atualizada = self.db.get_conversa(conversa.id)
+        self.assertIsNotNone(atualizada.temperatura)
 
     def test_mesmo_funil_nao_grava_correcao(self):
         conversa = self.db.criar_conversa(funil="b2c", estagio="S0")
