@@ -183,7 +183,37 @@ main {
   padding: 0.5rem;
   margin-bottom: 0.4rem;
   font-size: 0.8rem;
-  cursor: not-allowed; /* sem drag habilitado neste change */
+  cursor: grab;
+}
+
+.card.arrastando {
+  opacity: 0.4;
+}
+
+/* Coluna derivada (§3): nunca aceita drop, mesmo com o servidor recusando
+ * de novo — o cursor "not-allowed" é só a primeira camada de feedback. */
+.coluna.derivada .card {
+  cursor: default;
+}
+
+.coluna.alvo-valido {
+  outline: 2px dashed var(--acento);
+  outline-offset: -2px;
+}
+
+.coluna.alvo-invalido {
+  outline: 2px dashed var(--quente);
+  outline-offset: -2px;
+  cursor: not-allowed;
+}
+
+.kanban-erro {
+  background: var(--quente);
+  color: white;
+  padding: 0.5rem 0.8rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  margin-bottom: 0.6rem;
 }
 
 .card .nome {

@@ -16,6 +16,7 @@
  */
 
 const CHAVE_TOKEN = "camu_painel_token";
+const CHAVE_OPERADOR = "camu_painel_operador";
 
 function obterToken() {
   try {
@@ -33,6 +34,22 @@ function salvarToken(valor) {
   }
 }
 
+function obterOperador() {
+  try {
+    return localStorage.getItem(CHAVE_OPERADOR) || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function salvarOperador(valor) {
+  try {
+    localStorage.setItem(CHAVE_OPERADOR, valor);
+  } catch (e) {
+    /* idem obterToken/salvarToken. */
+  }
+}
+
 async function chamarApi(caminho) {
   const resposta = await fetch(`/api${caminho}`, {
     headers: { "X-Camu-Token": obterToken() },
@@ -44,6 +61,29 @@ async function chamarApi(caminho) {
     throw erro;
   }
   return corpo;
+}
+
+/**
+ * POST de uma ação humana (marco, funil, correção — change `acoes-no-painel`).
+ * Mesmo formato de erro de `chamarApi`: `erro.regra` carrega a seção citada
+ * pelo servidor (ex.: "§3") quando a ação é recusada com 422.
+ */
+async function chamarApiEscrever(caminho, corpo) {
+  const resposta = await fetch(`/api${caminho}`, {
+    method: "POST",
+    headers: {
+      "X-Camu-Token": obterToken(),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(corpo),
+  });
+  const dados = await resposta.json();
+  if (!resposta.ok) {
+    const erro = new Error(dados.erro || `erro HTTP ${resposta.status}`);
+    erro.regra = dados.regra;
+    throw erro;
+  }
+  return dados;
 }
 
 function el(tag, props, filhos) {
@@ -96,6 +136,44 @@ async function renderizarFila(container) {
   });
 }
 
+// Coluna de marco -> marco a gravar (§3: as únicas 5 marcadas à mão).
+// SX/PX (terminal) usam o mesmo marco "perdido" — §3 diz que ele vale nos
+// dois funis; S6 usa "ganho" pela mesma razão.
+const ESTAGIO_PARA_MARCO = {
+  S6: "ganho",
+  SX: "perdido",
+  P5: "consignacao_assinada",
+  P6: "primeira_reposicao",
+  PX: "perdido",
+};
+
+// Origem do drag em curso (id do card + funil do kanban de onde ele saiu).
+// Variável de módulo, não `dataTransfer.getData`: alguns navegadores só
+// deixam ler o payload no `drop`, não no `dragover`, e é no `dragover` que
+// a coluna precisa saber se pinta o alvo como válido ou recusado.
+let origemArraste = null;
+
+function mostrarErroKanban(container, mensagem) {
+  const existente = container.querySelector(".kanban-erro");
+  if (existente) existente.remove();
+  container.insertBefore(el("div", { class: "kanban-erro", texto: mensagem }), container.firstChild);
+}
+
+/** O que um drop nesta coluna faria: mudar funil, marcar marco, ou nada. */
+function planoDoDrop(coluna, funilDoBoard) {
+  if (!origemArraste) return { valido: false };
+  if (origemArraste.funil !== funilDoBoard) {
+    // Card veio do outro kanban: qualquer coluna aqui serve de alvo — o
+    // servidor recalcula o estágio a partir dos fatos já gravados, a coluna
+    // de destino é só onde o operador soltou o card.
+    return { valido: true, tipo: "funil" };
+  }
+  if (coluna.aceita_drop) {
+    return { valido: true, tipo: "marco", marco: ESTAGIO_PARA_MARCO[coluna.estagio] };
+  }
+  return { valido: false };
+}
+
 async function renderizarKanban(container) {
   const dados = await chamarApi("/kanban");
   dados.kanbans.forEach((kanban) => {
@@ -112,16 +190,76 @@ async function renderizarKanban(container) {
         filhos.push(el("div", { class: "motivo-recusa", texto: coluna.motivo_recusa }));
       }
       coluna.cards.forEach((card) => {
-        const cardEl = el("div", { class: "card" }, [
+        const cardEl = el("div", { class: "card", draggable: "true" }, [
           el("span", { class: "nome", texto: card.nome }),
           el("span", { class: "sinal", texto: card.sinal }),
         ]);
         cardEl.addEventListener("click", () => {
           window.location.hash = `#/conversas/${card.id}`;
         });
+        cardEl.addEventListener("dragstart", (evento) => {
+          origemArraste = { id: card.id, funil: kanban.funil };
+          cardEl.classList.add("arrastando");
+          evento.dataTransfer.effectAllowed = "move";
+          // Payload no `dataTransfer` também, por completude — o drop lê
+          // `origemArraste`, que sobrevive mesmo nos navegadores que só
+          // liberam `getData` no próprio evento de drop.
+          evento.dataTransfer.setData("text/plain", String(card.id));
+        });
+        cardEl.addEventListener("dragend", () => {
+          cardEl.classList.remove("arrastando");
+          origemArraste = null;
+        });
         filhos.push(cardEl);
       });
-      board.appendChild(el("div", { class: classes }, filhos));
+
+      const colunaEl = el("div", { class: classes }, filhos);
+      colunaEl.addEventListener("dragover", (evento) => {
+        const plano = planoDoDrop(coluna, kanban.funil);
+        if (!plano.valido && !origemArraste) return; // nada sendo arrastado
+        evento.preventDefault(); // permite o drop mesmo quando será recusado
+        colunaEl.classList.toggle("alvo-valido", plano.valido);
+        colunaEl.classList.toggle("alvo-invalido", !plano.valido);
+      });
+      colunaEl.addEventListener("dragleave", () => {
+        colunaEl.classList.remove("alvo-valido", "alvo-invalido");
+      });
+      colunaEl.addEventListener("drop", async (evento) => {
+        evento.preventDefault();
+        colunaEl.classList.remove("alvo-valido", "alvo-invalido");
+        const origem = origemArraste;
+        origemArraste = null;
+        if (!origem) return;
+        const plano = planoDoDrop(coluna, kanban.funil);
+        if (!plano.valido) {
+          mostrarErroKanban(
+            container,
+            coluna.motivo_recusa || "§3: esta coluna não aceita marcação manual"
+          );
+          return;
+        }
+        const por = obterOperador();
+        try {
+          if (plano.tipo === "marco") {
+            await chamarApiEscrever(`/conversas/${origem.id}/marcos`, {
+              marco: plano.marco,
+              por,
+            });
+          } else {
+            await chamarApiEscrever(`/conversas/${origem.id}/funil`, {
+              funil: kanban.funil,
+              por,
+            });
+          }
+          await renderizarRota(); // recarrega o kanban com o estado novo
+        } catch (erro) {
+          mostrarErroKanban(
+            container,
+            `${erro.message}${erro.regra ? ` (${erro.regra})` : ""}`
+          );
+        }
+      });
+      board.appendChild(colunaEl);
     });
     container.appendChild(board);
   });
@@ -450,8 +588,10 @@ async function conectarStream() {
 
 function iniciar() {
   document.getElementById("campo-token").value = obterToken();
+  document.getElementById("campo-operador").value = obterOperador();
   document.getElementById("botao-salvar-token").addEventListener("click", () => {
     salvarToken(document.getElementById("campo-token").value.trim());
+    salvarOperador(document.getElementById("campo-operador").value.trim());
     renderizarRota();
   });
   document.getElementById("botao-atualizar").addEventListener("click", renderizarRota);

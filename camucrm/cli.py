@@ -18,7 +18,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import config, metrics
+from . import acoes, config, metrics
+from .acoes import AcaoInvalidaError
 from .backfill import extrair_historico, importar_conversas
 from .db import Database, MARCOS_MANUAIS, TetoFollowupError
 from .drafts import RascunhoInvalidoError, gerar as gerar_rascunho
@@ -26,9 +27,9 @@ from .extraction import FATOS_BOOLEANOS
 from .ingest import ingerir
 from .extraction.extractor import Extrator
 from .llm import LlmIndisponivelError, criar_llm
-from .pipeline import carregar_sinais, recalcular, recalcular_todas
+from .pipeline import recalcular, recalcular_todas
 from .rules.fila import Candidato, formatar_fila, montar_fila
-from .rules.estagio import mudar_funil, sugere_b2b
+from .rules.estagio import sugere_b2b
 from .rules.temperatura import classificar
 from .taxonomia import BOLA_CAMU, FILA_TAMANHO_MAXIMO, estagio_label
 from .transport import Destinatario, criar_transporte
@@ -201,18 +202,23 @@ def cmd_followup(args) -> int:
 
 
 def cmd_marcar(args) -> int:
+    """Marca um marco manual. Sequência real em `acoes.marcar_marco`.
+
+    A CLI e o painel (drop numa coluna de marco no kanban) chamam a mesma
+    função — nenhum dos dois caminhos reimplementa a validação nem os
+    efeitos (`acoes-humanas`, requirement "Ação humana compartilhada entre
+    CLI e painel").
+    """
     quem = _operador(args)
     banco = _db()
-    banco.registrar_marco(args.conversa, args.marco, por=quem)
-    conversa = banco.get_conversa(args.conversa)
-    if conversa is None:
-        raise SystemExit(f"conversa {args.conversa} não existe")
-    if args.marco == "perdido":
-        banco.atualizar_estado_conversa(conversa.id, resultado="perdido")
-    elif args.marco == "ganho":
-        banco.atualizar_estado_conversa(conversa.id, resultado="ganho")
-    estado = recalcular(banco, conversa)
-    print(f"#{conversa.id}: marco `{args.marco}` por {quem} -> estágio {estado.estagio}")
+    try:
+        resultado = acoes.marcar_marco(banco, args.conversa, args.marco, por=quem)
+    except AcaoInvalidaError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(
+        f"#{resultado.conversa_id}: marco `{resultado.marco}` por {quem} "
+        f"-> estágio {resultado.estado.estagio}"
+    )
     return 0
 
 
@@ -233,29 +239,22 @@ def cmd_tipo(args) -> int:
         print(f"#{conversa.id} já é {args.tipo.upper()}; nada mudou.")
         return 0
 
-    anterior = conversa.funil
-    banco.set_tipo_contato(conversa.contato_id, args.tipo)
-    banco.set_funil_conversa(conversa.id, args.tipo)
-    # A reclassificação é uma correção (§7): o padrão delas mostra o que o
-    # sistema não está vendo na hora de classificar.
-    banco.registrar_correcao(conversa.id, "funil", anterior, args.tipo, por=quem)
+    try:
+        resultado = acoes.mudar_funil_conversa(banco, args.conversa, args.tipo, por=quem)
+    except AcaoInvalidaError as exc:
+        raise SystemExit(str(exc)) from exc
 
-    atualizada = banco.get_conversa(conversa.id)
-    assert atualizada is not None
-    fatos = banco.fatos_da_conversa(conversa.id)
-    sinais = carregar_sinais(banco, atualizada)
-    movimento = mudar_funil(atualizada.estagio, fatos, sinais)
-    if movimento:
-        banco.gravar_evento_estagio(
-            conversa.id, movimento.de, movimento.para, motivo=movimento.motivo
-        )
-        banco.atualizar_estado_conversa(conversa.id, estagio=movimento.para)
+    if resultado.movimento:
         print(
-            f"#{conversa.id} {conversa.nome_contato}: {anterior.upper()} -> "
-            f"{args.tipo.upper()}, estágio {movimento.de} -> {movimento.para}"
+            f"#{conversa.id} {conversa.nome_contato}: {resultado.anterior.upper()} -> "
+            f"{resultado.novo.upper()}, estágio {resultado.movimento.de} -> "
+            f"{resultado.movimento.para}"
         )
     else:
-        print(f"#{conversa.id} {conversa.nome_contato}: {anterior.upper()} -> {args.tipo.upper()}")
+        print(
+            f"#{conversa.id} {conversa.nome_contato}: {resultado.anterior.upper()} -> "
+            f"{resultado.novo.upper()}"
+        )
     return 0
 
 

@@ -13,8 +13,16 @@ de conversas abertas de verdade fica muito abaixo disso, e otimizar cedo
 trocaria simplicidade por um problema que ainda não existe.
 
 Nenhuma rota tem "enviar" no path, e este módulo não importa
-`camucrm.transport` — o painel só lê (ver `tests/test_painel_api.py::
-test_nao_existe_rota_de_envio`, que confere isso por AST, não por grep).
+`camucrm.transport` — o painel não manda mensagem nenhuma (ver
+`tests/test_painel_api.py::test_nenhum_path_contem_enviar` e
+`test_nenhum_modulo_do_painel_importa_transport`, que conferem isso por AST,
+não por grep).
+
+**Change `acoes-no-painel`**: as três rotas de escrita abaixo (marcos, funil,
+correções) existem para o kanban ter drag-and-drop. Nenhuma delas implementa a
+sequência de efeitos aqui — todas chamam `camucrm.acoes`, o mesmo módulo que
+`cli.cmd_marcar`/`cli.cmd_tipo` chamam, para os dois caminhos nunca divergirem
+(ver `camucrm/acoes.py`).
 """
 
 from __future__ import annotations
@@ -22,9 +30,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
-from .. import metrics
+from .. import acoes, metrics
 from ..db import Database
 from ..pipeline import recalcular
 from ..rules.fila import Candidato, montar_fila
@@ -226,3 +235,86 @@ def get_metricas(dias: int = 30, db: Database = Depends(_db)):
         metrics.tempo_por_estagio(db),
         metrics.saude_taxonomia(db, desde=desde),
     )
+
+
+# --------------------------------------------------------------------------
+# Rotas de escrita (change `acoes-no-painel`) — sempre via `camucrm.acoes`
+# --------------------------------------------------------------------------
+#
+# `AcaoInvalidaError` (e sua subclasse `MarcoNaoPermitidoError`) viram HTTP
+# 422 com `{"erro", "regra"}` — diferente das rotas de leitura acima, que
+# devolvem 200 com corpo de erro para "conversa não existe" (padrão já
+# fixado em `test_conversa_inexistente_404_shape`). Aqui a diferença importa:
+# 422 é o contrato que o requirement "Coluna derivada recusa drop com 422"
+# exige, e a mesma fôrma serve para qualquer outra ação recusada por este
+# router — nenhum marco fica meio-gravado.
+
+
+class MarcoBody(BaseModel):
+    marco: str
+    por: str | None = None
+
+
+class FunilBody(BaseModel):
+    funil: str
+    por: str | None = None
+
+
+class CorrecaoBody(BaseModel):
+    campo: str
+    antes: str | None = None
+    depois: str | None = None
+    por: str | None = None
+
+
+@router.post("/conversas/{conversa_id}/marcos")
+def marcar_marco(conversa_id: int, corpo: MarcoBody, db: Database = Depends(_db)):
+    """Drop numa coluna de marco do kanban (S6/SX/P5/P6/PX).
+
+    Delega inteiro a `acoes.marcar_marco` — mesma função que `cli.cmd_marcar`
+    chama, para os dois caminhos nunca produzirem estados diferentes.
+    """
+    try:
+        resultado = acoes.marcar_marco(db, conversa_id, corpo.marco, por=corpo.por)
+    except acoes.AcaoInvalidaError as exc:
+        regra = getattr(exc, "regra", None)
+        return JSONResponse(status_code=422, content=views.erro(str(exc), regra))
+    conversa = db.get_conversa(conversa_id)
+    return {"ok": True, "card": views.card_conversa(conversa, resultado.estado)}
+
+
+@router.post("/conversas/{conversa_id}/funil")
+def mudar_funil(conversa_id: int, corpo: FunilBody, db: Database = Depends(_db)):
+    """Arrastar um card entre os dois kanbans do funil.
+
+    Delega a `acoes.mudar_funil_conversa`, que grava a correção (§7) sempre
+    que o funil muda de verdade — arrastar de volta ao mesmo funil não conta
+    como mudança e não grava nada, mesmo comportamento de `cli.cmd_tipo`.
+    """
+    try:
+        resultado = acoes.mudar_funil_conversa(db, conversa_id, corpo.funil, por=corpo.por)
+    except acoes.AcaoInvalidaError as exc:
+        regra = getattr(exc, "regra", None)
+        return JSONResponse(status_code=422, content=views.erro(str(exc), regra))
+    conversa = db.get_conversa(conversa_id)
+    estado = recalcular(db, conversa, persistir=False)
+    return {"ok": True, "card": views.card_conversa(conversa, estado)}
+
+
+@router.post("/conversas/{conversa_id}/correcoes")
+def registrar_correcao(conversa_id: int, corpo: CorrecaoBody, db: Database = Depends(_db)):
+    """Correção humana avulsa, gravada sempre (§7).
+
+    Caminho genérico para qualquer campo corrigido na tela de detalhe — não
+    passa pela reclassificação de funil de `acoes.mudar_funil_conversa`
+    (essa é a rota `/funil` acima); esta é só o registro em `correcoes`.
+    """
+    conversa = db.get_conversa(conversa_id)
+    if conversa is None:
+        return JSONResponse(
+            status_code=422, content=views.erro(f"conversa {conversa_id} não existe", None)
+        )
+    db.registrar_correcao(
+        conversa_id, corpo.campo, corpo.antes, corpo.depois, por=corpo.por
+    )
+    return {"ok": True}

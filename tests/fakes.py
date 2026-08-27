@@ -182,6 +182,16 @@ class FakeDatabase:
     def get_conversa(self, conversa_id: int) -> Conversa | None:
         return self.conversas.get(conversa_id)
 
+    def set_tipo_contato(self, contato_id: int, tipo: str) -> None:
+        contato = self.contatos.get(contato_id)
+        if contato is not None:
+            contato.tipo = tipo
+
+    def set_funil_conversa(self, conversa_id: int, funil: str) -> None:
+        conversa = self.conversas.get(conversa_id)
+        if conversa is not None:
+            conversa.funil = funil
+
     def listar_conversas_abertas(self, limite: int = 500) -> list[Conversa]:
         return [c for c in self.conversas.values() if c.resultado is None][:limite]
 
