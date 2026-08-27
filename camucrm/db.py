@@ -249,6 +249,29 @@ class RascunhoRegistro:
     estagio_no_envio: str | None
 
 
+@dataclass
+class ResumoConversa:
+    """Uma linha de `resumos_conversa` (change `resumo-conversa`).
+
+    FOLHA do grafo — ver docstring de `camucrm/summaries.py`. `estagio` e
+    `temperatura` são copiados no momento da geração (mesma convenção de
+    `RascunhoRegistro`): o que a tela mostra é "o resumo foi escrito a
+    partir DESTE estado", não o estado atual, que pode já ter mudado.
+    """
+
+    id: int
+    conversa_id: int
+    resumo: str | None
+    proximo_passo: str | None
+    ultima_mensagem_id: int | None
+    estagio: str
+    temperatura: str
+    prompt_versao: str
+    modelo: str | None
+    gerado_em: datetime
+    gerado_por: str | None
+
+
 class TetoFollowupError(RuntimeError):
     """Tentativa de furar o teto de 2 follow-ups (§6).
 
@@ -490,6 +513,40 @@ CREATE INDEX IF NOT EXISTS rascunhos_conversa_idx ON rascunhos (conversa_id, ger
 -- avançou o estágio" de um jeito plausível e errado.
 CREATE UNIQUE INDEX IF NOT EXISTS rascunhos_mensagem_unica
     ON rascunhos (mensagem_id) WHERE mensagem_id IS NOT NULL;
+
+-- ADIÇÃO (change `resumo-conversa`): terceira superfície de LLM do sistema
+-- (ver docstring de `camucrm/summaries.py` e a seção "A divisão que não pode
+-- ser quebrada (§1)" do CLAUDE.md para a divergência registrada). FOLHA do
+-- grafo: nenhuma regra de `camucrm/rules/` lê esta tabela, e apagá-la
+-- inteira não muda `estagio`/`temperatura`/fila de nenhuma conversa — é
+-- cache de leitura humana, não fonte de verdade.
+--
+-- `ultima_mensagem_id` é a fronteira do que o resumo viu: staleness é
+-- CONTAGEM de mensagens acima deste id (`Database.mensagens_desde`), não
+-- diferença de timestamp — uma conversa pode ficar dias sem mensagem nova
+-- sem que o resumo fique desatualizado por isso.
+CREATE TABLE IF NOT EXISTS resumos_conversa (
+    id                  SERIAL PRIMARY KEY,
+    conversa_id         INTEGER NOT NULL REFERENCES conversas(id) ON DELETE CASCADE,
+    resumo              TEXT,
+    proximo_passo       TEXT,
+    ultima_mensagem_id  INTEGER REFERENCES mensagens(id) ON DELETE SET NULL,
+    estagio             VARCHAR(4) NOT NULL,
+    temperatura         VARCHAR(16) NOT NULL,
+    prompt_versao       VARCHAR(16) NOT NULL,
+    modelo              VARCHAR(64),
+    gerado_em           TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    gerado_por          VARCHAR(48)
+);
+CREATE INDEX IF NOT EXISTS resumos_conversa_conversa_idx
+    ON resumos_conversa (conversa_id, gerado_em);
+-- Clicar "gerar"/"regerar" duas vezes na mesma fronteira (mesma última
+-- mensagem vista, mesma versão de prompt) não duplica linha — vira
+-- `ON CONFLICT ... DO UPDATE` em `Database.gravar_resumo`.
+-- `coalesce(ultima_mensagem_id, 0)` porque NULL != NULL em SQL não
+-- bloquearia duas conversas ainda sem mensagem nenhuma.
+CREATE UNIQUE INDEX IF NOT EXISTS resumos_conversa_cursor_idx
+    ON resumos_conversa (conversa_id, coalesce(ultima_mensagem_id, 0), prompt_versao);
 """
 
 # §12, extensão da purga (change `rascunho-registrado`): texto escrito para
@@ -1475,6 +1532,91 @@ class Database:
                 )
                 return [RascunhoRegistro(*row) for row in cur.fetchall()]
 
+    # -- resumos (§1 divergência registrada, change `resumo-conversa`) ----
+
+    _RESUMO_SELECT = """
+        SELECT id, conversa_id, resumo, proximo_passo, ultima_mensagem_id,
+               estagio, temperatura, prompt_versao, modelo, gerado_em,
+               gerado_por
+          FROM resumos_conversa
+    """
+
+    def gravar_resumo(
+        self,
+        conversa_id: int,
+        *,
+        resumo: str | None,
+        proximo_passo: str | None,
+        ultima_mensagem_id: int | None,
+        estagio: str,
+        temperatura: str,
+        prompt_versao: str,
+        modelo: str | None = None,
+        gerado_por: str | None = None,
+    ) -> int:
+        """Grava (ou substitui) o resumo na fronteira `(conversa_id,
+        ultima_mensagem_id, prompt_versao)`. `ON CONFLICT ... DO UPDATE`
+        cobre os dois casos que a rota precisa: clicar "gerar" duas vezes
+        sem mensagem nova (mesma fronteira, no-op de conteúdo) e
+        `?forcar=true` (mesma fronteira, conteúdo substituído de propósito).
+        Fronteira nova (mensagem nova chegou) sempre insere linha nova — não
+        há conflito de índice para apagar.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO resumos_conversa (
+                        conversa_id, resumo, proximo_passo, ultima_mensagem_id,
+                        estagio, temperatura, prompt_versao, modelo, gerado_por
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (conversa_id, coalesce(ultima_mensagem_id, 0), prompt_versao)
+                    DO UPDATE SET
+                        resumo = EXCLUDED.resumo,
+                        proximo_passo = EXCLUDED.proximo_passo,
+                        estagio = EXCLUDED.estagio,
+                        temperatura = EXCLUDED.temperatura,
+                        modelo = EXCLUDED.modelo,
+                        gerado_em = now(),
+                        gerado_por = EXCLUDED.gerado_por
+                    RETURNING id
+                    """,
+                    (
+                        conversa_id, resumo, proximo_passo, ultima_mensagem_id,
+                        estagio, temperatura, prompt_versao, modelo, gerado_por,
+                    ),
+                )
+                return cur.fetchone()[0]
+
+    def resumo_vigente(self, conversa_id: int, prompt_versao: str) -> ResumoConversa | None:
+        """O resumo mais recente para esta conversa e versão de prompt —
+        cache que a rota `POST /api/conversas/{id}/resumo` confere ANTES de
+        chamar o LLM (requirement "Cache por versão de prompt e mensagem").
+        Nunca chama LLM: leitura pura.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"{self._RESUMO_SELECT} WHERE conversa_id = %s AND prompt_versao = %s "
+                    "ORDER BY coalesce(ultima_mensagem_id, 0) DESC, gerado_em DESC LIMIT 1",
+                    (conversa_id, prompt_versao),
+                )
+                row = cur.fetchone()
+                return ResumoConversa(*row) if row else None
+
+    def mensagens_desde(self, conversa_id: int, mensagem_id: int | None) -> int:
+        """Quantas mensagens da conversa têm id maior que `mensagem_id` —
+        a staleness do resumo (§8 mesma lógica: contagem, não timestamp).
+        `mensagem_id=None` conta todas as mensagens da conversa.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM mensagens WHERE conversa_id = %s AND id > %s",
+                    (conversa_id, mensagem_id or 0),
+                )
+                return cur.fetchone()[0]
+
     # -- retenção (§12) ---------------------------------------------------
 
     def purgar_mensagens_antigas(self, meses: int = 12) -> int:
@@ -1492,6 +1634,14 @@ class Database:
         permanece. O `UPDATE` roda ANTES do `DELETE`: depois que a mensagem
         some, o `ON DELETE SET NULL` do FK já apagou o `mensagem_id` que
         identifica qual rascunho anonimizar.
+
+        Extensão do change `resumo-conversa`: `resumos_conversa.resumo`/
+        `proximo_passo` é prosa DERIVADA das mensagens do cliente — mesmo
+        conteúdo pessoal, mesmo critério de idade, mesmo motivo de rodar
+        ANTES do `DELETE` (a FK de `ultima_mensagem_id` também é
+        `ON DELETE SET NULL`). Diferente de `rascunhos` não há constraint de
+        forma exigindo texto não-nulo aqui, então o valor vira `NULL` direto
+        — sem placeholder.
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -1511,6 +1661,19 @@ class Database:
                        AND c.atualizado_em < now() - make_interval(months => %(meses)s)
                     """,
                     {"marca": TEXTO_RASCUNHO_PURGADO, "meses": meses},
+                )
+                cur.execute(
+                    """
+                    UPDATE resumos_conversa r
+                       SET resumo = NULL,
+                           proximo_passo = NULL
+                      FROM mensagens m
+                      JOIN conversas c ON c.id = m.conversa_id
+                     WHERE r.ultima_mensagem_id = m.id
+                       AND c.resultado IS NOT NULL
+                       AND c.atualizado_em < now() - make_interval(months => %(meses)s)
+                    """,
+                    {"meses": meses},
                 )
                 cur.execute(
                     """

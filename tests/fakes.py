@@ -25,6 +25,7 @@ from camucrm.db import (
     MensagemRegistro,
     ObjecaoRegistro,
     RascunhoRegistro,
+    ResumoConversa,
     TetoFollowupError,
     _normalizar_texto,
 )
@@ -140,6 +141,10 @@ class FakeDatabase:
         self.marcos_por: dict[int, dict[str, tuple[datetime, str | None]]] = {}
         # change `rascunho-registrado`.
         self.rascunhos: dict[int, RascunhoRegistro] = {}
+        # change `resumo-conversa`: chave é a fronteira (conversa_id,
+        # ultima_mensagem_id, prompt_versao) — mesma coisa que o índice único
+        # de `resumos_conversa` protege no banco real.
+        self.resumos: dict[int, ResumoConversa] = {}
         self._proximo_id = 1
         # Proxy de `conversas.atualizado_em` para `token_de_mudanca` (change
         # `painel-tempo-real`): o fake não guarda timestamp de atualização
@@ -606,3 +611,69 @@ class FakeDatabase:
         linhas = [r for r in self.rascunhos.values() if r.conversa_id == conversa_id]
         linhas.sort(key=lambda r: r.gerado_em, reverse=True)
         return linhas[:limite]
+
+    # -- resumos (change `resumo-conversa`) --------------------------------
+
+    def gravar_resumo(
+        self,
+        conversa_id,
+        *,
+        resumo,
+        proximo_passo,
+        ultima_mensagem_id,
+        estagio,
+        temperatura,
+        prompt_versao,
+        modelo=None,
+        gerado_por=None,
+    ) -> int:
+        """Espelha o `ON CONFLICT (conversa_id, coalesce(ultima_mensagem_id,
+        0), prompt_versao) DO UPDATE` do banco real: mesma fronteira
+        atualiza a linha existente em vez de duplicar.
+        """
+        fronteira = (conversa_id, ultima_mensagem_id or 0, prompt_versao)
+        for existente in self.resumos.values():
+            if (
+                existente.conversa_id,
+                existente.ultima_mensagem_id or 0,
+                existente.prompt_versao,
+            ) == fronteira:
+                existente.resumo = resumo
+                existente.proximo_passo = proximo_passo
+                existente.estagio = estagio
+                existente.temperatura = temperatura
+                existente.modelo = modelo
+                existente.gerado_em = datetime.now(timezone.utc)
+                existente.gerado_por = gerado_por
+                return existente.id
+        resumo_id = self._novo_id()
+        self.resumos[resumo_id] = ResumoConversa(
+            id=resumo_id,
+            conversa_id=conversa_id,
+            resumo=resumo,
+            proximo_passo=proximo_passo,
+            ultima_mensagem_id=ultima_mensagem_id,
+            estagio=estagio,
+            temperatura=temperatura,
+            prompt_versao=prompt_versao,
+            modelo=modelo,
+            gerado_em=datetime.now(timezone.utc),
+            gerado_por=gerado_por,
+        )
+        return resumo_id
+
+    def resumo_vigente(self, conversa_id: int, prompt_versao: str) -> ResumoConversa | None:
+        candidatos = [
+            r
+            for r in self.resumos.values()
+            if r.conversa_id == conversa_id and r.prompt_versao == prompt_versao
+        ]
+        if not candidatos:
+            return None
+        candidatos.sort(key=lambda r: ((r.ultima_mensagem_id or 0), r.gerado_em), reverse=True)
+        return candidatos[0]
+
+    def mensagens_desde(self, conversa_id: int, mensagem_id: int | None) -> int:
+        linhas = self.mensagens.get(conversa_id, [])
+        limite = mensagem_id or 0
+        return sum(1 for identificador, *_ in linhas if identificador > limite)

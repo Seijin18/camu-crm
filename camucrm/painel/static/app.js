@@ -407,6 +407,20 @@ async function renderizarDetalhe(container, id) {
   });
   container.appendChild(secaoObjecoes);
 
+  // Change `resumo-conversa`: correções (5) vêm ANTES de follow-ups (6) —
+  // "a ordem da tela é ela que ancora o humano em evidência" (design.md) —
+  // e as duas vêm antes do bloco de resumo (7), abaixo.
+  const secaoCorrecoes = el("div", { class: "secao" }, [el("h3", { texto: "Correções (§7)" })]);
+  detalhe.correcoes.forEach((c) => {
+    secaoCorrecoes.appendChild(
+      el("div", {
+        class: "linha",
+        texto: `${c.campo}: "${c.antes || ""}" → "${c.depois || ""}" (${c.por || "?"})`,
+      })
+    );
+  });
+  container.appendChild(secaoCorrecoes);
+
   const secaoFollowups = el("div", { class: "secao" }, [el("h3", { texto: "Follow-ups (§6)" })]);
   detalhe.followups.forEach((f) => {
     secaoFollowups.appendChild(
@@ -423,19 +437,86 @@ async function renderizarDetalhe(container, id) {
   });
   container.appendChild(secaoMarcos);
 
-  const secaoCorrecoes = el("div", { class: "secao" }, [el("h3", { texto: "Correções (§7)" })]);
-  detalhe.correcoes.forEach((c) => {
-    secaoCorrecoes.appendChild(
-      el("div", {
-        class: "linha",
-        texto: `${c.campo}: "${c.antes || ""}" → "${c.depois || ""}" (${c.por || "?"})`,
-      })
-    );
-  });
-  container.appendChild(secaoCorrecoes);
+  // Bloco 7 — só depois dos 6 blocos determinísticos acima. Visualmente
+  // distinto (classe `resumo-llm`): é a única prosa gerada por modelo na
+  // tela, e a tela precisa continuar inteiramente útil sem ela.
+  await renderizarResumo(container, id);
 
   await renderizarRascunhos(container, id);
   await renderizarMensagens(container, id);
+}
+
+/**
+ * Change `resumo-conversa`: terceira superfície de LLM (§1/CLAUDE.md,
+ * `camucrm/summaries.py`). `GET` só lê o cache — nunca gera; o botão
+ * Gerar/Regerar é a única coisa que chama `POST` (gasta cota, grava linha).
+ * Sem LLM configurado (ou cache vazio) a seção mostra "resumo não gerado" —
+ * os blocos 1-6 acima já são inteiramente úteis sozinhos.
+ */
+async function renderizarResumo(container, id) {
+  const secao = el("div", { class: "secao resumo-llm" }, [
+    el("h3", { texto: "Resumo (gerado por LLM)" }),
+  ]);
+  const areaResultado = el("div", { class: "resumo-conteudo" });
+
+  function montarConteudo(dados) {
+    areaResultado.textContent = "";
+    if (!dados.gerado) {
+      areaResultado.appendChild(
+        el("p", {
+          class: "aviso",
+          texto: dados.erro ? `resumo não gerado — ${dados.erro}` : "resumo não gerado",
+        })
+      );
+      return;
+    }
+    areaResultado.appendChild(el("p", { texto: dados.resumo }));
+    areaResultado.appendChild(
+      el("p", { class: "aviso", texto: `Próximo passo: ${dados.proximo_passo}` })
+    );
+    areaResultado.appendChild(
+      el("p", {
+        class: "aviso",
+        texto: `gerado por LLM (${dados.modelo || "?"}) · prompt v${dados.prompt_versao} · ` +
+          `há ${dados.mensagens_desde} mensagem(ns)`,
+      })
+    );
+  }
+
+  const cache = await chamarApi(`/conversas/${id}/resumo`);
+  montarConteudo(cache);
+  // Já existe um resumo: clicar de novo é pedido explícito de "Regerar" —
+  // `forcar=true` pula a checagem de cache. Sem resumo ainda, um `POST`
+  // sem `forcar` já gera (não há cache para a rota reaproveitar).
+  let jaGerado = Boolean(cache.gerado);
+
+  const botaoGerar = el("button", {
+    class: "secundario",
+    texto: jaGerado ? "Regerar" : "Gerar resumo",
+  });
+  botaoGerar.addEventListener("click", async () => {
+    botaoGerar.disabled = true;
+    const rotuloOriginal = botaoGerar.textContent;
+    botaoGerar.textContent = "Gerando (chama o LLM)…";
+    try {
+      const dados = await chamarApiEscrever(`/conversas/${id}/resumo`, {
+        por: obterOperador(),
+        forcar: jaGerado,
+      });
+      montarConteudo(dados);
+      jaGerado = Boolean(dados.gerado);
+      botaoGerar.textContent = jaGerado ? "Regerar" : "Gerar resumo";
+    } catch (erro) {
+      areaResultado.textContent = `Erro: ${erro.message}`;
+      botaoGerar.textContent = rotuloOriginal;
+    } finally {
+      botaoGerar.disabled = false;
+    }
+  });
+
+  secao.appendChild(botaoGerar);
+  secao.appendChild(areaResultado);
+  container.appendChild(secao);
 }
 
 /**

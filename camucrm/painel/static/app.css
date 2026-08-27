@@ -312,3 +312,16 @@ main {
   padding: 0.3rem 0.5rem;
   border-radius: 6px;
 }
+
+/* -- Resumo por LLM (§1/CLAUDE.md, change `resumo-conversa`) -------------- */
+/* Visualmente distinto de propósito: é a única prosa gerada por modelo na
+   tela de detalhe, e precisa ficar óbvio que não é dado bruto. */
+
+.resumo-llm {
+  border-left: 3px solid var(--acento);
+  padding-left: 0.75rem;
+}
+
+.resumo-conteudo {
+  margin-top: 0.4rem;
+}

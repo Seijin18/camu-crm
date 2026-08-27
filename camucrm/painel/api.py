@@ -23,6 +23,13 @@ correções) existem para o kanban ter drag-and-drop. Nenhuma delas implementa a
 sequência de efeitos aqui — todas chamam `camucrm.acoes`, o mesmo módulo que
 `cli.cmd_marcar`/`cli.cmd_tipo` chamam, para os dois caminhos nunca divergirem
 (ver `camucrm/acoes.py`).
+
+**Change `resumo-conversa`**: este módulo é um dos dois importadores
+autorizados de `camucrm.summaries` (o outro é `camucrm.cli`) — conjunto
+fechado, provado por `tests/test_summaries.py`. `POST
+/conversas/{id}/resumo` é a única rota que chama LLM para gerar resumo;
+`GET` é leitura pura do cache (nunca gera, requirement "Geração só ao
+clicar, nunca automática").
 """
 
 from __future__ import annotations
@@ -33,7 +40,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .. import acoes, config, metrics
+from .. import acoes, config, metrics, summaries
 from ..db import Database
 from ..drafts import PROMPT_VERSAO, RascunhoInvalidoError
 from ..drafts import gerar as gerar_rascunho
@@ -429,3 +436,99 @@ def registrar_escolha_rascunho(
         rascunho_id, escolhida=corpo.opcao, texto_final=corpo.texto_final, por=corpo.por
     )
     return views.rascunho_para_json(db.rascunho(rascunho_id))
+
+
+# --------------------------------------------------------------------------
+# Resumo (change `resumo-conversa`) — terceira superfície de LLM (ver
+# docstring de `camucrm/summaries.py` e CLAUDE.md/§1). `POST`, sempre: gera
+# gasta cota de LLM e grava linha; nunca `GET` (requirement "Geração só ao
+# clicar, nunca automática"). Cache é conferido ANTES de chamar o LLM
+# (requirement "Cache por versão de prompt e mensagem"); LLM indisponível ou
+# resumo inválido devolve 200 com `resumo: null`, nunca 500 (requirement
+# "Falha de LLM não derruba a tela").
+# --------------------------------------------------------------------------
+
+
+class GerarResumoBody(BaseModel):
+    por: str | None = None
+    forcar: bool = False
+
+
+def _montar_contexto_resumo(db: Database, conversa, estado) -> summaries.ContextoResumo:
+    historico = [(m.direcao, m.texto) for m in db.listar_mensagens(conversa.id)]
+    return summaries.ContextoResumo(
+        funil=conversa.funil,
+        estagio=estado.estagio,
+        temperatura=estado.temperatura,
+        sinal=estado.classificacao.sinal,
+        fatos=db.fatos_detalhados(conversa.id),
+        eventos=db.eventos_da_conversa(conversa.id),
+        objecoes=db.objecoes_da_conversa(conversa.id),
+        correcoes=db.correcoes_da_conversa(conversa.id),
+        followups=db.followups_da_conversa(conversa.id),
+        historico=historico,
+    )
+
+
+@router.post("/conversas/{conversa_id}/resumo")
+def gerar_resumo_da_conversa(
+    conversa_id: int, corpo: GerarResumoBody, db: Database = Depends(_db)
+):
+    """Gera (ou reaproveita do cache) o resumo da conversa.
+
+    Sem `forcar`, um cache que já viu a última mensagem registrada (staleness
+    zero) é devolvido sem chamar o LLM — é a checagem que o requirement
+    "Cache por versão de prompt e mensagem" pede antes da chamada. Com
+    `forcar=true`, ou sem cache válido, gera de novo e grava via
+    `db.gravar_resumo` (`ON CONFLICT ... DO UPDATE` cobre a mesma fronteira).
+    """
+    conversa = db.get_conversa(conversa_id)
+    if conversa is None:
+        return JSONResponse(
+            status_code=422, content=views.erro(f"conversa {conversa_id} não existe", None)
+        )
+
+    mensagens = db.listar_mensagens_registradas(conversa_id=conversa_id)
+    ultima_mensagem_id = mensagens[-1].id if mensagens else None
+
+    cache = db.resumo_vigente(conversa_id, summaries.PROMPT_VERSAO_RESUMO)
+    if not corpo.forcar and cache is not None:
+        pendentes = db.mensagens_desde(conversa_id, cache.ultima_mensagem_id)
+        if pendentes == 0:
+            return views.resumo_para_json(cache, mensagens_desde=0)
+
+    estado = recalcular(db, conversa, persistir=False)
+    contexto = _montar_contexto_resumo(db, conversa, estado)
+    llm = criar_llm()
+    try:
+        resumo = summaries.gerar(llm, contexto)
+    except (summaries.ResumoInvalidoError, LlmIndisponivelError) as exc:
+        # Requirement "Falha de LLM não derruba a tela": 200, não 422/500.
+        return views.resumo_para_json(None, mensagens_desde=None, erro=str(exc))
+
+    db.gravar_resumo(
+        conversa_id,
+        resumo=resumo.resumo,
+        proximo_passo=resumo.proximo_passo,
+        ultima_mensagem_id=ultima_mensagem_id,
+        estagio=estado.estagio,
+        temperatura=estado.temperatura,
+        prompt_versao=summaries.PROMPT_VERSAO_RESUMO,
+        modelo=getattr(llm, "nome", None),
+        gerado_por=corpo.por,
+    )
+    novo_cache = db.resumo_vigente(conversa_id, summaries.PROMPT_VERSAO_RESUMO)
+    return views.resumo_para_json(novo_cache, mensagens_desde=0)
+
+
+@router.get("/conversas/{conversa_id}/resumo")
+def resumo_da_conversa(conversa_id: int, db: Database = Depends(_db)):
+    """Leitura pura do cache — nunca chama LLM, nunca gera."""
+    conversa = db.get_conversa(conversa_id)
+    if conversa is None:
+        return views.erro(f"conversa {conversa_id} não existe", None)
+    cache = db.resumo_vigente(conversa_id, summaries.PROMPT_VERSAO_RESUMO)
+    if cache is None:
+        return views.resumo_para_json(None, mensagens_desde=None)
+    pendentes = db.mensagens_desde(conversa_id, cache.ultima_mensagem_id)
+    return views.resumo_para_json(cache, mensagens_desde=pendentes)

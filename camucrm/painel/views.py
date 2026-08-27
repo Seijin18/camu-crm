@@ -25,6 +25,7 @@ from ..db import (
     MensagemRegistro,
     ObjecaoRegistro,
     RascunhoRegistro,
+    ResumoConversa,
 )
 from ..pipeline import EstadoConversa
 from ..rules.estagio import ORIGEM_BACKFILL
@@ -364,6 +365,56 @@ def rascunho_para_json(rascunho: RascunhoRegistro) -> dict[str, Any]:
         "mensagem_id": rascunho.mensagem_id,
         "estagio_no_envio": rascunho.estagio_no_envio,
         "comandos": comandos,
+    }
+
+
+def resumo_para_json(
+    registro: ResumoConversa | None,
+    *,
+    mensagens_desde: int | None,
+    erro: str | None = None,
+) -> dict[str, Any]:
+    """Payload de `GET`/`POST /api/conversas/{id}/resumo` (change
+    `resumo-conversa`).
+
+    `gerado=False` cobre os dois casos em que não existe resumo utilizável
+    para mostrar: nunca foi gerado (`erro=None`) ou a última tentativa
+    falhou — LLM indisponível ou resumo recusado nas duas tentativas
+    (`erro` preenchido). Nos dois, a tela mostra "resumo não gerado" — nunca
+    um 500 (requirement "Falha de LLM não derruba a tela").
+
+    `mensagens_desde` é a staleness em CONTAGEM de mensagens acima da
+    fronteira que o resumo viu, não diferença de tempo (§8, mesma lógica do
+    aviso de backfill) — `None` quando não há resumo para medir staleness.
+    """
+    if registro is None:
+        return {
+            "gerado": False,
+            "resumo": None,
+            "proximo_passo": None,
+            "estagio": None,
+            "estagio_label": None,
+            "temperatura": None,
+            "prompt_versao": None,
+            "modelo": None,
+            "gerado_em": None,
+            "gerado_por": None,
+            "mensagens_desde": mensagens_desde,
+            "erro": erro,
+        }
+    return {
+        "gerado": True,
+        "resumo": registro.resumo,
+        "proximo_passo": registro.proximo_passo,
+        "estagio": registro.estagio,
+        "estagio_label": estagio_label(registro.estagio),
+        "temperatura": registro.temperatura,
+        "prompt_versao": registro.prompt_versao,
+        "modelo": registro.modelo,
+        "gerado_em": registro.gerado_em.isoformat(),
+        "gerado_por": registro.gerado_por,
+        "mensagens_desde": mensagens_desde,
+        "erro": erro,
     }
 
 

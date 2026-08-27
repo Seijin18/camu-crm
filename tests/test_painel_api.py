@@ -447,5 +447,155 @@ class TesteRotasDeRascunho(unittest.TestCase):
                 self.assertNotIn("enviar", caminho)
 
 
+RESUMO_OK = json.dumps({
+    "resumo": "Ana pediu peça personalizada e mandou a foto do pet.\n"
+              "A prévia foi enviada, sem resposta ainda.",
+    "proximo_passo": "Enviar follow-up perguntando se ela viu a prévia.",
+})
+
+
+class TesteRotasDeResumo(unittest.TestCase):
+    """Change `resumo-conversa`: `POST` gera (checa cache antes do LLM),
+    `GET` só lê. Nunca 500 — LLM indisponível ou resumo inválido devolvem
+    200 com `resumo: null` (requirement "Falha de LLM não derruba a
+    tela")."""
+
+    def setUp(self):
+        self.cliente = TestClient(server.app)
+        contexto = patch.dict("os.environ", {}, clear=False)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        os.environ.pop(server.ENV_TOKEN, None)
+        self.fake = FakeDatabase()
+        patcher = patch.object(server, "get_db", return_value=self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_get_sem_resumo_gerado_devolve_nao_gerado_sem_chamar_llm(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        with patch.object(api, "criar_llm") as llm_mock:
+            resposta = self.cliente.get(f"/api/conversas/{conversa.id}/resumo")
+        llm_mock.assert_not_called()
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertFalse(corpo["gerado"])
+        self.assertIsNone(corpo["resumo"])
+
+    def test_post_gera_e_persiste(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "oi")
+        with patch.object(api, "criar_llm", return_value=FakeLlm([RESUMO_OK])):
+            resposta = self.cliente.post(
+                f"/api/conversas/{conversa.id}/resumo", json={"por": "marcos"}
+            )
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertTrue(corpo["gerado"])
+        self.assertIn("prévia", corpo["resumo"])
+        self.assertEqual(corpo["mensagens_desde"], 0)
+        self.assertEqual(len(self.fake.resumos), 1)
+
+    def test_post_conversa_inexistente_devolve_422(self):
+        resposta = self.cliente.post("/api/conversas/999/resumo", json={"por": "marcos"})
+        self.assertEqual(resposta.status_code, 422)
+
+    def test_gerar_duas_vezes_sem_mensagem_nova_nao_chama_llm_de_novo(self):
+        """Cache é conferido ANTES da chamada ao LLM (requirement "Cache
+        por versão de prompt e mensagem")."""
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "oi")
+        llm = FakeLlm([RESUMO_OK])
+        with patch.object(api, "criar_llm", return_value=llm):
+            self.cliente.post(f"/api/conversas/{conversa.id}/resumo", json={"por": "marcos"})
+            resposta = self.cliente.post(
+                f"/api/conversas/{conversa.id}/resumo", json={"por": "marcos"}
+            )
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(len(llm.chamadas), 1)  # só a primeira chamou o LLM
+        self.assertEqual(len(self.fake.resumos), 1)  # nenhuma linha duplicada
+
+    def test_forcar_chama_llm_de_novo_mesmo_sem_mensagem_nova(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "oi")
+        llm = FakeLlm([RESUMO_OK, RESUMO_OK])
+        with patch.object(api, "criar_llm", return_value=llm):
+            self.cliente.post(f"/api/conversas/{conversa.id}/resumo", json={"por": "marcos"})
+            resposta = self.cliente.post(
+                f"/api/conversas/{conversa.id}/resumo",
+                json={"por": "marcos", "forcar": True},
+            )
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(len(llm.chamadas), 2)
+        self.assertEqual(len(self.fake.resumos), 1)  # substitui, não duplica
+
+    def test_mensagem_nova_gera_de_novo_sem_forcar(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "oi")
+        llm = FakeLlm([RESUMO_OK])
+        with patch.object(api, "criar_llm", return_value=llm):
+            self.cliente.post(f"/api/conversas/{conversa.id}/resumo", json={"por": "marcos"})
+        self.fake.registrar_mensagem(conversa.id, "in", "mais uma coisa")
+        llm2 = FakeLlm([RESUMO_OK])
+        with patch.object(api, "criar_llm", return_value=llm2):
+            resposta = self.cliente.post(
+                f"/api/conversas/{conversa.id}/resumo", json={"por": "marcos"}
+            )
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(len(llm2.chamadas), 1)  # fronteira nova, chamou de novo
+
+    def test_llm_indisponivel_devolve_200_com_resumo_null(self):
+        from camucrm.llm import LlmIndisponivelError
+
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "oi")
+
+        class LlmQuebrado:
+            nome = "quebrado"
+
+            def completar(self, system, user, *, json_estrito=False):
+                raise LlmIndisponivelError("sem chave")
+
+        with patch.object(api, "criar_llm", return_value=LlmQuebrado()):
+            resposta = self.cliente.post(
+                f"/api/conversas/{conversa.id}/resumo", json={"por": "marcos"}
+            )
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertFalse(corpo["gerado"])
+        self.assertIsNone(corpo["resumo"])
+        self.assertIsNotNone(corpo["erro"])
+
+    def test_get_apos_gerar_devolve_staleness_zero(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "oi")
+        with patch.object(api, "criar_llm", return_value=FakeLlm([RESUMO_OK])):
+            self.cliente.post(f"/api/conversas/{conversa.id}/resumo", json={"por": "marcos"})
+        resposta = self.cliente.get(f"/api/conversas/{conversa.id}/resumo")
+        corpo = resposta.json()
+        self.assertTrue(corpo["gerado"])
+        self.assertEqual(corpo["mensagens_desde"], 0)
+
+    def test_get_depois_de_mensagem_nova_mostra_staleness(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.fake.registrar_mensagem(conversa.id, "in", "oi")
+        with patch.object(api, "criar_llm", return_value=FakeLlm([RESUMO_OK])):
+            self.cliente.post(f"/api/conversas/{conversa.id}/resumo", json={"por": "marcos"})
+        self.fake.registrar_mensagem(conversa.id, "in", "mais uma")
+        resposta = self.cliente.get(f"/api/conversas/{conversa.id}/resumo")
+        corpo = resposta.json()
+        self.assertEqual(corpo["mensagens_desde"], 1)
+
+    def test_get_nunca_gera_resumo(self):
+        conversa = self.fake.criar_conversa(funil="b2c", estagio="S1", nome="Ana")
+        self.cliente.get(f"/api/conversas/{conversa.id}/resumo")
+        self.assertEqual(len(self.fake.resumos), 0)
+
+    def test_nenhuma_rota_de_resumo_contem_enviar(self):
+        caminhos = set(server.app.openapi()["paths"].keys())
+        for caminho in caminhos:
+            if "resumo" in caminho:
+                self.assertNotIn("enviar", caminho)
+
+
 if __name__ == "__main__":
     unittest.main()

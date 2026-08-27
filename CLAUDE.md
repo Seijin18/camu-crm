@@ -16,9 +16,21 @@ explícita — um comentário dizendo o que mudou e por quê — e não silencio
 LLM extrai fatos  →  regra determinística decide  →  humano envia
 ```
 
-O LLM aparece em exatamente dois lugares: `camucrm/extraction/` (extrair fatos
-binários com evidência) e `camucrm/drafts.py` (rascunhar duas opções). Se um
-módulo de `camucrm/rules/` passar a importar `llm`, a arquitetura vazou.
+O LLM aparece em exatamente três lugares: `camucrm/extraction/` (extrair
+fatos binários com evidência), `camucrm/drafts.py` (rascunhar duas opções) e
+`camucrm/summaries.py` (change `resumo-conversa`: resumir a conversa sob
+demanda, nunca automático). A divergência com "dois lugares" é real e está
+registrada aqui de propósito, não silenciada — a propriedade que a torna
+aceitável: `extraction/` alimenta `fatos`, que alimenta as regras de
+`rules/` — um erro ali é corretude ESTRUTURAL, produz sistematicamente um
+estágio errado. `drafts.py` e `summaries.py` são TERMINAIS: a saída de
+nenhum dos dois retroalimenta `fatos` nem nenhuma regra (`resumos_conversa`
+é FOLHA do grafo — apagar a tabela inteira não muda estágio, temperatura ou
+fila de nenhuma conversa, provado por `tests/test_summaries.py` e
+`tests/test_e2e.py::TesteResumoNaoMudaEstado`). Um erro de qualquer um dos
+dois custa uma leitura ruim para um humano, nunca um estágio errado gravado
+no banco. A regra original permanece de pé, sem uma vírgula de mudança: se
+um módulo de `camucrm/rules/` importar `llm`, a arquitetura vazou.
 
 Consequência prática que justifica a regra: `make recalcular` reprocessa toda a
 base sem custo de LLM. Se o estágio dependesse do modelo, cada mudança de

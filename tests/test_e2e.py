@@ -2,6 +2,12 @@
 
     mensagem -> extração (LLM) -> fatos -> estágio -> temperatura -> fila -> rascunho
 
+Change `resumo-conversa` estende este arquivo com `TesteResumoNaoMudaEstado`:
+gerar um resumo (terceira superfície de LLM, `camucrm/summaries.py`) é um
+apêndice de leitura sobre o mesmo ciclo, não um ramo novo — a prova de que
+`resumos_conversa` é FOLHA do grafo (§1 do CLAUDE.md) é rodar o ciclo, gerar
+o resumo, rodar de novo, e checar que nada mudou.
+
 Convenção do repositório (herdada do WhatBot): toda mudança que altera esse
 ciclo **estende este arquivo**, nunca duplica um E2E paralelo. Um segundo
 arquivo E2E sempre acaba testando uma versão diferente do mesmo caminho, e a
@@ -27,6 +33,8 @@ from camucrm.extraction.extractor import Extrator  # noqa: E402
 from camucrm.llm import FakeLlm, LlmIndisponivelError  # noqa: E402
 from camucrm.pipeline import recalcular  # noqa: E402
 from camucrm.rules.fila import Candidato, montar_fila  # noqa: E402
+from camucrm.summaries import ContextoResumo, PROMPT_VERSAO_RESUMO  # noqa: E402
+from camucrm.summaries import gerar as gerar_resumo  # noqa: E402
 from camucrm.taxonomia import ESFRIANDO, QUENTE  # noqa: E402
 
 AGORA = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
@@ -462,3 +470,86 @@ class TesteEstagioSeRendeAoHistorico(unittest.TestCase):
         db.gravar_fatos(conversa.id, {"foto_pet_recebida": True}, {"foto_pet_recebida": "aqui a foto"})
         estado = recalcular(db, db.get_conversa(conversa.id), agora=AGORA)
         self.assertEqual(estado.estagio, "S2")
+
+
+RESUMO_JSON_OK = json.dumps({
+    "resumo": "Ana mandou a foto do pet Thor e recebeu a prévia.\n"
+              "Ainda não respondeu depois disso.",
+    "proximo_passo": "Perguntar se ela viu a prévia enviada.",
+})
+
+
+class TesteResumoNaoMudaEstado(unittest.TestCase):
+    """Change `resumo-conversa`: estende o E2E único do ciclo com o passo
+
+        ... -> fila -> resumo (LLM, terceira superfície, `camucrm/summaries.py`)
+
+    A prova que este teste faz é a mesma que sustenta a divergência de §1
+    registrada no CLAUDE.md: `resumos_conversa` é FOLHA do grafo — gerar um
+    resumo não pode mudar `(estagio, temperatura, fila)`. Mora aqui, não num
+    `test_summaries_e2e.py` à parte, pela mesma regra que já vale para
+    `TesteCicloAteVinculoDoRascunho`.
+    """
+
+    def _estado_e_fila(self, db, conversa):
+        estado = recalcular(db, db.get_conversa(conversa.id), agora=AGORA)
+        candidato = Candidato(
+            conversa_id=conversa.id, nome="Ana", funil=conversa.funil,
+            estagio=estado.estagio, classificacao=estado.classificacao,
+            sinais=estado.sinais,
+        )
+        fila = montar_fila([candidato])
+        return (estado.estagio, estado.temperatura, [i.conversa_id for i in fila])
+
+    def test_ciclo_completo_com_resumo_no_fim(self):
+        db = FakeDatabase()
+        conversa = db.criar_conversa(nome="Ana")
+        db.registrar_mensagem(
+            conversa.id, "in", "oi, vi o insta de voces", AGORA - timedelta(hours=6)
+        )
+        db.registrar_mensagem(
+            conversa.id, "out", "Oi! Me manda uma foto do seu pet?",
+            AGORA - timedelta(hours=5),
+        )
+        extrator = Extrator(db, FakeLlm([
+            resposta(foto_pet_recebida=True,
+                     evidencias={"foto_pet_recebida": "aqui ele, o nome dele e Thor"})
+        ]))
+        db.registrar_mensagem(
+            conversa.id, "in", "aqui ele, o nome dele e Thor", AGORA - timedelta(hours=4)
+        )
+        resultado = extrator.processar_conversa(conversa.id, agora=AGORA)
+        self.assertEqual(resultado.estado.estagio, "S2")
+
+        antes = self._estado_e_fila(db, conversa)
+
+        estado = recalcular(db, db.get_conversa(conversa.id), agora=AGORA)
+        contexto = ContextoResumo(
+            funil=conversa.funil,
+            estagio=estado.estagio,
+            temperatura=estado.temperatura,
+            sinal=estado.classificacao.sinal,
+            fatos=db.fatos_detalhados(conversa.id),
+            eventos=db.eventos_da_conversa(conversa.id),
+            objecoes=db.objecoes_da_conversa(conversa.id),
+            correcoes=db.correcoes_da_conversa(conversa.id),
+            followups=db.followups_da_conversa(conversa.id),
+            historico=[(m.direcao, m.texto) for m in db.listar_mensagens(conversa.id)],
+        )
+        resumo = gerar_resumo(FakeLlm([RESUMO_JSON_OK]), contexto)
+        db.gravar_resumo(
+            conversa.id,
+            resumo=resumo.resumo,
+            proximo_passo=resumo.proximo_passo,
+            ultima_mensagem_id=None,
+            estagio=estado.estagio,
+            temperatura=estado.temperatura,
+            prompt_versao=PROMPT_VERSAO_RESUMO,
+        )
+
+        depois = self._estado_e_fila(db, conversa)
+        self.assertEqual(antes, depois)
+
+        # Apagar `resumos_conversa` inteira também não muda nada — é cache.
+        db.resumos.clear()
+        self.assertEqual(self._estado_e_fila(db, conversa), depois)
