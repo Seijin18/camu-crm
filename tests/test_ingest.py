@@ -137,6 +137,91 @@ class TesteMidiaSemLegendaNaIngestao(unittest.TestCase):
         self.assertFalse(any(fatos.values()))
 
 
+class TesteDedupeSemExternaId(unittest.TestCase):
+    """Change `ingestao-a-prova-de-falha`, spec.md "Evento sem externa_id
+    ainda é protegido contra duplicação" — hash estável do payload cru como
+    `externa_id` sintético (design.md)."""
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.transporte = EvolutionTransporte("http://x", "k", "i")
+
+    def _payload_sem_key_id(self, texto="oi", telefone="5511999998888"):
+        return {
+            "event": "messages.upsert",
+            "data": {
+                "key": {"remoteJid": f"{telefone}@s.whatsapp.net", "fromMe": False},
+                "message": {"conversation": texto},
+                "messageTimestamp": int((AGORA - timedelta(hours=1)).timestamp()),
+                "pushName": "Ana",
+            },
+        }
+
+    def test_reentrega_de_evento_sem_key_id_nao_duplica(self):
+        bruto = self._payload_sem_key_id()
+        primeiro = ingerir(self.db, self.transporte.receber(bruto), agora=AGORA)
+        segundo = ingerir(self.db, self.transporte.receber(bruto), agora=AGORA)
+
+        self.assertFalse(primeiro.duplicada)
+        self.assertTrue(segundo.duplicada)
+        self.assertEqual(len(self.db.mensagens[primeiro.conversa_id]), 1)
+
+    def test_payloads_diferentes_sem_key_id_nao_colidem(self):
+        primeiro = ingerir(
+            self.db, self.transporte.receber(self._payload_sem_key_id("oi")), agora=AGORA
+        )
+        segundo = ingerir(
+            self.db,
+            self.transporte.receber(self._payload_sem_key_id("outra mensagem")),
+            agora=AGORA,
+        )
+        self.assertFalse(segundo.duplicada)
+        self.assertEqual(len(self.db.mensagens[primeiro.conversa_id]), 2)
+
+    def test_evento_com_key_id_continua_usando_o_id_real_nao_o_hash(self):
+        """Evento normal (com `key.id`) não muda de comportamento."""
+        from camucrm.ingest import _externa_id_efetivo
+
+        evento = self.transporte.receber(payload(ident="M1"))
+        self.assertEqual(_externa_id_efetivo(evento), "M1")
+
+    def test_evento_sem_bruto_nem_externa_id_no_hash_devolve_none(self):
+        """Evento construído direto (sem payload cru) não tem o que
+        hashear — mesmo comportamento de antes deste change."""
+        from camucrm.ingest import _externa_id_efetivo
+
+        evento = EventoRecebido(
+            telefone="5511900000000", texto="oi", enviada_em=AGORA
+        )
+        self.assertIsNone(_externa_id_efetivo(evento))
+
+
+class TesteTransacaoUnica(unittest.TestCase):
+    """Change `ingestao-a-prova-de-falha`, spec.md "Cadeia de ingestão é
+    transacional" — `ingerir()` encadeia os três dentro de
+    `db.transacao()` (o rollback de verdade é provado contra Postgres real
+    em `tests/integration/`; aqui só confere que o caminho usa o
+    contextmanager em vez de três transações soltas)."""
+
+    def test_upsert_conversa_e_mensagem_rodam_dentro_de_transacao(self):
+        db = FakeDatabase()
+        chamadas = []
+        original = db.transacao
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def espiao():
+            chamadas.append("entrou")
+            with original() as conn:
+                yield conn
+            chamadas.append("saiu")
+
+        db.transacao = espiao
+        ingerir(db, EvolutionTransporte().receber(payload()), agora=AGORA)
+        self.assertEqual(chamadas, ["entrou", "saiu"])
+
+
 class TesteEventoDireto(unittest.TestCase):
     def test_aceita_evento_ja_normalizado(self):
         db = FakeDatabase()

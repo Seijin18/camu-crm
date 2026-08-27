@@ -142,21 +142,46 @@ async def webhook_evolution(
 def _processar(payload: dict[str, Any]) -> None:
     """Ingere o evento. Roda depois da resposta HTTP.
 
-    Toda exceção é registrada e engolida: um evento malformado não pode
-    derrubar o worker nem impedir os próximos. O evento perdido reaparece na
-    próxima mensagem da mesma conversa, e o `externa_id` garante que nada
-    duplica quando isso acontece.
+    Change `ingestao-a-prova-de-falha`: o payload cru é gravado em
+    `eventos_recebidos_bruto` (design.md) ANTES de qualquer parsing/
+    `ingerir()`. Uma exceção durante o processamento não perde mais o
+    evento — a linha permanece `processado=False` com o erro registrado,
+    disponível para `camucrm reprocessar-falhas`. Um evento malformado ainda
+    não pode derrubar o worker nem impedir os próximos: a exceção é
+    registrada (log + staging), nunca propagada.
     """
+    db = get_db()
+    try:
+        evento_bruto_id = db.registrar_evento_bruto(payload)
+    except Exception:  # noqa: BLE001
+        # Se nem o staging grava, o banco está fora do ar — não há onde
+        # registrar o rastro de reprocessamento. `ensure_schema()` já rodou
+        # no boot (`servir()`), então isto é infraestrutura caindo depois de
+        # já estar de pé, não schema ausente.
+        logger.exception(
+            "Falha ao gravar payload bruto em eventos_recebidos_bruto — "
+            "evento perdido antes mesmo do staging (banco indisponível?)"
+        )
+        return
+
     try:
         # Sem credencial: este processo só sabe receber (ver `criar_transporte`).
         transporte = criar_transporte("evolution", para_envio=False)
-        resultado = ingerir(get_db(), transporte.receber(payload), origem="whatsapp")
-        if resultado.ignorada:
-            return
-        logger.info("Webhook: %s", resultado)
-    except Exception:  # noqa: BLE001
-        logger.exception("Falha processando webhook (evento descartado)")
+        resultado = ingerir(db, transporte.receber(payload), origem="whatsapp")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Falha processando webhook — payload preservado em "
+            "eventos_recebidos_bruto (id=%s) para reprocessamento manual "
+            "(`camucrm reprocessar-falhas`)",
+            evento_bruto_id,
+        )
+        db.marcar_evento_bruto_falhou(evento_bruto_id, str(exc))
         return
+
+    db.marcar_evento_bruto_processado(evento_bruto_id)
+    if resultado.ignorada:
+        return
+    logger.info("Webhook: %s", resultado)
 
     if resultado.duplicada or resultado.conversa_id is None:
         return
@@ -196,8 +221,19 @@ def _extrair(conversa_id: int) -> None:
 
 
 def servir(porta: int | None = None) -> None:
-    """Sobe o serviço. Chamado por `camucrm servir`."""
+    """Sobe o serviço. Chamado por `camucrm servir`.
+
+    Change `ingestao-a-prova-de-falha`: `ensure_schema()` roda aqui, no boot
+    do processo, ANTES de aceitar qualquer requisição. É idempotente — seguro
+    rodar de novo mesmo que o schema já exista — e falha de conectar ou de
+    aplicar o schema derruba o processo com um erro alto, aqui, e não em
+    silêncio no primeiro webhook recebido contra um banco novo/recriado ou
+    uma migração ainda não aplicada (spec.md, "Schema ausente falha no boot,
+    não no primeiro evento").
+    """
     import uvicorn
+
+    get_db().ensure_schema()
 
     uvicorn.run(
         app,

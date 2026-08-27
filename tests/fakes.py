@@ -10,6 +10,7 @@ que "garante" uma constraint prova apenas que o fake concorda consigo mesmo.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -18,6 +19,7 @@ from camucrm.db import (
     Conversa,
     ContatoResumido,
     CorrecaoRegistro,
+    EventoBrutoRegistro,
     EventoRegistro,
     FatoRegistro,
     FollowupRegistro,
@@ -146,6 +148,8 @@ class FakeDatabase:
         # ultima_mensagem_id, prompt_versao) — mesma coisa que o índice único
         # de `resumos_conversa` protege no banco real.
         self.resumos: dict[int, ResumoConversa] = {}
+        # change `ingestao-a-prova-de-falha`: staging do payload cru.
+        self.eventos_brutos: dict[int, EventoBrutoRegistro] = {}
         self._proximo_id = 1
         # Proxy de `conversas.atualizado_em` para `token_de_mudanca` (change
         # `painel-tempo-real`): o fake não guarda timestamp de atualização
@@ -205,8 +209,16 @@ class FakeDatabase:
     def listar_conversas_abertas(self, limite: int = 500) -> list[Conversa]:
         return [c for c in self.conversas.values() if c.resultado is None][:limite]
 
+    @contextmanager
+    def transacao(self):
+        """Fake sem transação real de Postgres — os três métodos do caminho
+        de ingestão já são atômicos em memória (um dict Python cada). Existe
+        só para `ingest.ingerir` (`with db.transacao() as conn:`) funcionar
+        sem checar se o banco é fake ou real."""
+        yield None
+
     def registrar_mensagem(
-        self, conversa_id, direcao, texto, enviada_em=None, *, externa_id=None
+        self, conversa_id, direcao, texto, enviada_em=None, *, externa_id=None, conn=None
     ) -> int | None:
         enviada_em = enviada_em or datetime.now(timezone.utc)
         existentes = self.mensagens.setdefault(conversa_id, [])
@@ -548,7 +560,7 @@ class FakeDatabase:
             contato.telefone is not None, contato.criado_em,
         )
 
-    def upsert_contato(self, telefone, *, nome=None, tipo="b2c", origem=None) -> Contato:
+    def upsert_contato(self, telefone, *, nome=None, tipo="b2c", origem=None, conn=None) -> Contato:
         for contato in self.contatos.values():
             if contato.telefone == telefone:
                 return contato
@@ -560,7 +572,7 @@ class FakeDatabase:
         self.contatos[contato_id] = contato
         return contato
 
-    def get_or_create_conversa(self, contato_id, funil=None) -> Conversa:
+    def get_or_create_conversa(self, contato_id, funil=None, *, conn=None) -> Conversa:
         for conversa in self.conversas.values():
             if conversa.contato_id == contato_id and conversa.resultado is None:
                 return conversa
@@ -788,3 +800,38 @@ class FakeDatabase:
         linhas = self.mensagens.get(conversa_id, [])
         limite = mensagem_id or 0
         return sum(1 for identificador, *_ in linhas if identificador > limite)
+
+    # -- eventos brutos (staging, change `ingestao-a-prova-de-falha`) -----
+
+    def registrar_evento_bruto(self, payload) -> int:
+        evento_id = self._novo_id()
+        self.eventos_brutos[evento_id] = EventoBrutoRegistro(
+            id=evento_id,
+            payload=payload,
+            recebido_em=datetime.now(timezone.utc),
+            processado=False,
+            processado_em=None,
+            erro=None,
+            tentativas=0,
+        )
+        return evento_id
+
+    def marcar_evento_bruto_processado(self, evento_id: int) -> None:
+        registro = self.eventos_brutos.get(evento_id)
+        if registro is not None:
+            registro.processado = True
+            registro.processado_em = datetime.now(timezone.utc)
+            registro.erro = None
+
+    def marcar_evento_bruto_falhou(self, evento_id: int, erro: str) -> None:
+        registro = self.eventos_brutos.get(evento_id)
+        if registro is not None:
+            registro.erro = erro
+            registro.tentativas += 1
+
+    def listar_eventos_brutos_pendentes(self, limite: int = 200) -> list[EventoBrutoRegistro]:
+        pendentes = sorted(
+            (r for r in self.eventos_brutos.values() if not r.processado),
+            key=lambda r: r.id,
+        )
+        return pendentes[:limite]

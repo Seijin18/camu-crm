@@ -142,6 +142,15 @@ class EvolutionTransporte:
             return None
         dados = evento.get("data") or evento
         if not isinstance(dados, Mapping):
+            # Cobre, entre outros formatos inesperados, um `data` em lista —
+            # o formato que teria se `messages.upsert` chegasse em lote.
+            # Investigação (change `ingestao-a-prova-de-falha`, design.md):
+            # documentação oficial e issues públicas da Evolution API não
+            # mostram nenhum caso de lote; `data` é sempre um objeto único.
+            # Sem confirmação de que lote acontece de fato, nenhum
+            # desmembramento foi implementado — este guard já garante que,
+            # SE acontecer, o evento é ignorado (não descartado com dado
+            # errado), no mesmo caminho de qualquer payload malformado.
             return None
 
         chave = dados.get("key") or {}

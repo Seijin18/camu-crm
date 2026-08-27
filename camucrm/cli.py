@@ -17,11 +17,12 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from . import acoes, config, metrics
 from .acoes import AcaoInvalidaError
 from .backfill import extrair_historico, importar_conversas
-from .db import Database, MARCOS_MANUAIS, TetoFollowupError
+from .db import Database, MARCOS_MANUAIS, RETENCAO_EVENTOS_BRUTOS_DIAS, TetoFollowupError
 from .drafts import RascunhoInvalidoError, gerar as gerar_rascunho
 from .extraction import FATOS_BOOLEANOS
 from .ingest import ingerir
@@ -336,19 +337,105 @@ def cmd_purgar(args) -> int:
     apagadas = banco.purgar_mensagens_antigas(args.meses)
     print(f"{apagadas} mensagem(ns) descartada(s) (§12, retenção de {args.meses} meses).")
     print("Preservados: fatos, objeções e eventos de estágio.")
+    # Change `ingestao-a-prova-de-falha`, design.md: job separado (não o
+    # mesmo SQL), mas reaproveita o mesmo comando de retenção para o
+    # operador não precisar lembrar de dois comandos. Só `processado=TRUE`
+    # sai; falha pendente nunca é apagada automaticamente.
+    eventos_apagados = banco.purgar_eventos_brutos_antigos(args.dias_eventos_brutos)
+    print(
+        f"{eventos_apagados} evento(s) bruto(s) já processado(s) "
+        f"descartado(s) (retenção de {args.dias_eventos_brutos} dias; "
+        "falhas pendentes nunca são apagadas automaticamente)."
+    )
     return 0
+
+
+def cmd_reprocessar_falhas(args) -> int:
+    """Reprocessa payloads que falharam na ingestão (change
+    `ingestao-a-prova-de-falha`).
+
+    Lê `eventos_recebidos_bruto` com `processado=False` e tenta reingerir
+    cada um pelo MESMO caminho do webhook (`camucrm.ingest.ingerir`) — nunca
+    duplica mensagem já gravada com sucesso porque o dedup por `externa_id`
+    (ou seu hash sintético, quando ausente) é o mesmo de sempre. Sempre
+    manual: um cron automático reprocessando silenciosamente esconderia
+    exatamente o sinal que este comando existe para expor (design.md).
+    """
+    banco = _db()
+    pendentes = banco.listar_eventos_brutos_pendentes(limite=args.limite)
+    if not pendentes:
+        print("Nenhum evento pendente de reprocessamento.")
+        return 0
+
+    transporte = criar_transporte("evolution", para_envio=False)
+    sucesso = 0
+    falha = 0
+    for evento in pendentes:
+        try:
+            resultado = ingerir(banco, transporte.receber(evento.payload), origem="whatsapp")
+        except Exception as exc:  # noqa: BLE001 - um evento ruim não pode parar os demais
+            banco.marcar_evento_bruto_falhou(evento.id, str(exc))
+            falha += 1
+            print(f"  #{evento.id}: FALHOU DE NOVO — {exc}")
+            continue
+        banco.marcar_evento_bruto_processado(evento.id)
+        sucesso += 1
+        print(f"  #{evento.id}: reprocessado — {resultado}")
+
+    print(f"{sucesso} reprocessado(s) com sucesso, {falha} ainda falhando.")
+    return 0 if falha == 0 else 1
+
+
+def _payload_parece_evolution(payload: Any) -> bool:
+    """Heurística: o payload tem a forma de um evento `messages.upsert` da
+    Evolution API (envelope `data.key`), mesmo que o `--transporte` efetivo
+    não seja `evolution`. Usada só para diferenciar a SAÍDA de `cmd_ingerir`
+    (change `ingestao-a-prova-de-falha`) — nunca para decidir se o evento é
+    ingerido de verdade, o que continua sendo decisão só do transporte
+    resolvido.
+    """
+    if not isinstance(payload, dict):
+        return False
+    dados = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    return isinstance(dados, dict) and isinstance(dados.get("key"), dict)
 
 
 def cmd_ingerir(args) -> int:
     """Lê um payload de webhook do stdin e ingere.
 
     Mesmo caminho que o webhook usa (`camucrm.ingest`) — dois caminhos de
-    entrada acabariam divergindo.
+    entrada acabariam divergindo. Por isso o `--transporte` tem o mesmo
+    padrão do webhook (`evolution`, só recepção — `para_envio=False`): antes
+    deste change o padrão herdado de `criar_transporte` era `console`, e um
+    operador que esquecesse a flag via a MESMA saída "evento ignorado" de um
+    evento benigno real — sem nenhum aviso de que a configuração divergiu do
+    caminho do webhook (spec.md, "cmd_ingerir não finge sucesso silencioso").
+
+    `--transporte` continua aceito (para depurar com fixtures de
+    `ConsoleTransporte`, por exemplo); quando o valor escolhido não é
+    `evolution` e o payload tem cara de evento real da Evolution API, a
+    saída avisa que o motivo do "ignorado" é configuração, não um evento
+    benigno de verdade.
     """
     banco = _db()
-    transporte = criar_transporte(args.transporte)
+    nome_transporte = args.transporte or "evolution"
+    transporte = criar_transporte(nome_transporte, para_envio=False)
     payload = json.loads(sys.stdin.read())
-    print(ingerir(banco, transporte.receber(payload), origem="whatsapp"))
+    resultado = ingerir(banco, transporte.receber(payload), origem="whatsapp")
+    if (
+        resultado.ignorada
+        and transporte.nome != "evolution"
+        and _payload_parece_evolution(payload)
+    ):
+        print(
+            f"AVISO: payload parece um evento real da Evolution API, mas "
+            f"--transporte={transporte.nome!r} não sabe interpretá-lo — "
+            "ignorado por CONFIGURAÇÃO divergente do webhook (use "
+            "`--transporte evolution`, o padrão), não porque o evento seja "
+            "benigno."
+        )
+        return 1
+    print(resultado)
     return 0
 
 
@@ -557,11 +644,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("purgar", help="retenção de mensagens (§12)")
     p.add_argument("--meses", type=int, default=12)
+    p.add_argument(
+        "--dias-eventos-brutos",
+        type=int,
+        default=RETENCAO_EVENTOS_BRUTOS_DIAS,
+        dest="dias_eventos_brutos",
+        help="retenção da caixa de reprocessamento (só eventos já processados)",
+    )
     p.set_defaults(func=cmd_purgar)
 
     p = sub.add_parser("ingerir", help="lê um webhook do stdin")
-    p.add_argument("--transporte")
+    p.add_argument(
+        "--transporte",
+        help="padrão: evolution, mesmo do webhook (ver requirement "
+        "'cmd_ingerir não finge sucesso silencioso')",
+    )
     p.set_defaults(func=cmd_ingerir)
+
+    p = sub.add_parser(
+        "reprocessar-falhas",
+        help="reprocessa eventos que falharam na ingestão (staging de webhook)",
+    )
+    p.add_argument("--limite", type=int, default=200)
+    p.set_defaults(func=cmd_reprocessar_falhas)
 
     p = sub.add_parser("acompanhar", help="painel ao vivo do que está entrando")
     p.add_argument("--intervalo", type=int, default=5, help="segundos entre atualizações")

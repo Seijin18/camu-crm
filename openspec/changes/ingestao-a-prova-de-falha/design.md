@@ -71,6 +71,51 @@ está ausente — mesma ideia que `backfill-seguro-para-reexecucao` usa para
 mensagens sem id de origem. Isso estende a proteção de dedupe sem exigir dois
 índices/dois caminhos de código.
 
+## Investigação: `messages.upsert` pode chegar em lote?
+
+Tarefa 4.1 de `tasks.md` — verificação antes de qualquer código, não
+implementação às cegas.
+
+**Conclusão: não há evidência de que a Evolution API entregue múltiplas
+mensagens num único evento de webhook `messages.upsert`, e nenhuma mudança
+de código foi feita por causa disso.**
+
+O que foi checado (agente sem acesso a uma instância real da Evolution API
+para reproduzir tráfego ao vivo — verificação por documentação oficial e
+discussão pública, não por teste de carga):
+
+- A documentação oficial de webhooks da Evolution API mostra o payload de
+  `MESSAGES_UPSERT` com `data` como um objeto único (`key`, `pushName`,
+  `message`, `messageType`, `messageTimestamp`, ...), nunca como array. Nenhum
+  exemplo da documentação mostra lote.
+- Busca nas issues públicas do repositório (`evolution-foundation/evolution-
+  api`) por relatos de payload em lote não encontrou nenhum caso — as
+  issues sobre `messages.upsert` discutem discrepância de nome de evento
+  (`send.message` vs `messages.upsert`) e comportamento de eco, não formato
+  de lote.
+- Baileys (a biblioteca que a Evolution API usa por baixo) emite
+  internamente `messages.upsert` com um array de mensagens — mas a camada de
+  webhook da Evolution API, pelo que a documentação e as issues mostram,
+  despacha uma chamada HTTP por mensagem, já desembrulhada.
+
+**Por que isso não vira um teste automatizado**: a conclusão vem de
+documentação e de discussão pública, não de uma instância real gerando
+tráfego sob volume — não há como provar "nunca acontece" sem acesso a uma
+instância de produção sob carga real. O comportameto defensivo já existente
+em `EvolutionTransporte.receber` (`if not isinstance(dados, Mapping): return
+None`) já cobre o pior caso SE a suposição acima se revelar errada no
+futuro: um payload em lote não creditaria dados errados a um contato nem
+duplicaria nada — cairia no mesmo caminho de "evento ignorado" que qualquer
+payload malformado, silenciosamente, sem side-effect incorreto. Se um caso
+real de lote aparecer em produção (visível pelo log "Webhook com corpo
+não-JSON" nunca disparando, mas mensagens somem sem aparecer em
+`eventos_recebidos_bruto` — o que este próprio change torna detectável,
+porque agora HÁ staging do payload cru), a correção natural seria desmembrar
+a lista em `EvolutionTransporte.receber` antes de devolver `EventoRecebido`,
+ou (mais simples) fazer o webhook chamar `ingerir()` uma vez por item da
+lista quando `data` for array. Ver comentário em
+`camucrm/transport/evolution.py::receber`.
+
 ## Alternativa descartada
 
 Fila externa (Redis Streams, SQS) para o staging de eventos brutos —

@@ -21,11 +21,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, Sequence
 
 import psycopg
+from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool
 
 from .rules.estagio import ORIGEM_LIVE
@@ -40,6 +42,14 @@ ENV_TELEFONE_SALT = "CAMU_TELEFONE_SALT"
 
 # Marcos que só um humano registra (§3). Fechados como os demais vocabulários.
 MARCOS_MANUAIS = ("ganho", "consignacao_assinada", "primeira_reposicao", "perdido")
+
+# Change `ingestao-a-prova-de-falha`, design.md: janela de retenção da caixa
+# de reprocessamento (`eventos_recebidos_bruto`) — só para linhas já
+# `processado = TRUE`. Linhas com falha pendente (`processado = FALSE`)
+# NUNCA são apagadas automaticamente, não importa a idade (ver
+# `Database.purgar_eventos_brutos_antigos`); apagar uma falha não resolvida
+# repetiria exatamente o bug que este change corrige.
+RETENCAO_EVENTOS_BRUTOS_DIAS = 14
 
 
 def hash_telefone(telefone: str, salt: str | None = None) -> str:
@@ -288,6 +298,23 @@ class ResumoConversa:
     modelo: str | None
     gerado_em: datetime
     gerado_por: str | None
+
+
+@dataclass
+class EventoBrutoRegistro:
+    """Uma linha de `eventos_recebidos_bruto` (change `ingestao-a-prova-de-
+    falha`, design.md). Staging do payload cru do webhook, gravado ANTES de
+    qualquer parsing/`ingerir()` — ver docstring de `Database.
+    registrar_evento_bruto`.
+    """
+
+    id: int
+    payload: Any
+    recebido_em: datetime
+    processado: bool
+    processado_em: datetime | None
+    erro: str | None
+    tentativas: int
 
 
 class TetoFollowupError(RuntimeError):
@@ -575,6 +602,27 @@ CREATE INDEX IF NOT EXISTS resumos_conversa_conversa_idx
 -- bloquearia duas conversas ainda sem mensagem nenhuma.
 CREATE UNIQUE INDEX IF NOT EXISTS resumos_conversa_cursor_idx
     ON resumos_conversa (conversa_id, coalesce(ultima_mensagem_id, 0), prompt_versao);
+
+-- ADIÇÃO (change `ingestao-a-prova-de-falha`, design.md): staging do payload
+-- bruto do webhook, gravado ANTES de qualquer parsing/`ingerir()`. Uma
+-- exceção dentro de `ingerir()` não perde o evento — a linha permanece
+-- `processado = FALSE` com `erro` preenchido, disponível para
+-- `camucrm reprocessar-falhas`. NÃO é histórico permanente (fora de escopo
+-- do proposal.md): só linhas `processado = TRUE` saem, depois de
+-- `RETENCAO_EVENTOS_BRUTOS_DIAS`, via `purgar_eventos_brutos_antigos`; uma
+-- linha `processado = FALSE` nunca é apagada automaticamente.
+CREATE TABLE IF NOT EXISTS eventos_recebidos_bruto (
+    id              SERIAL PRIMARY KEY,
+    recebido_em     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    payload         JSONB NOT NULL,
+    processado      BOOLEAN NOT NULL DEFAULT FALSE,
+    processado_em   TIMESTAMP WITH TIME ZONE,
+    erro            TEXT,
+    tentativas      INTEGER NOT NULL DEFAULT 0
+);
+-- Índice parcial: só as linhas que `listar_eventos_brutos_pendentes` lê.
+CREATE INDEX IF NOT EXISTS eventos_recebidos_bruto_pendentes_idx
+    ON eventos_recebidos_bruto (id) WHERE NOT processado;
 """
 
 # §12, extensão da purga (change `rascunho-registrado`): texto escrito para
@@ -625,6 +673,34 @@ class Database:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
 
+    def _conn_ou(self, conn):
+        """Devolve `conn` (via `nullcontext`, sem abrir/fechar nada) quando já
+        veio de fora, ou uma conexão nova de `self._conn()` quando não veio.
+
+        Suporta o parâmetro opcional `conn=` de `upsert_contato`/
+        `get_or_create_conversa`/`registrar_mensagem`: chamado sem `conn`
+        (todo caller pré-existente, ex. `backfill.py`), cada método continua
+        abrindo e commitando sua própria transação, como sempre. Chamado com
+        `conn=` (só `ingest.ingerir`, via `Database.transacao`), os três
+        rodam dentro da MESMA transação Postgres — commit/rollback é de quem
+        abriu `transacao()`, nunca daqui.
+        """
+        return nullcontext(conn) if conn is not None else self._conn()
+
+    @contextmanager
+    def transacao(self):
+        """Uma única transação Postgres para operações que precisam ser
+        atômicas juntas (change `ingestao-a-prova-de-falha`, spec.md
+        "Cadeia de ingestão é transacional"): `ingest.ingerir` encadeia
+        `upsert_contato` -> `get_or_create_conversa` -> `registrar_mensagem`
+        dentro de um `with db.transacao() as conn:`, passando `conn=conn`
+        para os três. Uma falha em qualquer ponto do meio propaga para fora
+        deste `with`, e o `with self._conn()` abaixo reverte tudo — psycopg 3
+        commita ao sair sem exceção, reverte ao sair com exceção.
+        """
+        with self._conn() as conn:
+            yield conn
+
     # -- contatos ---------------------------------------------------------
 
     def upsert_contato(
@@ -634,16 +710,20 @@ class Database:
         nome: str | None = None,
         tipo: str = B2C,
         origem: str | None = None,
+        conn=None,
     ) -> Contato:
         """Cria ou atualiza um contato, identificado pelo hash do telefone.
 
         O nome só é sobrescrito quando vem preenchido: um push_name ausente
         num evento não deve apagar o nome que alguém digitou à mão.
+
+        `conn=` opcional (change `ingestao-a-prova-de-falha`): ver
+        `Database._conn_ou`.
         """
         if tipo not in (B2B, B2C):
             raise ValueError(f"tipo inválido: {tipo!r}")
         telefone_hash = hash_telefone(telefone)
-        with self._conn() as conn:
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -694,15 +774,20 @@ class Database:
         FROM conversas c JOIN contatos ct ON ct.id = c.contato_id
     """
 
-    def get_or_create_conversa(self, contato_id: int, funil: str | None = None) -> Conversa:
+    def get_or_create_conversa(
+        self, contato_id: int, funil: str | None = None, *, conn=None
+    ) -> Conversa:
         """Conversa aberta do contato, criando uma se não houver.
 
         "Aberta" é a mais recente sem `resultado`. Conversa com resultado é
         histórico fechado e não recebe mensagem nova — um cliente que volta
         depois de fechado abre outra, o que mantém as métricas de conversão
         por conversa e não por pessoa.
+
+        `conn=` opcional (change `ingestao-a-prova-de-falha`): ver
+        `Database._conn_ou`.
         """
-        with self._conn() as conn:
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"{self._CONVERSA_SELECT} WHERE c.contato_id = %s "
@@ -857,6 +942,7 @@ class Database:
         enviada_em: datetime | None = None,
         *,
         externa_id: str | None = None,
+        conn=None,
     ) -> int | None:
         """Grava uma mensagem e atualiza `ultimo_inbound`/`ultimo_outbound`.
 
@@ -864,13 +950,16 @@ class Database:
         webhook reentregue não vira mensagem nova nem move o relógio da
         conversa, que é o que faria a temperatura oscilar sem ninguém ter
         falado nada.
+
+        `conn=` opcional (change `ingestao-a-prova-de-falha`): ver
+        `Database._conn_ou`.
         """
         if direcao not in (ENTRADA, SAIDA):
             raise ValueError(f"direção inválida: {direcao!r}")
         enviada_em = enviada_em or datetime.now(timezone.utc)
         coluna = "ultimo_inbound" if direcao == ENTRADA else "ultimo_outbound"
         bola = "camu" if direcao == ENTRADA else BOLA_CLIENTE
-        with self._conn() as conn:
+        with self._conn_ou(conn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -1893,6 +1982,85 @@ class Database:
                     (meses,),
                 )
                 return apagadas
+
+    # -- eventos brutos (staging, change `ingestao-a-prova-de-falha`) -----
+
+    def registrar_evento_bruto(self, payload: Any) -> int:
+        """Grava o payload cru do webhook ANTES de qualquer parsing/
+        `ingerir()` — design.md do change `ingestao-a-prova-de-falha`.
+
+        Chamado por `webhook.py::_processar`, sempre, mesmo que o evento
+        acabe sendo benigno. Nunca por `cmd_ingerir`: ali há um operador
+        olhando a saída no terminal, o staging existe para o caminho
+        automático, sem ninguém olhando.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO eventos_recebidos_bruto (payload) VALUES (%s) "
+                    "RETURNING id",
+                    (Json(payload),),
+                )
+                return cur.fetchone()[0]
+
+    def marcar_evento_bruto_processado(self, evento_id: int) -> None:
+        """`ingerir()` terminou sem exceção — a linha sai da lista de
+        pendentes de `listar_eventos_brutos_pendentes` e passa a ser
+        candidata de `purgar_eventos_brutos_antigos`."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE eventos_recebidos_bruto SET processado = TRUE, "
+                    "processado_em = now(), erro = NULL WHERE id = %s",
+                    (evento_id,),
+                )
+
+    def marcar_evento_bruto_falhou(self, evento_id: int, erro: str) -> None:
+        """`ingerir()` levantou uma exceção — a linha permanece
+        `processado = FALSE` (spec.md, "Falha de ingestão deixa rastro
+        reprocessável"), com o erro registrado e a tentativa contada.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE eventos_recebidos_bruto SET erro = %s, "
+                    "tentativas = tentativas + 1 WHERE id = %s",
+                    (erro[:2000] if erro else erro, evento_id),
+                )
+
+    def listar_eventos_brutos_pendentes(self, limite: int = 200) -> list[EventoBrutoRegistro]:
+        """Linhas `processado = FALSE`, em ordem de chegada — o que
+        `camucrm reprocessar-falhas` tenta reingerir."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, payload, recebido_em, processado, "
+                    "processado_em, erro, tentativas "
+                    "FROM eventos_recebidos_bruto WHERE NOT processado "
+                    "ORDER BY id LIMIT %s",
+                    (limite,),
+                )
+                return [EventoBrutoRegistro(*row) for row in cur.fetchall()]
+
+    def purgar_eventos_brutos_antigos(
+        self, dias: int = RETENCAO_EVENTOS_BRUTOS_DIAS
+    ) -> int:
+        """Remove só linhas `processado = TRUE` mais antigas que `dias`
+        (design.md: retenção de curto prazo, não histórico permanente).
+
+        `processado = FALSE` nunca é candidato, para nenhuma idade — apagar
+        uma falha ainda não resolvida repetiria exatamente o bug que este
+        change corrige (spec.md, "Retenção da caixa de reprocessamento não
+        apaga falha pendente").
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM eventos_recebidos_bruto WHERE processado "
+                    "AND recebido_em < now() - make_interval(days => %s)",
+                    (dias,),
+                )
+                return cur.rowcount
 
 
 def _texto(valor: Any) -> str | None:

@@ -41,9 +41,21 @@ class TesteRotas(unittest.TestCase):
         self.assertEqual(resposta.status_code, 200)
 
     def test_falha_no_processamento_nao_propaga(self):
-        """Um evento malformado não pode derrubar o worker."""
-        with patch.object(webhook, "criar_transporte", side_effect=RuntimeError("boom")):
+        """Um evento malformado não pode derrubar o worker.
+
+        `get_db()` precisa estar mockado agora (change
+        `ingestao-a-prova-de-falha`): `_processar` grava o payload em
+        `eventos_recebidos_bruto` antes de chegar em `criar_transporte`, e
+        sem mock isto tentaria abrir um pool contra Postgres de verdade.
+        """
+        db_falso = Mock()
+        db_falso.registrar_evento_bruto.return_value = 1
+        with patch.object(webhook, "get_db", return_value=db_falso), patch.object(
+            webhook, "criar_transporte", side_effect=RuntimeError("boom")
+        ):
             webhook._processar({"event": "x"})  # não deve levantar
+        db_falso.marcar_evento_bruto_falhou.assert_called_once()
+        db_falso.marcar_evento_bruto_processado.assert_not_called()
 
     def test_nao_existe_rota_de_envio(self):
         """§10: um webhook que responde sozinho é o disparo automático proibido."""
@@ -165,3 +177,70 @@ class TesteExtracaoAoReceber(unittest.TestCase):
         ), patch.object(webhook, "_extrair") as extrair:
             webhook._processar({"event": "messages.upsert"})
         extrair.assert_called_once_with(7)
+
+
+class TesteBootFalhaAlto(unittest.TestCase):
+    """Requirement (spec.md): "Schema ausente falha no boot, não no primeiro
+    evento" — `servir()` chama `ensure_schema()` antes de subir o uvicorn."""
+
+    def test_schema_ausente_ou_banco_indisponivel_derruba_boot(self):
+        db_falso = Mock()
+        db_falso.ensure_schema.side_effect = RuntimeError("schema ausente")
+        with patch.object(webhook, "get_db", return_value=db_falso), patch(
+            "uvicorn.run"
+        ) as uv_run:
+            with self.assertRaises(RuntimeError):
+                webhook.servir()
+        uv_run.assert_not_called()
+
+    def test_schema_ok_sobe_o_servico(self):
+        db_ok = Mock()
+        with patch.object(webhook, "get_db", return_value=db_ok), patch(
+            "uvicorn.run"
+        ) as uv_run:
+            webhook.servir(9999)
+        db_ok.ensure_schema.assert_called_once()
+        uv_run.assert_called_once()
+
+
+class TesteStagingDeEventosBrutos(unittest.TestCase):
+    """Requirements: "Payload bruto é preservado antes do processamento" e
+    "Falha de ingestão deixa rastro reprocessável"."""
+
+    def test_payload_e_gravado_antes_de_processar(self):
+        db_falso = Mock()
+        db_falso.registrar_evento_bruto.return_value = 42
+        from camucrm.ingest import ResultadoIngestao
+
+        with patch.object(webhook, "get_db", return_value=db_falso), patch.object(
+            webhook, "criar_transporte"
+        ), patch.object(
+            webhook, "ingerir", return_value=ResultadoIngestao(1, "Ana")
+        ), patch.object(webhook, "_extrair"):
+            webhook._processar({"event": "messages.upsert"})
+        db_falso.registrar_evento_bruto.assert_called_once_with(
+            {"event": "messages.upsert"}
+        )
+        db_falso.marcar_evento_bruto_processado.assert_called_once_with(42)
+        db_falso.marcar_evento_bruto_falhou.assert_not_called()
+
+    def test_excecao_em_ingerir_marca_falha_sem_apagar_o_payload(self):
+        db_falso = Mock()
+        db_falso.registrar_evento_bruto.return_value = 7
+        with patch.object(webhook, "get_db", return_value=db_falso), patch.object(
+            webhook, "criar_transporte", side_effect=RuntimeError("boom")
+        ):
+            webhook._processar({"event": "messages.upsert"})  # não deve levantar
+        db_falso.marcar_evento_bruto_falhou.assert_called_once()
+        args = db_falso.marcar_evento_bruto_falhou.call_args[0]
+        self.assertEqual(args[0], 7)
+        self.assertIn("boom", args[1])
+        db_falso.marcar_evento_bruto_processado.assert_not_called()
+
+    def test_falha_ao_gravar_o_staging_nao_propaga(self):
+        """Se nem o INSERT do staging funciona (banco fora do ar), o worker
+        ainda não pode cair — só não há onde registrar o rastro."""
+        db_falso = Mock()
+        db_falso.registrar_evento_bruto.side_effect = RuntimeError("sem conexão")
+        with patch.object(webhook, "get_db", return_value=db_falso):
+            webhook._processar({"event": "x"})  # não deve levantar

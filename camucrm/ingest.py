@@ -11,6 +11,8 @@ que é Evolution API, nem WhatsApp, nem o formato de nenhum webhook.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,6 +25,30 @@ from .taxonomia import B2B, B2C
 from .transport.base import EventoRecebido
 
 logger = logging.getLogger("camucrm.ingest")
+
+
+def _externa_id_efetivo(evento: EventoRecebido) -> str | None:
+    """`evento.externa_id`, ou um hash estável do payload cru quando ausente.
+
+    Change `ingestao-a-prova-de-falha`, design.md: "computar um hash estável
+    do payload cru (...) como um `externa_id` sintético quando o campo real
+    está ausente — mesma ideia que `backfill-seguro-para-reexecucao` usa
+    para mensagens sem id de origem. Isso estende a proteção de dedupe sem
+    exigir dois índices/dois caminhos de código" — `mensagens_externa_id_idx`
+    já é único sobre `externa_id IS NOT NULL`; preencher esse campo com um
+    hash sintético (em vez de deixá-lo `NULL`) basta para proteger reentrega
+    de um evento sem `key.id`.
+
+    Sem `evento.bruto` (evento já normalizado, construído direto em teste ou
+    por um caminho que não guarda o payload cru) não há o que hashear —
+    devolve `None`, mesmo comportamento de antes deste change.
+    """
+    if evento.externa_id is not None:
+        return evento.externa_id
+    if evento.bruto is None:
+        return None
+    canonico = json.dumps(evento.bruto, sort_keys=True, default=str)
+    return f"hash:{hashlib.md5(canonico.encode('utf-8')).hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -74,24 +100,30 @@ def ingerir(
         return ResultadoIngestao(None, None, ignorada=True)
 
     tipo = tipo_padrao if tipo_padrao in (B2B, B2C) else B2C
-    contato = db.upsert_contato(
-        evento.telefone, nome=evento.nome, tipo=tipo, origem=origem
-    )
-    conversa = db.get_or_create_conversa(contato.id)
+    externa_id = _externa_id_efetivo(evento)
 
-    inserida = db.registrar_mensagem(
-        conversa.id,
-        evento.direcao,
-        evento.texto,
-        evento.enviada_em,
-        externa_id=evento.externa_id,
-    )
+    # Change `ingestao-a-prova-de-falha`, spec.md "Cadeia de ingestão é
+    # transacional": os três rodam na MESMA transação Postgres — uma falha
+    # em qualquer ponto do meio não deixa contato/conversa gravados sem a
+    # mensagem correspondente (`Database.transacao`/`_conn_ou`).
+    with db.transacao() as conn:
+        contato = db.upsert_contato(
+            evento.telefone, nome=evento.nome, tipo=tipo, origem=origem, conn=conn
+        )
+        conversa = db.get_or_create_conversa(contato.id, conn=conn)
+
+        inserida = db.registrar_mensagem(
+            conversa.id,
+            evento.direcao,
+            evento.texto,
+            evento.enviada_em,
+            externa_id=externa_id,
+            conn=conn,
+        )
     if inserida is None:
         # Webhook reentregue. Não é erro, e não pode mover o relógio da
         # conversa — senão a temperatura oscilaria sem ninguém ter falado.
-        logger.debug(
-            "Mensagem duplicada ignorada (externa_id=%s)", evento.externa_id
-        )
+        logger.debug("Mensagem duplicada ignorada (externa_id=%s)", externa_id)
         return ResultadoIngestao(conversa.id, contato.label, duplicada=True)
 
     if evento.direcao == SAIDA:
