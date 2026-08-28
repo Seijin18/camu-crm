@@ -22,7 +22,7 @@ import hashlib
 import logging
 import os
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, Sequence
 
@@ -844,6 +844,38 @@ CREATE TABLE IF NOT EXISTS cobertura_extracao (
 # `NULL` violaria a própria constraint que garante que a geração nunca ficou
 # pela metade.
 TEXTO_RASCUNHO_PURGADO = "[texto apagado — retenção §12]"
+
+
+@dataclass
+class ContextoConversa:
+    """Tudo que `pipeline.recalcular` pergunta ao banco sobre UMA conversa,
+    pré-carregado em lote por `Database.contexto_para_recalculo` (otimização
+    de 2026-08-28 — ver o comentário acima daquele método para o porquê).
+
+    Mutável de propósito: `contexto_para_recalculo` preenche cada instância
+    incrementalmente conforme varre cada uma das seis consultas em lote, em
+    vez de montar um dataclass congelado a partir de uma junção só (que
+    exigiria decidir de antemão como combinar seis granularidades
+    diferentes — por chave de fato, por evento, por marco — numa única
+    linha por conversa).
+    """
+
+    fatos: dict[str, bool] = field(default_factory=dict)
+    momentos_fatos: dict[str, datetime] = field(default_factory=dict)
+    mensagens: list[Mensagem] = field(default_factory=list)
+    estagio_corrente: str | None = None
+    estagio_maximo_alcancado: str | None = None
+    ultimo_avanco_em: datetime | None = None
+    ultimo_avanco_causada_por: str | None = None
+    ultimo_followup_em: datetime | None = None
+    marcos: dict[str, datetime] = field(default_factory=dict)
+    recusa_desconsiderada: bool = False
+
+    @classmethod
+    def vazio(cls) -> "ContextoConversa":
+        """Uma conversa sem nenhum dado nas seis tabelas — ainda assim um
+        objeto válido, para quem chama nunca precisar tratar `None`."""
+        return cls()
 
 
 class Database:
@@ -2907,6 +2939,127 @@ class Database:
                     (dias,),
                 )
                 return cur.rowcount
+
+    # -- contexto em lote para recálculo (otimização de 2026-08-28) --------
+    #
+    # `recalcular` (uma conversa) faz ~10 idas separadas ao banco
+    # (`fatos_da_conversa`, `listar_mensagens`, `fato_registrado_em` × N,
+    # `ultimo_followup_em`, `ultimo_avanco_em`/`_causada_por`,
+    # `estagio_maximo_alcancado`, `estagio_corrente`, `marco_em` × N,
+    # `recusa_desconsiderada`). Contra Postgres local isso é de graça
+    # (latência ~0); contra um banco remoto (Supabase, medido ~0,5-0,7s por
+    # ida), `_carregar_candidatos` (que chama `recalcular` uma vez por
+    # conversa aberta) levava 40-50s com poucas conversas — não travado,
+    # devagar demais para um navegador não desistir.
+    #
+    # `contexto_para_recalculo` substitui isso por SEIS consultas em lote
+    # (uma por tabela envolvida, `WHERE conversa_id = ANY(%s)`), não uma por
+    # conversa — o tempo passa a ser CONSTANTE em relação ao número de
+    # conversas abertas, não proporcional a ele. `pipeline.recalcular_lote`
+    # usa isto para servir as mesmas perguntas que `recalcular` já fazia,
+    # sem duplicar a lógica de decisão (`ContextoConversa` intercepta só os
+    # métodos de leitura; ver `pipeline._ConversaCacheada`).
+
+    def contexto_para_recalculo(self, conversa_ids: Sequence[int]) -> dict[int, "ContextoConversa"]:
+        """Pré-carrega, em seis consultas, tudo que `recalcular` perguntaria
+        ao banco uma conversa de cada vez. Devolve um `ContextoConversa`
+        para CADA id pedido — inclusive os sem nenhum dado (vazio), para que
+        quem chama nunca precise checar `.get(id)` contra `None`.
+        """
+        ids = list(conversa_ids)
+        contexto: dict[int, ContextoConversa] = {cid: ContextoConversa.vazio() for cid in ids}
+        if not ids:
+            return contexto
+
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                # 1) fatos: chave -> momento (mensagem_em, com extraido_em de
+                # fallback), por conversa — substitui `fatos_da_conversa`
+                # (chave presente = True) E todas as chamadas de
+                # `fato_registrado_em` (o momento já vem junto).
+                cur.execute(
+                    "SELECT conversa_id, chave, MIN(COALESCE(mensagem_em, extraido_em)) "
+                    "FROM fatos WHERE conversa_id = ANY(%s) AND valor "
+                    "GROUP BY conversa_id, chave",
+                    (ids,),
+                )
+                for cid, chave, momento in cur.fetchall():
+                    contexto[cid].fatos[chave] = True
+                    contexto[cid].momentos_fatos[chave] = momento
+
+                # 2) mensagens — substitui `listar_mensagens`. Mesma ordem
+                # (`enviada_em, id`) dentro de cada conversa, garantida pelo
+                # ORDER BY composto; agrupar preserva essa ordem porque cada
+                # grupo é um subconjunto contíguo da varredura ordenada.
+                cur.execute(
+                    "SELECT conversa_id, direcao, enviada_em, texto FROM mensagens "
+                    "WHERE conversa_id = ANY(%s) ORDER BY conversa_id, enviada_em, id",
+                    (ids,),
+                )
+                for cid, direcao, enviada_em, texto in cur.fetchall():
+                    contexto[cid].mensagens.append(Mensagem(direcao, enviada_em, texto))
+
+                # 3) eventos_estagio — substitui `estagio_corrente`,
+                # `estagio_maximo_alcancado`, `ultimo_avanco_em` e
+                # `ultimo_avanco_causada_por` (quatro consultas antes, uma
+                # agora). Ordenado por id para bater com `estagio_corrente`
+                # ("a ordem de inserção é a ordem em que o sistema
+                # concluiu" — ver docstring de lá); o cálculo do último
+                # avanço AO VIVO é feito à parte, por `em`, porque é essa a
+                # semântica de `ultimo_avanco_em` (não a ordem de id).
+                from .taxonomia import is_terminal, rank_estagio
+
+                cur.execute(
+                    "SELECT conversa_id, id, para, em, origem, causada_por "
+                    "FROM eventos_estagio WHERE conversa_id = ANY(%s) ORDER BY conversa_id, id",
+                    (ids,),
+                )
+                ultimo_live: dict[int, tuple[datetime, str]] = {}
+                for cid, _id_evento, para, em, origem, causada_por in cur.fetchall():
+                    ctx = contexto[cid]
+                    ctx.estagio_corrente = para  # última linha da varredura ordenada vence
+                    if not is_terminal(para):
+                        atual = ctx.estagio_maximo_alcancado
+                        if atual is None or rank_estagio(para) > rank_estagio(atual):
+                            ctx.estagio_maximo_alcancado = para
+                    if origem == ORIGEM_LIVE:
+                        anterior = ultimo_live.get(cid)
+                        if anterior is None or em > anterior[0]:
+                            ultimo_live[cid] = (em, causada_por)
+                for cid, (em, causada_por) in ultimo_live.items():
+                    contexto[cid].ultimo_avanco_em = em
+                    contexto[cid].ultimo_avanco_causada_por = causada_por
+
+                # 4) followups — substitui `ultimo_followup_em`.
+                cur.execute(
+                    "SELECT conversa_id, MAX(enviado_em) FROM followups "
+                    "WHERE conversa_id = ANY(%s) GROUP BY conversa_id",
+                    (ids,),
+                )
+                for cid, ultimo in cur.fetchall():
+                    contexto[cid].ultimo_followup_em = ultimo
+
+                # 5) marcos_manuais — substitui `marcos_da_conversa` E todas
+                # as chamadas de `marco_em` (marco -> momento, num só mapa).
+                cur.execute(
+                    "SELECT conversa_id, marco, em FROM marcos_manuais "
+                    "WHERE conversa_id = ANY(%s)",
+                    (ids,),
+                )
+                for cid, marco, em in cur.fetchall():
+                    contexto[cid].marcos[marco] = em
+
+                # 6) correções — substitui `recusa_desconsiderada`.
+                cur.execute(
+                    "SELECT DISTINCT conversa_id FROM correcoes "
+                    "WHERE conversa_id = ANY(%s) AND campo = 'recusa_explicita' "
+                    "AND depois = 'desconsiderado'",
+                    (ids,),
+                )
+                for (cid,) in cur.fetchall():
+                    contexto[cid].recusa_desconsiderada = True
+
+        return contexto
 
     # -- prospecção B2B (change `prospeccao-b2b-shortlist`) ----------------
     #

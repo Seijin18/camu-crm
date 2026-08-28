@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
-from .db import Database, Conversa
+from .db import Conversa, ContextoConversa, Database
 from .rules import estagio as regras_estagio
 from .rules.sinais import SinaisConversa, construir_sinais
 from .rules.temperatura import Classificacao, classificar
@@ -311,10 +311,124 @@ def recalcular_todas(
 
     Rodar isto é o que se faz depois de mudar um critério de estágio ou de
     temperatura. O resultado é reprodutível: mesmos fatos, mesmo relógio,
-    mesmo resultado.
+    mesmo resultado. Delega a `recalcular_lote` (otimização de 2026-08-28)
+    — mesmo resultado de antes, com uma fração das idas ao banco.
     """
     agora = agora or datetime.now(timezone.utc)
-    return [
-        recalcular(db, conversa, agora=agora)
-        for conversa in db.listar_conversas_abertas(limite=limite)
-    ]
+    return recalcular_lote(db, db.listar_conversas_abertas(limite=limite), agora=agora)
+
+
+class _ConversaCacheada:
+    """Serve as leituras de UMA conversa a partir de um `ContextoConversa`
+    já pré-carregado, delegando tudo o mais (inclusive toda escrita) ao
+    `Database` real — ver o comentário de `Database.contexto_para_recalculo`
+    para o porquê desta otimização existir.
+
+    Existe para `recalcular_lote` poder chamar `recalcular` exatamente como
+    `recalcular_todas`/o painel sempre chamaram, SEM duplicar a lógica de
+    decisão de `carregar_sinais`/`_avanco_ao_vivo`/`momentos_de_estagio` —
+    esse código continua fazendo `db.fato_registrado_em(...)`,
+    `db.estagio_corrente(...)` etc. do jeito de sempre; só que aqui `db` é
+    este objeto, que já tem a resposta em memória. Duplicar a lógica de
+    decisão para um "caminho em lote" separado seria o tipo de divergência
+    que este projeto trata como o erro mais caro que existe — um recálculo
+    em lote que discordasse do recálculo de uma conversa só produziria
+    exatamente a inconsistência que a garantia de `estagio_de_partida`
+    (fonte de verdade = `eventos_estagio`, não cache) existe para evitar.
+
+    `conversa_id` é fixo na criação e conferido em cada leitura — um objeto
+    novo por conversa, nunca reaproveitado entre conversas diferentes, para
+    que um erro de programação (passar o objeto errado) estoure na hora, não
+    vire silenciosamente um estágio calculado com os fatos de outra conversa.
+    """
+
+    def __init__(self, db: Database, conversa_id: int, contexto: ContextoConversa):
+        self._db = db
+        self._id = conversa_id
+        self._ctx = contexto
+
+    def __getattr__(self, nome: str):
+        return getattr(self._db, nome)
+
+    def _conferir(self, conversa_id: int) -> None:
+        if conversa_id != self._id:
+            raise ValueError(
+                f"_ConversaCacheada para conversa {self._id} usado com "
+                f"conversa_id {conversa_id} — provável bug de programação"
+            )
+
+    def fatos_da_conversa(self, conversa_id: int) -> dict[str, bool]:
+        self._conferir(conversa_id)
+        return dict(self._ctx.fatos)
+
+    def listar_mensagens(self, conversa_id: int):
+        self._conferir(conversa_id)
+        return list(self._ctx.mensagens)
+
+    def fato_registrado_em(self, conversa_id: int, chave: str):
+        self._conferir(conversa_id)
+        return self._ctx.momentos_fatos.get(chave)
+
+    def ultimo_followup_em(self, conversa_id: int):
+        self._conferir(conversa_id)
+        return self._ctx.ultimo_followup_em
+
+    def ultimo_avanco_em(self, conversa_id: int):
+        self._conferir(conversa_id)
+        return self._ctx.ultimo_avanco_em
+
+    def ultimo_avanco_causada_por(self, conversa_id: int):
+        self._conferir(conversa_id)
+        return self._ctx.ultimo_avanco_causada_por
+
+    def estagio_maximo_alcancado(self, conversa_id: int):
+        self._conferir(conversa_id)
+        return self._ctx.estagio_maximo_alcancado
+
+    def estagio_corrente(self, conversa_id: int):
+        self._conferir(conversa_id)
+        return self._ctx.estagio_corrente
+
+    def marco_em(self, conversa_id: int, marco: str):
+        self._conferir(conversa_id)
+        return self._ctx.marcos.get(marco)
+
+    def marcos_da_conversa(self, conversa_id: int, *, conn=None):
+        self._conferir(conversa_id)
+        return set(self._ctx.marcos.keys())
+
+    def recusa_desconsiderada(self, conversa_id: int) -> bool:
+        self._conferir(conversa_id)
+        return self._ctx.recusa_desconsiderada
+
+
+def recalcular_lote(
+    db: Database,
+    conversas: list[Conversa],
+    *,
+    agora: datetime | None = None,
+    persistir: bool = True,
+) -> list[EstadoConversa]:
+    """`recalcular` para várias conversas, com o custo de rede de UMA.
+
+    Pré-carrega tudo com `Database.contexto_para_recalculo` (seis consultas
+    em lote, não uma por conversa por campo) e chama `recalcular` normal
+    para cada conversa contra um `_ConversaCacheada` — mesma função, mesmo
+    resultado, mesma ordem de decisão de sempre, só sem o round-trip de rede
+    repetido. Ver `Database.contexto_para_recalculo` para a motivação
+    completa (medido: 40-50s virou baixos segundos contra um banco remoto,
+    com poucas conversas abertas).
+
+    Usada por `recalcular_todas` (CLI `camucrm recalcular`, e por extensão
+    `camucrm fila`, que chama `recalcular_lote` diretamente — era o mais
+    lento dos dois na prática, por rodar com `persistir=True` por padrão) e
+    por `camucrm/painel/api.py::_carregar_candidatos`/`_carregar_fechadas`
+    (fila, kanban, aba Conversas — as rotas que motivaram a otimização).
+    """
+    agora = agora or datetime.now(timezone.utc)
+    contexto_por_id = db.contexto_para_recalculo([c.id for c in conversas])
+    resultados = []
+    for conversa in conversas:
+        cache = _ConversaCacheada(db, conversa.id, contexto_por_id[conversa.id])
+        resultados.append(recalcular(cache, conversa, agora=agora, persistir=persistir))
+    return resultados

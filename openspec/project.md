@@ -224,6 +224,42 @@ Nenhum dos dois muda `rules/` nem a divisão de três lugares do LLM (§1). Orde
 de implementação: `backfill-cobertura-por-prompt` primeiro (mais isolado,
 maior confiança de causa), `extracao-em-lote-por-janela` depois.
 
+## Migração para Supabase e otimização de N+1 (2026-08-28)
+
+Outra sessão migrou `CAMU_DB_DSN` de Postgres local para um projeto Supabase
+(pooler `aws-0-us-east-2.pooler.supabase.com`), sem intervenção do usuário
+nesta sessão. `start.sh`/`status.sh` ganharam detecção do banco real (antes
+assumiam Postgres local incondicionalmente via docker — o que escondeu, na
+prática, que o painel estava conectando em outro lugar).
+
+**Achado, investigado por eliminação:** o painel "não carregava" a fila
+contra o Supabase — não travamento, latência real. `pipeline.recalcular`
+faz ~10 idas ao banco por conversa (`fatos_da_conversa`, `listar_mensagens`,
+`fato_registrado_em` × N, `ultimo_followup_em`, `ultimo_avanco_em`/
+`_causada_por`, `estagio_maximo_alcancado`, `estagio_corrente`, `marco_em`
+× N, `recusa_desconsiderada`); `_carregar_candidatos`/`_carregar_fechadas`
+(painel) e `camucrm fila` chamavam isso uma conversa de cada vez. Contra
+Postgres local (latência ~0) isso sempre foi de graça; contra o Supabase
+(~0,5-0,7s por ida, medido), a fila com 4 conversas abertas levava 34-48s —
+confirmado que a rota SEMPRE terminava (espera de ~120s), só devagar demais
+para um navegador não desistir.
+
+**Correção:** `Database.contexto_para_recalculo` (seis consultas em lote,
+`WHERE conversa_id = ANY(%s)`, uma por tabela envolvida) + `pipeline.
+recalcular_lote`, que reusa `recalcular` sem duplicar a lógica de decisão —
+`pipeline._ConversaCacheada` intercepta só as leituras (servidas do lote
+pré-carregado), delegando toda escrita ao `Database` real. Medido depois:
+34-48s → 2-3s no painel, 44s → 5s em `camucrm fila`. Equivalência com o
+caminho antigo provada contra Postgres real, não só por fake — ver
+`tests/integration/test_recalculo_em_lote_postgres.py` (fatos, trilha de
+eventos com reabertura, follow-up + recusa desconsiderada, marco manual, e
+várias conversas no mesmo lote não se misturando).
+
+Fora de escopo desta correção: `recalcular` de UMA conversa (webhook,
+extração, ações do painel) continua fazendo as ~10 idas de sempre — N=1 não
+tem N+1 para otimizar, e `_ConversaCacheada` existe só para o caminho em
+lote.
+
 ## Próximos changes candidatos
 
 `midia-foto-pet` continua à frente **em valor** — não depende do painel, e

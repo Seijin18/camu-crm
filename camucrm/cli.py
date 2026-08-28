@@ -28,7 +28,7 @@ from .extraction import FATOS_BOOLEANOS
 from .ingest import ingerir
 from .extraction.extractor import Extrator
 from .llm import LlmIndisponivelError, criar_llm
-from .pipeline import recalcular, recalcular_todas
+from .pipeline import recalcular, recalcular_lote, recalcular_todas
 from .rules.fila import Candidato, formatar_fila, montar_fila
 from .rules.estagio import sugere_b2b
 from .rules.temperatura import classificar
@@ -77,22 +77,26 @@ def cmd_fila(args) -> int:
     if args.incluir_teste and args.somente_teste:
         raise SystemExit("--incluir-teste e --somente-teste não podem ser usados juntos")
     agora = datetime.now(timezone.utc)
-    candidatos = []
     conversas = banco.listar_conversas_abertas(
         incluir_teste=args.incluir_teste, apenas_teste=args.somente_teste
     )
-    for conversa in conversas:
-        estado = recalcular(banco, conversa, agora=agora, persistir=not args.simular)
-        candidatos.append(
-            Candidato(
-                conversa_id=conversa.id,
-                nome=conversa.nome_contato or f"#{conversa.id}",
-                funil=conversa.funil,
-                estagio=estado.estagio,
-                classificacao=estado.classificacao,
-                sinais=estado.sinais,
-            )
+    # `recalcular_lote` (otimização de 2026-08-28): mesmo resultado de
+    # `recalcular` chamado uma conversa de cada vez, com uma fração das idas
+    # ao banco — ver `Database.contexto_para_recalculo`. Este é o comando
+    # que "precisa ser rodado toda manhã" (docstring acima); contra um banco
+    # remoto o padrão antigo levava dezenas de segundos.
+    estados = recalcular_lote(banco, conversas, agora=agora, persistir=not args.simular)
+    candidatos = [
+        Candidato(
+            conversa_id=conversa.id,
+            nome=conversa.nome_contato or f"#{conversa.id}",
+            funil=conversa.funil,
+            estagio=estado.estagio,
+            classificacao=estado.classificacao,
+            sinais=estado.sinais,
         )
+        for conversa, estado in zip(conversas, estados)
+    ]
     itens = montar_fila(candidatos, limite=args.limite)
     print(formatar_fila(itens, data=agora.strftime("%d/%m")))
     if args.motivos:

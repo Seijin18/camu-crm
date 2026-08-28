@@ -6,11 +6,16 @@ threadpool. Uma rota `async def` chamando uma consulta síncrona bloquearia o
 loop inteiro — o bug mais provável neste tipo de serviço, e o motivo do
 `CLAUDE.md` pedir atenção a isso explicitamente.
 
-N+1 aceito conscientemente: cada conversa aberta é recalculada (`pipeline.
-recalcular(persistir=False)`) uma a uma. `?limite=200` é o teto; acima de 150
-conversas abertas o módulo loga aviso — não é otimizado agora porque o número
-de conversas abertas de verdade fica muito abaixo disso, e otimizar cedo
-trocaria simplicidade por um problema que ainda não existe.
+N+1 de REDE otimizado (2026-08-28): `_carregar_candidatos`/`_carregar_fechadas`
+usam `pipeline.recalcular_lote`, que pré-carrega em seis consultas o que antes
+era uma ida ao banco por conversa por campo (`Database.
+contexto_para_recalculo`). Motivador: contra Postgres local o padrão antigo
+era de graça (latência ~0); contra um banco remoto (Supabase), a fila com
+poucas conversas abertas levava 40-50s. N+1 de PROCESSAMENTO em Python
+continua existindo (cada conversa ainda passa pela mesma lógica de decisão,
+uma de cada vez) — é barato e cresce sub-linearmente com o volume real de
+conversas abertas, então não é o gargalo. `?limite=200` é o teto; acima de
+150 conversas abertas o módulo loga aviso.
 
 Este módulo (`api.py`) não importa `camucrm.transport` diretamente — a única
 rota com "enviar" no path (`POST /prospeccao/{id}/enviar`, change
@@ -56,7 +61,7 @@ from ..evaluation.dataset import DatasetInvalidoError, TAMANHO_MINIMO, avisos_de
 from ..evaluation.runner import rodar as rodar_eval
 from ..extraction.extractor import Extrator
 from ..llm import LlmIndisponivelError, criar_llm
-from ..pipeline import recalcular
+from ..pipeline import recalcular, recalcular_lote
 from ..rules.fila import Candidato, montar_fila
 from ..taxonomia import B2B, B2C, FUNIS
 from ..whatsapp_export import (
@@ -92,9 +97,12 @@ def _carregar_candidatos(
 ):
     """Conversas abertas, recalculadas, prontas para virar card ou item de fila.
 
-    Um recálculo por conversa (N+1 aceito, ver docstring do módulo). O aviso
-    de log acima de `LIMITE_AVISO_N1` é o que o plano pede: sinalizar o custo
-    sem bloquear a rota por causa dele.
+    Recálculo em LOTE (change de 2026-08-28: otimização de consultas) — não
+    mais uma ida ao banco por conversa por campo. `recalcular_lote` faz seis
+    consultas totais, não seis por conversa; o aviso de log acima de
+    `LIMITE_AVISO_N1` continua existindo porque o CUSTO DE PROCESSAMENTO em
+    Python ainda cresce com o número de conversas, só o custo de REDE deixou
+    de crescer.
 
     `apenas_teste` (change `contatos-de-teste-isolados`) é o toggle "Modo
     teste" do painel — sempre binário aqui (nunca `incluir_teste`, que é só
@@ -106,16 +114,14 @@ def _carregar_candidatos(
         import logging
 
         logging.getLogger("camucrm.painel").warning(
-            "%s conversas abertas recalculadas nesta requisição (N+1 aceito, "
-            "ver CLAUDE.md/plano do painel-leitura)",
+            "%s conversas abertas recalculadas nesta requisição (custo de "
+            "processamento cresce com N mesmo em lote — ver CLAUDE.md/plano "
+            "do painel-leitura)",
             len(conversas),
         )
     agora = datetime.now(timezone.utc)
-    resultado = []
-    for conversa in conversas:
-        estado = recalcular(db, conversa, agora=agora, persistir=False)
-        resultado.append((conversa, estado))
-    return resultado
+    estados = recalcular_lote(db, conversas, agora=agora, persistir=False)
+    return list(zip(conversas, estados))
 
 
 def _carregar_fechadas(
@@ -126,13 +132,14 @@ def _carregar_fechadas(
     Change `marco-manual-visivel-na-aba-conversas`: existe só para
     `listar_conversas` abaixo — nunca para `/kanban` nem para a fila, que
     continuam batendo exclusivamente em `_carregar_candidatos` (requirement
-    "Kanban e fila continuam mostrando só conversas abertas"). Mesmo padrão
-    de recálculo N+1 sem persistir (`recalcular(..., persistir=False)`):
-    barato, e não tem side-effect mesmo numa conversa já fechada.
+    "Kanban e fila continuam mostrando só conversas abertas"). Recálculo em
+    lote (mesma otimização de `_carregar_candidatos`), sem persistir: barato,
+    e não tem side-effect mesmo numa conversa já fechada.
     """
     conversas = db.listar_conversas_fechadas(limite=limite, apenas_teste=apenas_teste)
     agora = datetime.now(timezone.utc)
-    return [(c, recalcular(db, c, agora=agora, persistir=False)) for c in conversas]
+    estados = recalcular_lote(db, conversas, agora=agora, persistir=False)
+    return list(zip(conversas, estados))
 
 
 def _candidato_de(conversa, estado) -> Candidato:

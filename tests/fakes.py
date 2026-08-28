@@ -18,6 +18,7 @@ from camucrm.db import (
     Contato,
     Conversa,
     ContatoResumido,
+    ContextoConversa,
     CorrecaoRegistro,
     EventoBrutoRegistro,
     EventoRegistro,
@@ -746,6 +747,72 @@ class FakeDatabase:
             and c["depois"] == "desconsiderado"
             for c in self.correcoes
         )
+
+    def contexto_para_recalculo(self, conversa_ids) -> dict:
+        """Espelha `db.Database.contexto_para_recalculo` (otimização de
+        2026-08-28): mesma resposta que chamar `fatos_da_conversa`,
+        `listar_mensagens`, `fato_registrado_em`, `ultimo_followup_em`,
+        `ultimo_avanco_em`/`_causada_por`, `estagio_maximo_alcancado`,
+        `estagio_corrente`, `marco_em`, `marcos_da_conversa` e
+        `recusa_desconsiderada` uma a uma dariam — só que construída
+        iterando as listas em memória uma vez, não uma consulta por campo.
+        Sem I/O real aqui (é um fake), mas a FORMA da resposta precisa bater
+        exatamente, porque `pipeline._ConversaCacheada` serve as mesmas
+        perguntas que o caminho não-lote faz, e um teste que passasse contra
+        o fake sem bater com o `Database` real esconderia justamente o tipo
+        de divergência que este projeto trata como o erro mais caro.
+        """
+        ids = set(conversa_ids)
+        contexto = {cid: ContextoConversa.vazio() for cid in ids}
+
+        for c, k, evidencia, extraido_em, mensagem_em in self.fatos:
+            if c not in ids:
+                continue
+            momento = mensagem_em or extraido_em
+            ctx = contexto[c]
+            ctx.fatos[k] = True
+            anterior = ctx.momentos_fatos.get(k)
+            if anterior is None or momento < anterior:
+                ctx.momentos_fatos[k] = momento
+
+        for cid in ids:
+            contexto[cid].mensagens = self.listar_mensagens(cid)
+
+        ultimo_live: dict[int, tuple] = {}
+        for e in self.eventos:
+            cid = e["conversa_id"]
+            if cid not in ids:
+                continue
+            ctx = contexto[cid]
+            ctx.estagio_corrente = e["para"]  # última iteração = ordem de inserção
+            if not is_terminal(e["para"]):
+                atual = ctx.estagio_maximo_alcancado
+                if atual is None or rank_estagio(e["para"]) > rank_estagio(atual):
+                    ctx.estagio_maximo_alcancado = e["para"]
+            if e["origem"] == "live":
+                anterior = ultimo_live.get(cid)
+                if anterior is None or e["em"] > anterior[0]:
+                    ultimo_live[cid] = (e["em"], e.get("causada_por", "cliente"))
+        for cid, (em, causada_por) in ultimo_live.items():
+            contexto[cid].ultimo_avanco_em = em
+            contexto[cid].ultimo_avanco_causada_por = causada_por
+
+        for cid in ids:
+            contexto[cid].ultimo_followup_em = self.ultimo_followup_em(cid)
+
+        for cid in ids:
+            for marco, (em, _por) in self.marcos_por.get(cid, {}).items():
+                contexto[cid].marcos[marco] = em
+            # marcos sem registro em `marcos_por` (ex.: fixtures antigas que
+            # chamam `registrar_marco` diretamente no dict) ainda contam,
+            # com `agora` como `marco_em` já fazia — mesma regra de fallback.
+            for marco in self.marcos.get(cid, set()) - set(contexto[cid].marcos):
+                contexto[cid].marcos[marco] = datetime.now(timezone.utc)
+
+        for cid in ids:
+            contexto[cid].recusa_desconsiderada = self.recusa_desconsiderada(cid)
+
+        return contexto
 
     def correcoes_da_conversa(self, conversa_id: int) -> list[CorrecaoRegistro]:
         linhas = [
