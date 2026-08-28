@@ -489,7 +489,16 @@ def cmd_ingerir(args) -> int:
     nome_transporte = args.transporte or "evolution"
     transporte = criar_transporte(nome_transporte, para_envio=False)
     payload = json.loads(sys.stdin.read())
-    resultado = ingerir(banco, transporte.receber(payload), origem="whatsapp")
+    # Change `ingestao-restrita-por-instancia`: mesmo parâmetro que o
+    # webhook passa (`payload.get("instance")`) — os dois caminhos nunca
+    # podem divergir. `--instancia` também aceita override manual, útil
+    # pra testar um payload sem o campo `instance` de verdade.
+    instancia = args.instancia or (
+        payload.get("instance") if isinstance(payload, dict) else None
+    )
+    resultado = ingerir(
+        banco, transporte.receber(payload), origem="whatsapp", instancia=instancia
+    )
     if (
         resultado.ignorada
         and transporte.nome != "evolution"
@@ -772,6 +781,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--transporte",
         help="padrão: evolution, mesmo do webhook (ver requirement "
         "'cmd_ingerir não finge sucesso silencioso')",
+    )
+    p.add_argument(
+        "--instancia",
+        help="nome da instância de origem (change "
+        "`ingestao-restrita-por-instancia`); padrão: campo 'instance' do "
+        "próprio payload, mesmo que o webhook usa",
     )
     p.set_defaults(func=cmd_ingerir)
 

@@ -59,11 +59,6 @@ class TesteCmdIngerirNaoFingeSucessoSilencioso(unittest.TestCase):
         self.addCleanup(contexto.stop)
 
     def _tem_contato_ingerido(self) -> bool:
-        # `FakeDatabase.get_or_create_conversa` (via `criar_conversa`) cria
-        # um contato "fantasma" auxiliar a cada conversa nova, além do
-        # contato real de `upsert_contato` — quirk pré-existente do fake,
-        # não deste change. Por isso a asserção é "existe o contato certo",
-        # não "existe exatamente um".
         return any(c.telefone == "5511999998888" for c in self.db.contatos.values())
 
     def test_sem_transporte_usa_evolution_por_padrao(self):
@@ -101,6 +96,46 @@ class TesteCmdIngerirNaoFingeSucessoSilencioso(unittest.TestCase):
         )
         self.assertEqual(codigo, 0)
         self.assertTrue(self._tem_contato_ingerido())
+
+
+class TesteCmdIngerirInstanciaRestrita(unittest.TestCase):
+    """Change `ingestao-restrita-por-instancia`: `--instancia` (ou o campo
+    `instance` do próprio payload) segue o mesmo caminho de
+    `ingest.ingerir` que o webhook usa — os dois nunca podem divergir."""
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        contexto = patch.object(cli, "_db", return_value=self.db)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        ambiente = patch.dict(
+            "os.environ", {"CAMU_INSTANCIAS_RESTRITAS": "pessoal-marcos"}
+        )
+        ambiente.start()
+        self.addCleanup(ambiente.stop)
+
+    def test_flag_instancia_restrita_telefone_desconhecido_nao_cria_nada(self):
+        codigo = _rodar(
+            ["ingerir", "--instancia", "pessoal-marcos"], payload=_payload_evolution()
+        )
+        self.assertEqual(codigo, 0)
+        self.assertEqual(self.db.contatos, {})
+
+    def test_campo_instance_do_payload_tem_o_mesmo_efeito_da_flag(self):
+        payload = _payload_evolution()
+        payload["instance"] = "pessoal-marcos"
+        codigo = _rodar(["ingerir"], payload=payload)
+        self.assertEqual(codigo, 0)
+        self.assertEqual(self.db.contatos, {})
+
+    def test_instancia_nao_restrita_ingere_normalmente(self):
+        codigo = _rodar(
+            ["ingerir", "--instancia", "camu"], payload=_payload_evolution()
+        )
+        self.assertEqual(codigo, 0)
+        self.assertTrue(
+            any(c.telefone == "5511999998888" for c in self.db.contatos.values())
+        )
 
 
 class TesteReprocessarFalhas(unittest.TestCase):

@@ -17,7 +17,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 
-from . import acoes
+from . import acoes, config
 from .db import Database, hash_telefone
 from .pipeline import EstadoConversa, recalcular
 from .rules.sinais import SAIDA
@@ -82,6 +82,7 @@ def ingerir(
     origem: str = "whatsapp",
     tipo_padrao: str = B2C,
     agora: datetime | None = None,
+    instancia: str | None = None,
 ) -> ResultadoIngestao:
     """Grava a mensagem e recalcula o estado da conversa.
 
@@ -95,9 +96,34 @@ def ingerir(
     aquele número é uma loja marca com `camucrm marcar`. Um lead classificado
     errado entra no funil errado e sai da fila pela regra errada, e ninguém
     descobre por quê.
+
+    `instancia` (change `ingestao-restrita-por-instancia`): nome da
+    instância da Evolution API de onde o evento chegou (ex.: número da
+    Camu, número pessoal, número do Felipe). Quando `instancia` está em
+    `config.instancias_restritas()` — as instâncias além da Camu, que
+    também recebem mensagem de gente que nunca teve relação comercial
+    nenhuma — um telefone que não é `contato` conhecido nem está em
+    `prospeccoes` é ignorado por inteiro, ANTES de qualquer
+    upsert/gravação: nenhum `contato`, `conversa` ou `mensagem` nasce dele.
+    A instância da Camu (não listada, o padrão) nunca passa por esta
+    checagem — continua aceitando DM nova de qualquer telefone, que é como
+    o funil B2C entra hoje (§12, design.md do change).
     """
     if evento is None:
         return ResultadoIngestao(None, None, ignorada=True)
+
+    telefone_hash = hash_telefone(evento.telefone)
+    em_prospeccao = db.prospeccao_por_telefone_hash(telefone_hash) is not None
+
+    if instancia is not None and instancia in config.instancias_restritas():
+        conhecido = db.contato_por_telefone_hash(telefone_hash) is not None
+        if not conhecido and not em_prospeccao:
+            logger.info(
+                "Ingestão ignorada: instância restrita %r, telefone "
+                "desconhecido (não é contato nem prospecção)",
+                instancia,
+            )
+            return ResultadoIngestao(None, None, ignorada=True)
 
     tipo = tipo_padrao if tipo_padrao in (B2B, B2C) else B2C
     # Change `prospeccao-b2b-shortlist`: telefone presente na shortlist B2B
@@ -107,7 +133,7 @@ def ingerir(
     # pelo operador ao importar a planilha (design.md do change). Só afeta
     # contato NOVO: `db.upsert_contato` nunca atualiza `tipo` de um contato
     # já existente via `ON CONFLICT`.
-    if db.prospeccao_por_telefone_hash(hash_telefone(evento.telefone)) is not None:
+    if em_prospeccao:
         tipo = B2B
     externa_id = _externa_id_efetivo(evento)
 

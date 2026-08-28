@@ -251,6 +251,19 @@ Nesta ordem de dependência:
    por transição — ver `design.md` do change para o porquê de não ser
    `'backfill'`) — disparo só pelo painel, decisão do usuário, sem comando
    CLI dedicado.
+6. **`ingestao-restrita-por-instancia`** — implementado em 2026-08-27
+   (proposto e concluído no mesmo dia), pedido do usuário: número pessoal
+   (dele e do Felipe) vai virar instância própria
+   da Evolution API, ao vivo, além do número da Camu. Sem a restrição,
+   qualquer amigo/familiar que mandasse mensagem viraria "contato" no CRM.
+   Decisão confirmada com o usuário: a restrição ("só contato já conhecido
+   ou vindo de `prospeccoes`") é por INSTÂNCIA
+   (`CAMU_INSTANCIAS_RESTRITAS`), nunca global — a instância da Camu
+   continua aceitando DM nova de qualquer um, que é como o funil B2C entra
+   hoje (§12). Sem dependência das anteriores. **Pendente** (`tasks.md`
+   7.2, fora do código): confirmar contra um payload real, quando as
+   instâncias novas forem registradas na Evolution API, que o campo
+   `instance` chega como assumido em `design.md`.
 
 O painel não é mais candidato — é change ativo, antecipado. Ver os seis
 changes `painel-leitura`, `painel-tempo-real`, `acoes-no-painel`,

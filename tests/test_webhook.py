@@ -328,3 +328,57 @@ class TesteStagingDeEventosBrutos(unittest.TestCase):
         db_falso.registrar_evento_bruto.side_effect = RuntimeError("sem conexão")
         with patch.object(webhook, "get_db", return_value=db_falso):
             webhook._processar({"event": "x"})  # não deve levantar
+
+
+class TesteInstanciaRepassadaParaIngerir(unittest.TestCase):
+    """Change `ingestao-restrita-por-instancia`: `_processar` extrai
+    `payload["instance"]` e repassa para `ingest.ingerir`, que decide a
+    restrição — nenhuma regra de negócio mora aqui (docstring do módulo),
+    só a extração do campo."""
+
+    def test_campo_instance_do_payload_e_repassado(self):
+        from camucrm.ingest import ResultadoIngestao
+
+        db_falso = Mock()
+        db_falso.registrar_evento_bruto.return_value = 1
+        with patch.object(webhook, "get_db", return_value=db_falso), patch.object(
+            webhook, "criar_transporte"
+        ), patch.object(
+            webhook, "ingerir", return_value=ResultadoIngestao(1, "Ana")
+        ) as ingerir_mock, patch.object(webhook, "_extrair"):
+            webhook._processar({"event": "messages.upsert", "instance": "pessoal-marcos"})
+        self.assertEqual(ingerir_mock.call_args.kwargs.get("instancia"), "pessoal-marcos")
+
+    def test_payload_sem_campo_instance_repassa_none(self):
+        from camucrm.ingest import ResultadoIngestao
+
+        db_falso = Mock()
+        db_falso.registrar_evento_bruto.return_value = 1
+        with patch.object(webhook, "get_db", return_value=db_falso), patch.object(
+            webhook, "criar_transporte"
+        ), patch.object(
+            webhook, "ingerir", return_value=ResultadoIngestao(1, "Ana")
+        ) as ingerir_mock, patch.object(webhook, "_extrair"):
+            webhook._processar({"event": "messages.upsert"})
+        self.assertIsNone(ingerir_mock.call_args.kwargs.get("instancia"))
+
+    def test_evento_ignorado_por_instancia_ainda_fica_staged(self):
+        """Requirement "Payload cru continua sendo preservado
+        incondicionalmente": o staging roda ANTES de `ingerir` decidir
+        qualquer coisa, então um evento ignorado por restrição de
+        instância continua tendo sua linha em `eventos_recebidos_bruto`."""
+        from camucrm.ingest import ResultadoIngestao
+
+        db_falso = Mock()
+        db_falso.registrar_evento_bruto.return_value = 5
+        with patch.object(webhook, "get_db", return_value=db_falso), patch.object(
+            webhook, "criar_transporte"
+        ), patch.object(
+            webhook, "ingerir", return_value=ResultadoIngestao(None, None, ignorada=True)
+        ), patch.object(webhook, "_extrair") as extrair:
+            webhook._processar({"event": "messages.upsert", "instance": "pessoal-marcos"})
+        db_falso.registrar_evento_bruto.assert_called_once_with(
+            {"event": "messages.upsert", "instance": "pessoal-marcos"}
+        )
+        db_falso.marcar_evento_bruto_processado.assert_called_once_with(5)
+        extrair.assert_not_called()

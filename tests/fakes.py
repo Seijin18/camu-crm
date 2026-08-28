@@ -852,17 +852,39 @@ class FakeDatabase:
         self.contatos[contato_id] = contato
         return contato
 
+    def contato_por_telefone_hash(self, telefone_hash: str) -> Contato | None:
+        for contato in self.contatos.values():
+            if contato.telefone_hash == telefone_hash:
+                return contato
+        return None
+
     def get_or_create_conversa(self, contato_id, funil=None, *, conn=None) -> Conversa:
+        """Espelha `db.Database.get_or_create_conversa`: cria a `conversas`
+        para o `contato_id` JÁ EXISTENTE — nunca um contato novo. Antes
+        deste ajuste (change `ingestao-restrita-por-instancia`, teste que
+        conta `len(self.contatos)` pela primeira vez), delegava para
+        `criar_conversa` — que sempre cria um contato PRÓPRIO, com telefone
+        placeholder — e só corrigia `conversa.contato_id` depois. O contato
+        fantasma sobrava órfão em `self.contatos`, inofensivo para os
+        testes que nunca contavam o total, mas divergente do banco real.
+        """
         for conversa in self.conversas.values():
             if conversa.contato_id == contato_id and conversa.resultado is None:
                 return conversa
         contato = self.contatos[contato_id]
-        conversa = self.criar_conversa(
-            funil=funil or contato.tipo,
-            estagio="P0" if (funil or contato.tipo) == "b2b" else "S0",
-            nome=contato.nome or "",
+        funil_efetivo = funil or contato.tipo
+        conversa_id = self._novo_id()
+        conversa = Conversa(
+            id=conversa_id, contato_id=contato_id, funil=funil_efetivo,
+            estagio="P0" if funil_efetivo == "b2b" else "S0",
+            bola_com="cliente", temperatura=None, ultimo_inbound=None,
+            ultimo_outbound=None, followups_enviados=0, resultado=None,
+            ultima_mensagem_processada_id=None, nome_contato=contato.nome or "",
         )
-        conversa.contato_id = contato_id
+        self.conversas[conversa_id] = conversa
+        self.mensagens[conversa_id] = []
+        self.followups[conversa_id] = []
+        self.marcos[conversa_id] = set()
         return conversa
 
     # -- rascunhos (§10, change `rascunho-registrado`) --------------------

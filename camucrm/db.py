@@ -955,6 +955,24 @@ class Database:
                 )
                 return Contato(*cur.fetchone())
 
+    def contato_por_telefone_hash(self, telefone_hash: str) -> Contato | None:
+        """Leitura pura, sem upsert — mesmo padrão de
+        `prospeccao_por_telefone_hash`. Usado por `ingest.ingerir` (change
+        `ingestao-restrita-por-instancia`) para decidir se um telefone JÁ é
+        contato conhecido ANTES de decidir se cria um novo — uma instância
+        restrita não pode upsertar (que sempre cria se não existir) para
+        descobrir se já existia.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, nome, telefone_hash, telefone, tipo, origem, "
+                    "criado_em, e_teste FROM contatos WHERE telefone_hash = %s",
+                    (telefone_hash,),
+                )
+                row = cur.fetchone()
+                return Contato(*row) if row else None
+
     def set_tipo_contato(self, contato_id: int, tipo: str, *, conn=None) -> None:
         """`conn=` opcional (change `painel-mensagens-recentes-e-acoes-
         seguras`): ver `Database._conn_ou` — usado por

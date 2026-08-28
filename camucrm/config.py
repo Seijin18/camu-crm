@@ -48,6 +48,11 @@ ENV_EVAL_DATASET = "CAMU_EVAL_DATASET"
 # Change `prospeccao-b2b-shortlist`: template da mensagem de prospecção B2B,
 # path configurável — mesmo padrão de `ENV_PLAYBOOK`.
 ENV_MENSAGEM_PROSPECCAO = "CAMU_MENSAGEM_PROSPECCAO"
+# Change `ingestao-restrita-por-instancia`: CSV de nomes de instância da
+# Evolution API (ex.: número pessoal, número do Felipe) cuja ingestão só
+# acompanha telefone já `contato` ou já em `prospeccoes` — ver
+# `instancias_restritas()`.
+ENV_INSTANCIAS_RESTRITAS = "CAMU_INSTANCIAS_RESTRITAS"
 
 DSN_PADRAO = "postgresql://camu:camu@localhost:5433/camucrm"
 
@@ -103,6 +108,27 @@ def mensagem_prospeccao() -> str | None:
     if caminho.exists():
         return caminho.read_text(encoding="utf-8").strip()
     return None
+
+
+def instancias_restritas() -> frozenset[str]:
+    """Nomes de instância da Evolution API cuja ingestão (`ingest.ingerir`)
+    só acompanha telefone já `contato` conhecido ou já presente em
+    `prospeccoes` — change `ingestao-restrita-por-instancia`.
+
+    Vazio por padrão: nenhuma instância é restrita, exatamente o
+    comportamento de antes deste change. A instância única de hoje (a da
+    Camu) nunca precisa entrar aqui — ela é a porta de entrada do funil B2C
+    (§12, "cliente iniciou o contato"), e restringi-la pararia de capturar
+    lead novo por DM. Esta variável é para as instâncias NOVAS (número
+    pessoal, número do Felipe), que só devem acompanhar contato comercial
+    já identificado, não qualquer mensagem que chegar.
+
+    Comparação exata, sem normalizar maiúscula/minúscula — nome de
+    instância é definido pelo operador no cadastro da Evolution API, não
+    texto de usuário sujeito a variação de digitação.
+    """
+    bruto = os.getenv(ENV_INSTANCIAS_RESTRITAS, "")
+    return frozenset(nome.strip() for nome in bruto.split(",") if nome.strip())
 
 
 def eval_dataset_caminho() -> Path:

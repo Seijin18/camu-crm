@@ -1,9 +1,11 @@
 """Ingestão (`camucrm/ingest.py`): o caminho único de entrada."""
 
+import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -303,3 +305,93 @@ class TesteNomeDoContato(unittest.TestCase):
             agora=AGORA,
         )
         self.assertEqual(next(iter(db.contatos.values())).nome, "Ana")
+
+
+class TesteIngestaoRestritaPorInstancia(unittest.TestCase):
+    """Change `ingestao-restrita-por-instancia`: instância listada em
+    `CAMU_INSTANCIAS_RESTRITAS` só acompanha telefone já `contato` ou já em
+    `prospeccoes` — instância NÃO listada (inclusive sem a variável
+    configurada) segue exatamente como antes."""
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.transporte = EvolutionTransporte("http://x", "k", "i")
+        contexto = patch.dict(
+            os.environ, {"CAMU_INSTANCIAS_RESTRITAS": "pessoal-marcos,pessoal-felipe"}
+        )
+        contexto.start()
+        self.addCleanup(contexto.stop)
+
+    def _ingerir(self, instancia=None, **kwargs):
+        bruto = payload(**kwargs)
+        return ingerir(
+            self.db, self.transporte.receber(bruto), agora=AGORA, instancia=instancia
+        )
+
+    def test_instancia_nao_listada_aceita_telefone_novo_normalmente(self):
+        resultado = self._ingerir(instancia="camu")
+        self.assertFalse(resultado.ignorada)
+        self.assertEqual(len(self.db.contatos), 1)
+
+    def test_instancia_sem_nome_nenhum_aceita_telefone_novo_normalmente(self):
+        """`instancia=None` (payload sem campo `instance`, ou webhook.py não
+        conseguiu extrair) nunca restringe — falha segura do lado de
+        restringir de menos (design.md, Decisão 3)."""
+        resultado = self._ingerir(instancia=None)
+        self.assertFalse(resultado.ignorada)
+        self.assertEqual(len(self.db.contatos), 1)
+
+    def test_instancia_restrita_telefone_desconhecido_e_ignorado_por_inteiro(self):
+        resultado = self._ingerir(instancia="pessoal-marcos")
+        self.assertTrue(resultado.ignorada)
+        self.assertEqual(self.db.contatos, {})
+        self.assertEqual(self.db.mensagens, {})
+        self.assertEqual(self.db.conversas, {})
+
+    def test_instancia_restrita_telefone_ja_contato_segue_normalmente(self):
+        # Primeira mensagem por instância não restrita cria o contato.
+        self._ingerir(instancia="camu")
+        self.assertEqual(len(self.db.contatos), 1)
+        # Segunda mensagem, mesmo telefone, agora por instância restrita.
+        resultado = self._ingerir(instancia="pessoal-marcos", ident="M2")
+        self.assertFalse(resultado.ignorada)
+        self.assertEqual(len(self.db.contatos), 1)
+
+    def test_instancia_restrita_telefone_de_prospeccao_cria_contato_b2b(self):
+        telefone = "5511999998888"
+        self.db.criar_prospeccao(nome="Petshop X", telefone=telefone)
+        resultado = self._ingerir(instancia="pessoal-felipe", telefone=telefone)
+        self.assertFalse(resultado.ignorada)
+        self.assertEqual(len(self.db.contatos), 1)
+        self.assertEqual(next(iter(self.db.contatos.values())).tipo, "b2b")
+
+    def test_restricao_vale_tambem_para_eco_fromme(self):
+        """Eco de mensagem enviada pelo próprio número pessoal (`fromMe`)
+        pra um telefone desconhecido também é ignorado — nenhum tratamento
+        especial por direção (requirement, spec.md)."""
+        bruto = {
+            "data": {
+                "key": {
+                    "remoteJid": "5511977776666@s.whatsapp.net",
+                    "id": "M3",
+                    "fromMe": True,
+                },
+                "message": {"conversation": "oi"},
+                "messageTimestamp": int(AGORA.timestamp()),
+            }
+        }
+        resultado = ingerir(
+            self.db,
+            self.transporte.receber(bruto),
+            agora=AGORA,
+            instancia="pessoal-marcos",
+        )
+        self.assertTrue(resultado.ignorada)
+        self.assertEqual(self.db.contatos, {})
+
+    def test_variavel_ausente_nao_restringe_nada(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CAMU_INSTANCIAS_RESTRITAS", None)
+            resultado = self._ingerir(instancia="pessoal-marcos")
+        self.assertFalse(resultado.ignorada)
+        self.assertEqual(len(self.db.contatos), 1)

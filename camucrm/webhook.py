@@ -224,7 +224,17 @@ def _processar(payload: dict[str, Any]) -> None:
     try:
         # Sem credencial: este processo só sabe receber (ver `criar_transporte`).
         transporte = criar_transporte("evolution", para_envio=False)
-        resultado = ingerir(db, transporte.receber(payload), origem="whatsapp")
+        # Change `ingestao-restrita-por-instancia`: `instance` é campo
+        # padrão do corpo do webhook da Evolution API (nível raiz, fora de
+        # `data`) — identifica de qual número o evento veio (Camu, número
+        # pessoal, número do Felipe). Ausente ou com nome inesperado, cai
+        # em `None` e `ingerir` não aplica restrição nenhuma (design.md do
+        # change, Decisão 3: falha segura do lado de restringir de menos,
+        # nunca de mais).
+        instancia = payload.get("instance") if isinstance(payload, dict) else None
+        resultado = ingerir(
+            db, transporte.receber(payload), origem="whatsapp", instancia=instancia
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception(
             "Falha processando webhook — payload preservado em "
