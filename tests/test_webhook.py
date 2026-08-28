@@ -362,11 +362,12 @@ class TesteInstanciaRepassadaParaIngerir(unittest.TestCase):
             webhook._processar({"event": "messages.upsert"})
         self.assertIsNone(ingerir_mock.call_args.kwargs.get("instancia"))
 
-    def test_evento_ignorado_por_instancia_ainda_fica_staged(self):
-        """Requirement "Payload cru continua sendo preservado
-        incondicionalmente": o staging roda ANTES de `ingerir` decidir
-        qualquer coisa, então um evento ignorado por restrição de
-        instância continua tendo sua linha em `eventos_recebidos_bruto`."""
+    def test_evento_ignorado_por_instancia_e_excluido_do_staging(self):
+        """Revisão de 2026-08-27 (pedido do usuário): o payload de um
+        telefone sem relação nenhuma com a Camu, numa instância restrita,
+        NÃO fica em `eventos_recebidos_bruto` depois da decisão — o
+        staging serviu só para o caso de falha no meio do caminho, e a
+        decisão foi tomada com sucesso."""
         from camucrm.ingest import ResultadoIngestao
 
         db_falso = Mock()
@@ -374,11 +375,34 @@ class TesteInstanciaRepassadaParaIngerir(unittest.TestCase):
         with patch.object(webhook, "get_db", return_value=db_falso), patch.object(
             webhook, "criar_transporte"
         ), patch.object(
-            webhook, "ingerir", return_value=ResultadoIngestao(None, None, ignorada=True)
+            webhook, "ingerir",
+            return_value=ResultadoIngestao(
+                None, None, ignorada=True, ignorada_por_restricao_instancia=True
+            ),
         ), patch.object(webhook, "_extrair") as extrair:
             webhook._processar({"event": "messages.upsert", "instance": "pessoal-marcos"})
         db_falso.registrar_evento_bruto.assert_called_once_with(
             {"event": "messages.upsert", "instance": "pessoal-marcos"}
         )
-        db_falso.marcar_evento_bruto_processado.assert_called_once_with(5)
+        db_falso.excluir_evento_bruto.assert_called_once_with(5)
+        db_falso.marcar_evento_bruto_processado.assert_not_called()
+        extrair.assert_not_called()
+
+    def test_evento_ignorado_por_outro_motivo_continua_staged(self):
+        """`ignorada=True` sem ser por restrição de instância (ex.: evento
+        que não é mensagem de conversa) continua marcado como processado,
+        sem exclusão — a exclusão é específica do motivo "telefone
+        desconhecido numa instância restrita"."""
+        from camucrm.ingest import ResultadoIngestao
+
+        db_falso = Mock()
+        db_falso.registrar_evento_bruto.return_value = 6
+        with patch.object(webhook, "get_db", return_value=db_falso), patch.object(
+            webhook, "criar_transporte"
+        ), patch.object(
+            webhook, "ingerir", return_value=ResultadoIngestao(None, None, ignorada=True)
+        ), patch.object(webhook, "_extrair") as extrair:
+            webhook._processar({"event": "connection.update"})
+        db_falso.marcar_evento_bruto_processado.assert_called_once_with(6)
+        db_falso.excluir_evento_bruto.assert_not_called()
         extrair.assert_not_called()

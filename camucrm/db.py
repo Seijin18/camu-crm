@@ -2805,6 +2805,27 @@ class Database:
                     (erro[:2000] if erro else erro, evento_id),
                 )
 
+    def excluir_evento_bruto(self, evento_id: int) -> None:
+        """Remove a linha imediatamente — não espera
+        `purgar_eventos_brutos_antigos` (change
+        `ingestao-restrita-por-instancia`, revisão da Decisão 2 do
+        `design.md`).
+
+        Chamado por `webhook.py::_processar` só quando `ingerir()` decide
+        que o evento é de uma instância restrita e telefone desconhecido:
+        o payload já serviu ao único propósito que tinha (deixar a decisão
+        reprocessável em caso de falha), a decisão foi tomada com sucesso
+        (nenhuma exceção), e não há razão de negócio pra guardar o
+        conteúdo de mensagem de alguém que nunca teve relação nenhuma com
+        a Camu — nem que seja pelos poucos dias de `RETENCAO_EVENTOS_
+        BRUTOS_DIAS`.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM eventos_recebidos_bruto WHERE id = %s", (evento_id,)
+                )
+
     def listar_eventos_brutos_pendentes(self, limite: int = 200) -> list[EventoBrutoRegistro]:
         """Linhas `processado = FALSE`, em ordem de chegada — o que
         `camucrm reprocessar-falhas` tenta reingerir."""

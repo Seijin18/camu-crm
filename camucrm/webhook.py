@@ -245,6 +245,15 @@ def _processar(payload: dict[str, Any]) -> None:
         db.marcar_evento_bruto_falhou(evento_bruto_id, str(exc))
         return
 
+    if resultado.ignorada_por_restricao_instancia:
+        # Change `ingestao-restrita-por-instancia`, revisão de 2026-08-27
+        # (pedido explícito do usuário): telefone sem relação nenhuma com
+        # a Camu não deixa rastro nem no staging técnico — o payload já
+        # cumpriu seu único propósito (permitir reprocessamento se algo
+        # tivesse falhado no meio) e a decisão foi tomada com sucesso.
+        db.excluir_evento_bruto(evento_bruto_id)
+        return
+
     db.marcar_evento_bruto_processado(evento_bruto_id)
     if resultado.ignorada:
         return

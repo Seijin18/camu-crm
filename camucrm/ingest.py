@@ -60,8 +60,17 @@ class ResultadoIngestao:
     duplicada: bool = False
     ignorada: bool = False
     estado: EstadoConversa | None = None
+    # Change `ingestao-restrita-por-instancia`: distingue POR QUE foi
+    # ignorado. `ignorada=True` sozinho também cobre evento que não é
+    # mensagem (status de conexão, recibo) — este campo é `True` só quando
+    # o motivo foi telefone desconhecido numa instância restrita, o único
+    # caso em que `webhook._processar` precisa fazer algo A MAIS
+    # (`db.excluir_evento_bruto`, não só marcar como processado).
+    ignorada_por_restricao_instancia: bool = False
 
     def __str__(self) -> str:
+        if self.ignorada_por_restricao_instancia:
+            return "evento ignorado (instância restrita, telefone desconhecido)"
         if self.ignorada:
             return "evento ignorado (não é mensagem de conversa)"
         if self.duplicada:
@@ -108,6 +117,15 @@ def ingerir(
     A instância da Camu (não listada, o padrão) nunca passa por esta
     checagem — continua aceitando DM nova de qualquer telefone, que é como
     o funil B2C entra hoje (§12, design.md do change).
+
+    O resultado vem com `ignorada_por_restricao_instancia=True` — é o
+    sinal que `webhook._processar` usa para excluir (não só marcar como
+    processado) o payload cru que já tinha sido gravado em
+    `eventos_recebidos_bruto` antes desta função rodar: revisão de
+    2026-08-27 à Decisão 2 do `design.md`, pedida explicitamente pelo
+    usuário — telefone sem relação nenhuma com a Camu não deve deixar
+    rastro nem no staging técnico, uma vez que a decisão foi tomada com
+    sucesso (nenhuma exceção no meio do caminho).
     """
     if evento is None:
         return ResultadoIngestao(None, None, ignorada=True)
@@ -123,7 +141,9 @@ def ingerir(
                 "desconhecido (não é contato nem prospecção)",
                 instancia,
             )
-            return ResultadoIngestao(None, None, ignorada=True)
+            return ResultadoIngestao(
+                None, None, ignorada=True, ignorada_por_restricao_instancia=True
+            )
 
     tipo = tipo_padrao if tipo_padrao in (B2B, B2C) else B2C
     # Change `prospeccao-b2b-shortlist`: telefone presente na shortlist B2B

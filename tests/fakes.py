@@ -1157,6 +1157,9 @@ class FakeDatabase:
             registro.erro = erro
             registro.tentativas += 1
 
+    def excluir_evento_bruto(self, evento_id: int) -> None:
+        self.eventos_brutos.pop(evento_id, None)
+
     def listar_eventos_brutos_pendentes(self, limite: int = 200) -> list[EventoBrutoRegistro]:
         pendentes = sorted(
             (r for r in self.eventos_brutos.values() if not r.processado),

@@ -33,7 +33,16 @@
 - [x] 4.1 `camucrm/webhook.py::_processar`: `instancia = payload.get(
       "instance")`, passado para `ingerir(..., instancia=instancia)`. Sem
       mudança na ordem `registrar_evento_bruto` → `ingerir` (→ Requirement
-      "Payload cru continua sendo preservado incondicionalmente").
+      "Payload cru é gravado antes da decisão, e excluído se o motivo for
+      restrição de instância").
+- [x] 4.2 **Revisão de 2026-08-27**, pedido explícito do usuário:
+      `ResultadoIngestao` ganha `ignorada_por_restricao_instancia: bool`;
+      `_processar` chama `db.excluir_evento_bruto(evento_bruto_id)` em vez
+      de `marcar_evento_bruto_processado` quando esse campo vem `True` (→
+      mesma Requirement acima).
+- [x] 4.3 `camucrm/db.py::excluir_evento_bruto(evento_id)` — `DELETE`
+      imediato, sem esperar `purgar_eventos_brutos_antigos`; `tests/
+      fakes.py::excluir_evento_bruto` — `dict.pop`.
 
 ## 5. CLI
 
@@ -52,9 +61,12 @@
       restrição vale igual para `direcao=in` e `direcao=out` (eco
       `fromMe`); `CAMU_INSTANCIAS_RESTRITAS` ausente não muda nada.
 - [x] 6.2 `tests/test_webhook.py`: evento com `instance` no payload chega
-      restrito em `ingerir`; evento ignorado por restrição ainda grava
-      `eventos_recebidos_bruto` (→ Requirement "Payload cru continua sendo
-      preservado incondicionalmente").
+      restrito em `ingerir`; evento ignorado por restrição de instância é
+      EXCLUÍDO de `eventos_recebidos_bruto` (`excluir_evento_bruto`
+      chamado, `marcar_evento_bruto_processado` não); evento ignorado por
+      OUTRO motivo continua marcado como processado, sem exclusão (→
+      Requirement "Payload cru é gravado antes da decisão, e excluído se o
+      motivo for restrição de instância").
 - [x] 6.3 Teste (onde existir cobertura de `cmd_ingerir`) confirmando que
       `--instancia` produz o mesmo resultado que o webhook para o mesmo
       payload (→ Requirement "`cmd_ingerir` e o webhook nunca divergem").

@@ -29,7 +29,10 @@ antes deste change.
 Numa instância listada em `CAMU_INSTANCIAS_RESTRITAS`, uma mensagem de
 telefone que NÃO é `contato` existente e NÃO está em `prospeccoes` NÃO DEVE
 gerar `contato`, `conversa` ou `mensagem` nenhuma. `ingerir` DEVE devolver
-`ResultadoIngestao(ignorada=True)` para esse caso.
+`ResultadoIngestao(ignorada=True, ignorada_por_restricao_instancia=True)`
+para esse caso — o segundo campo distingue este motivo de qualquer outro
+"ignorado" (ex.: evento que não é mensagem de conversa), porque só este
+motivo dispara a exclusão do payload cru (ver requirement abaixo).
 
 #### Scenario: Telefone desconhecido numa instância restrita é ignorado
 
@@ -37,7 +40,8 @@ gerar `contato`, `conversa` ou `mensagem` nenhuma. `ingerir` DEVE devolver
   numa instância restrita, de um telefone que não é contato conhecido nem
   está em `prospeccoes`
 - **THEN** nenhum `contato`, `conversa` ou `mensagem` é criado, e o
-  resultado da ingestão é `ignorada=True`
+  resultado da ingestão é `ignorada=True` com
+  `ignorada_por_restricao_instancia=True`
 
 #### Scenario: Telefone já contato numa instância restrita segue normalmente
 
@@ -53,18 +57,47 @@ gerar `contato`, `conversa` ou `mensagem` nenhuma. `ingerir` DEVE devolver
 - **THEN** um `contato` novo é criado (com `tipo=b2b`, mesma regra de
   `prospeccao-b2b-shortlist`) e a mensagem é gravada
 
-### Requirement: Payload cru continua sendo preservado incondicionalmente
+### Requirement: Payload cru é gravado antes da decisão, e excluído se o motivo for restrição de instância
 
 O registro em `eventos_recebidos_bruto` (change `ingestao-a-prova-de-falha`)
-NÃO DEVE ser afetado pela restrição de instância — todo payload recebido pelo
-webhook é gravado ali antes de qualquer decisão de ingestão, restrita ou não.
+NÃO DEVE ser afetado pela restrição de instância ANTES da decisão — todo
+payload recebido pelo webhook é gravado ali antes de qualquer chamada a
+`ingest.ingerir`, restrita ou não (a garantia de durabilidade contra falha
+no meio do processamento continua intacta). DEPOIS da decisão, se o motivo
+foi especificamente "instância restrita, telefone desconhecido"
+(`ResultadoIngestao.ignorada_por_restricao_instancia=True`), a linha
+correspondente DEVE ser excluída imediatamente — revisão de 2026-08-27,
+pedido explícito do usuário: mensagem de quem nunca teve relação nenhuma
+com a Camu não deve deixar rastro nem no staging técnico.
 
-#### Scenario: Evento ignorado por restrição de instância ainda foi staged
+#### Scenario: Payload existe até a decisão terminar com sucesso
 
-- **WHEN** um evento chega numa instância restrita e é ignorado por
-  telefone desconhecido
-- **THEN** existe uma linha correspondente em `eventos_recebidos_bruto`
-  para esse payload, como para qualquer outro evento recebido
+- **WHEN** um evento chega numa instância restrita
+- **THEN** existe uma linha em `eventos_recebidos_bruto` para esse payload
+  enquanto `ingest.ingerir` ainda está decidindo
+
+#### Scenario: Evento ignorado por restrição de instância é excluído do staging
+
+- **WHEN** um evento chega numa instância restrita, é ignorado por telefone
+  desconhecido, e `ingerir` termina sem exceção
+- **THEN** a linha correspondente em `eventos_recebidos_bruto` é excluída
+  (não apenas marcada como processada)
+
+#### Scenario: Evento ignorado por outro motivo continua preservado normalmente
+
+- **WHEN** um evento é ignorado por um motivo que NÃO é restrição de
+  instância (ex.: não é mensagem de conversa)
+- **THEN** a linha em `eventos_recebidos_bruto` continua existindo, marcada
+  como processada, sujeita só à retenção padrão
+  (`purgar_eventos_brutos_antigos`)
+
+#### Scenario: Falha no meio do processamento preserva o payload normalmente
+
+- **WHEN** `ingest.ingerir` levanta uma exceção durante o processamento de
+  um evento de instância restrita
+- **THEN** a linha em `eventos_recebidos_bruto` NÃO é excluída — permanece
+  `processado=False` com o erro registrado, disponível para
+  `camucrm reprocessar-falhas`, exatamente como qualquer outra falha
 
 ### Requirement: `cmd_ingerir` e o webhook nunca divergem na restrição
 

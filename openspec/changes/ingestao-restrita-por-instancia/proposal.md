@@ -28,7 +28,11 @@ telefone que **já é `contato` conhecido** OU **já está em `prospeccoes`**
 (a mesma tabela do change `prospeccao-b2b-shortlist`). Telefone desconhecido
 numa instância restrita é ignorado por inteiro — nenhum `contato`, nenhuma
 `conversa`, nenhuma `mensagem` — confirmado com o usuário ("ignorar
-totalmente... como se o sistema nem tivesse recebido").
+totalmente... como se o sistema nem tivesse recebido"). **Revisão de
+2026-08-27**, também pedida explicitamente: o payload cru fica staged só
+até a decisão terminar — se o motivo for restrição de instância, a linha
+é excluída na hora, não segue a retenção padrão (ver `design.md`, Decisão
+2).
 
 Sem instância nenhuma listada (variável ausente, o padrão), **nada muda**: é
 o comportamento de hoje, com uma única instância implícita e sem restrição —
@@ -46,12 +50,19 @@ zero risco de regressão pra quem não configurar a variável nova.
 - `camucrm/ingest.py::ingerir`: novo parâmetro `instancia: str | None`. Se a
   instância está em `instancias_restritas()` e o telefone não é `contato`
   conhecido nem está em `prospeccoes`, devolve `ResultadoIngestao(ignorada=
-  True)` sem tocar `contatos`/`conversas`/`mensagens`. Mesma checagem para
-  as duas direções (inbound e o eco `fromMe` de uma mensagem enviada pelo
-  próprio número pessoal) — nenhum tratamento especial por direção.
+  True, ignorada_por_restricao_instancia=True)` sem tocar
+  `contatos`/`conversas`/`mensagens`. Mesma checagem para as duas direções
+  (inbound e o eco `fromMe` de uma mensagem enviada pelo próprio número
+  pessoal) — nenhum tratamento especial por direção.
 - `camucrm/webhook.py`: extrai `payload.get("instance")` do corpo do evento
   (campo padrão da Evolution API em `messages.upsert`) e passa para
-  `ingerir(..., instancia=...)`.
+  `ingerir(..., instancia=...)`. Quando o resultado vem com
+  `ignorada_por_restricao_instancia=True`, chama `db.excluir_evento_bruto`
+  em vez de `marcar_evento_bruto_processado` — o payload staged não
+  sobrevive à decisão (revisão de 2026-08-27).
+- `camucrm/db.py::excluir_evento_bruto(evento_id)`: `DELETE` imediato de
+  uma linha de `eventos_recebidos_bruto`, sem esperar
+  `purgar_eventos_brutos_antigos`.
 - `camucrm/cli.py::cmd_ingerir`: flag `--instancia` opcional, mesmo caminho
   que o webhook usa — os dois nunca podem divergir (docstring de
   `ingest.py`).

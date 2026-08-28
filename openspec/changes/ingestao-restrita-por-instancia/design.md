@@ -26,31 +26,47 @@ instância da Camu como livre) só para continuar funcionando como sempre —
 regressão silenciosa para quem não tocar a variável nova. Com a allowlist do
 restrito, ausência de configuração = comportamento de hoje, sempre.
 
-## Decisão 2: telefone desconhecido não gera contato — mas o payload cru continua sendo staged
+## Decisão 2: telefone desconhecido não gera contato, e o payload cru é excluído após a decisão
+
+**Revisão de 2026-08-27**, pedida explicitamente pelo usuário depois de ver a
+primeira versão desta decisão — o raciocínio original está riscado abaixo,
+mantido para não apagar o porquê da mudança.
 
 O usuário pediu "ignorar totalmente" um telefone desconhecido numa instância
 restrita — nenhum `contato`, nenhuma `conversa`, nada visível em lugar
-nenhum do painel. Esta parte é direta.
+nenhum do painel. Esta parte sempre foi direta e continua igual.
 
-Zona cinzenta: `webhook._processar` grava o payload cru em
-`eventos_recebidos_bruto` ANTES de chamar `ingerir()` (change
-`ingestao-a-prova-de-falha`, para durabilidade — nenhum evento se perde
-mesmo se o processamento falhar no meio). Aplicar a decisão "ignorar
-totalmente" a esse staging também significaria mover o corte de instância/
-telefone para ANTES do staging — perdendo a garantia de durabilidade
-justamente para o caminho que mais precisa dela testado (é código novo).
+~~Zona cinzenta: `webhook._processar` grava o payload cru em
+`eventos_recebidos_bruto` ANTES de chamar `ingerir()`... Decisão: o staging
+continua incondicional.~~ A primeira versão manteve o staging para SEMPRE,
+apoiada na política de retenção geral (12 meses) — mas isso deixava o
+conteúdo da mensagem de um amigo/familiar acessível por meses num lugar
+técnico, mesmo que invisível no painel. O usuário confirmou explicitamente:
+**se o payload for excluído depois que a decisão de ignorar for tomada, não
+tem problema ele ter passado pelo sistema.**
 
-**Decisão: o staging continua incondicional.** `eventos_recebidos_bruto` já
-tem política de retenção e purga própria (§12, `purga-cobre-rascunhos-sem-
-vinculo` e a retenção geral de 12 meses) — não é uma segunda cópia
-permanente e visível da mensagem, é staging técnico de curta vida para
-reprocessamento em caso de falha. "Ignorar totalmente" nesta proposta
-significa: **nenhum `contato`, `conversa` ou `mensagem` é criado, e nada
-aparece em nenhuma tela do painel** — a garantia que resolve o problema real
-(poluir kanban/fila com contato de amigo/família). Registrado aqui como
-decisão explícita, não escondida — se o usuário quiser ir além (nem staging
-para instância restrita + telefone desconhecido), é extensão futura,
-reabrindo a garantia de durabilidade só para esse caso específico.
+**Decisão corrigida**: `webhook._processar` continua gravando o payload
+ANTES de chamar `ingerir()` — a garantia de durabilidade contra falha no
+meio do caminho (`ingestao-a-prova-de-falha`) permanece intacta, porque o
+staging ainda acontece incondicionalmente. O que muda é DEPOIS: quando
+`ingerir()` devolve com sucesso (sem exceção) e o motivo foi especificamente
+"instância restrita + telefone desconhecido"
+(`ResultadoIngestao.ignorada_por_restricao_instancia=True`), `_processar`
+chama `db.excluir_evento_bruto(evento_bruto_id)` — `DELETE` imediato, não
+espera os dias de `purgar_eventos_brutos_antigos`. Qualquer outro motivo de
+`ignorada=True` (evento que não é mensagem de conversa, ex. status de
+conexão) continua marcado como processado e sujeito só à retenção padrão —
+a exclusão imediata é específica do caso "gente sem relação nenhuma com a
+Camu", não de todo evento ignorado.
+
+Por que isso não abre mão de durabilidade: a exclusão só acontece DEPOIS de
+`ingerir()` retornar sem exceção — ou seja, a decisão já foi tomada com
+sucesso, e o payload staged já cumpriu o único papel que tinha (permitir
+reprocessar se algo tivesse quebrado no meio). Se `ingerir()` lançar uma
+exceção no meio do caminho (banco fora do ar, bug), o payload permanece
+(`marcar_evento_bruto_falhou`, comportamento inalterado) — só a exclusão
+some é a de um caminho que terminou com sucesso E com esse motivo
+específico.
 
 ## Decisão 3: nome do campo `instance` no payload da Evolution API
 
@@ -93,11 +109,23 @@ ingest.ingerir(db, evento, instancia=payload.get("instance"))
     │        │ sim
     │        ▼
     │   telefone já é contato OU está em prospeccoes?
-    │        │ não → ResultadoIngestao(ignorada=True), NADA gravado
+    │        │ não → ResultadoIngestao(ignorada=True,
+    │        │        ignorada_por_restricao_instancia=True), NADA gravado
     │        │ sim
     │        ▼
     ▼   segue o caminho de sempre (upsert_contato, get_or_create_conversa,
         registrar_mensagem, mesma transação de `ingestao-a-prova-de-falha`)
+
+de volta em webhook._processar(payload):
+    │
+    ├─ resultado.ignorada_por_restricao_instancia?
+    │        │ sim → db.excluir_evento_bruto(evento_bruto_id)  ← DELETE
+    │        │        imediato (Decisão 2, revisada), retorna
+    │        │ não
+    │        ▼
+    ▼   db.marcar_evento_bruto_processado(evento_bruto_id)  ← comportamento
+        de sempre para qualquer outro caso (sucesso, duplicata, ignorado
+        por outro motivo)
 ```
 
 ## `CAMU_INSTANCIAS_RESTRITAS`
