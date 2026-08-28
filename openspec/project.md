@@ -122,12 +122,29 @@ Todas justificadas no ponto de uso; listadas aqui para não se perderem.
   continua sem base nenhuma, e a capability é estritamente B2B por desenho
   (sem campo que aceite funil B2C). Decisão registrada aqui e no `design.md`
   do change, não escondida.
-- **Prospecção não envia mensagem** (mesmo change). O painel continua sem
-  nenhuma rota de envio e sem credencial da Evolution API — o "disparo" é um
-  link `wa.me`/`api.whatsapp.com` que abre o WhatsApp com a mensagem pronta;
-  o humano aperta enviar lá dentro. A garantia testada em todos os 6 changes
-  do painel (`camucrm.painel` nunca importa `camucrm.transport`) permanece
-  intacta.
+- **Prospecção não envia mensagem** (mesmo change) — **decisão REVERTIDA em
+  2026-08-28** pelo change `envio-prospeccao-pela-evolution-api`, a pedido
+  explícito do usuário. Registro original preservado abaixo por histórico;
+  ver o item seguinte para o estado atual.
+- **Envio de prospecção pela Evolution API** (change
+  `envio-prospeccao-pela-evolution-api`, reverte a decisão acima). A aba de
+  prospecção ganhou um botão que envia de fato, sem sair do painel: popup
+  com telefone e mensagem pré-preenchidos e editáveis, "Enviar" chama
+  `POST /prospeccao/{id}/enviar`. A garantia "`camucrm.painel` nunca importa
+  `camucrm.transport`" deixou de valer para o pacote inteiro e passou a
+  valer com uma exceção nomeada: só `camucrm/painel/envio.py` importa
+  transporte, e é o único módulo autorizado a fazê-lo (provado por AST em
+  `tests/test_painel_api.py`, não por convenção). O que continua intacto é
+  a garantia que importa — §1/§10, envio é sempre humano: `enviar_prospeccao`
+  recusa (422) qualquer chamada sem `aprovado_por` preenchido, antes de
+  tocar rede; o que muda é só ONDE esse clique de aprovação acontece. O
+  link `wa.me` continua existindo — os dois caminhos coexistem, o operador
+  escolhe. Consequência aceita: o processo do painel passa a carregar
+  `EVOLUTION_API_KEY` quando esse botão é usado (antes, ausente de
+  propósito). Colunas novas `prospeccoes.enviado_em`/`enviado_por`/
+  `enviado_erro`, distintas de `aberto_em`/`aberto_por` (intenção de clique
+  no link, sem confirmação) — estas são confirmação real, só gravadas
+  depois que a Evolution API respondeu.
 
 ## Correções pendentes — auditoria completa do pipeline (2026-08)
 

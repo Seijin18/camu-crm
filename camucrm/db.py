@@ -436,6 +436,15 @@ class ProspeccaoRegistro:
     aberto_em: datetime | None
     aberto_por: str | None
     criado_em: datetime
+    # ADIÇÃO (change `envio-prospeccao-pela-evolution-api`): resultado da
+    # última tentativa de envio pela API — ver comentário do schema. Vêm
+    # ANTES de contato_id/conversa_id na ordem posicional de propósito: os
+    # dois SELECTs que constroem este dataclass (`_PROSPECCAO_SELECT` e o de
+    # `listar_prospeccoes`) usam `ProspeccaoRegistro(*row)` — mudar a ordem
+    # aqui exige mudar a ordem das colunas nos dois SELECTs, não só num.
+    enviado_em: datetime | None = None
+    enviado_por: str | None = None
+    enviado_erro: str | None = None
     contato_id: int | None = None
     conversa_id: int | None = None
 
@@ -791,6 +800,17 @@ CREATE TABLE IF NOT EXISTS prospeccoes (
     atualizado_em   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS prospeccoes_zona_idx ON prospeccoes (zona, bairro);
+-- ADIÇÃO (change `envio-prospeccao-pela-evolution-api`): resultado da ÚLTIMA
+-- tentativa de envio pela Evolution API — distinto em espécie de
+-- aberto_em/aberto_por acima. Aquele é intenção (clicou no link `wa.me`,
+-- sem confirmação de que a mensagem saiu); estas colunas só são gravadas
+-- depois que a Evolution API respondeu com sucesso, ou registram o erro de
+-- uma tentativa que falhou. `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+-- porque `prospeccoes` já existe em banco de desenvolvimento (diferente da
+-- tabela em si, que nasceu com `CREATE TABLE IF NOT EXISTS` acima).
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_em TIMESTAMP WITH TIME ZONE;
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_por VARCHAR(48);
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_erro TEXT;
 
 -- ADIÇÃO (change `backfill-cobertura-por-prompt`): até onde CADA versão de
 -- prompt de extração já leu uma conversa. Existe para `forcar=True`
@@ -2873,7 +2893,8 @@ class Database:
     _PROSPECCAO_SELECT = """
         SELECT p.id, p.nome, p.telefone, p.bairro, p.zona, p.nota,
                p.avaliacoes, p.site, p.tier_origem, p.status_origem,
-               p.aberto_em, p.aberto_por, p.criado_em
+               p.aberto_em, p.aberto_por, p.criado_em,
+               p.enviado_em, p.enviado_por, p.enviado_erro
           FROM prospeccoes p
     """
 
@@ -3005,6 +3026,7 @@ class Database:
                     SELECT p.id, p.nome, p.telefone, p.bairro, p.zona, p.nota,
                            p.avaliacoes, p.site, p.tier_origem, p.status_origem,
                            p.aberto_em, p.aberto_por, p.criado_em,
+                           p.enviado_em, p.enviado_por, p.enviado_erro,
                            c.id AS contato_id, cv.id AS conversa_id
                       FROM prospeccoes p
                       LEFT JOIN contatos c ON c.telefone_hash = p.telefone_hash
@@ -3033,6 +3055,36 @@ class Database:
                     "WHERE id = %s",
                     (por, prospeccao_id),
                 )
+
+    def registrar_envio_prospeccao(
+        self, prospeccao_id: int, *, por: str, sucesso: bool, erro: str | None = None
+    ) -> None:
+        """Grava o resultado de UMA tentativa de envio pela Evolution API
+        (change `envio-prospeccao-pela-evolution-api`) — distinto de
+        `marcar_prospeccao_aberta` acima: aquele é intenção (clicou no
+        link), isto é confirmação (a API respondeu).
+
+        Sucesso grava `enviado_em = now()` e limpa `enviado_erro` (a
+        tentativa mais recente funcionou). Falha grava só `enviado_erro` —
+        `enviado_em` NÃO é apagado: se uma tentativa anterior teve sucesso,
+        esse registro precisa sobreviver a uma tentativa nova que falhou,
+        para a tela poder mostrar "enviado em X, mas a tentativa mais
+        recente falhou" em vez de perder o histórico do que funcionou.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if sucesso:
+                    cur.execute(
+                        "UPDATE prospeccoes SET enviado_em = now(), enviado_por = %s, "
+                        "enviado_erro = NULL WHERE id = %s",
+                        (por, prospeccao_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE prospeccoes SET enviado_por = %s, enviado_erro = %s "
+                        "WHERE id = %s",
+                        (por, erro, prospeccao_id),
+                    )
 
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
         """Usado por `ingest.ingerir` para decidir se um contato novo nasce

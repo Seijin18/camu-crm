@@ -1,3 +1,1 @@
-Oi, {nome}! Tudo bem?
-
-Aqui é da Camu — trabalhamos com consignação de retratos personalizados de pets para petshops parceiros, sem custo de estoque pra você. Posso te mandar uma ideia rápida de como funciona, sem compromisso?
+Oi, tudo bem? Encontrei seu número pelo Google Maps. Gostaria de saber se é do {nome}

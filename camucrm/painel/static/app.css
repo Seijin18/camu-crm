@@ -542,3 +542,90 @@ main {
 .prospeccao-resultado {
   margin-top: 0.75rem;
 }
+
+/* Change `envio-prospeccao-pela-evolution-api`: botão do envio direto,
+   distinto do link `wa.me` (que continua existindo do lado dele — os dois
+   caminhos coexistem, o operador escolhe). Cor própria para não confundir
+   com o botão verde-acento do WhatsApp: este é o que fala com a API. */
+.prospeccao-btn-enviar {
+  background: var(--bg-elev);
+  color: var(--texto);
+  border: 1px solid var(--acento);
+}
+
+.prospeccao-item .enviado-selo {
+  font-size: 0.8rem;
+  color: var(--texto-fraco);
+}
+
+.prospeccao-item .enviado-selo.com-erro {
+  color: var(--quente);
+}
+
+/* -- Popup de envio (modal simples, sem framework) ------------------------ */
+
+.modal-fundo {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 1rem;
+}
+
+.modal-caixa {
+  background: var(--bg-elev);
+  border: 1px solid var(--borda);
+  border-radius: 10px;
+  padding: 1.25rem;
+  width: 100%;
+  max-width: 34rem;
+  max-height: 90vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.modal-caixa h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.modal-caixa label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  color: var(--texto-fraco);
+}
+
+.modal-caixa input[type="text"],
+.modal-caixa textarea {
+  background: var(--bg);
+  color: var(--texto);
+  border: 1px solid var(--borda);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  font-family: inherit;
+  font-size: 0.9rem;
+  resize: vertical;
+}
+
+.modal-caixa textarea {
+  min-height: 6rem;
+}
+
+.modal-acoes {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.modal-erro {
+  color: var(--quente);
+  font-size: 0.85rem;
+}

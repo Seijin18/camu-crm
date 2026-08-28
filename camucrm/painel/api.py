@@ -12,11 +12,12 @@ conversas abertas o módulo loga aviso — não é otimizado agora porque o núm
 de conversas abertas de verdade fica muito abaixo disso, e otimizar cedo
 trocaria simplicidade por um problema que ainda não existe.
 
-Nenhuma rota tem "enviar" no path, e este módulo não importa
-`camucrm.transport` — o painel não manda mensagem nenhuma (ver
-`tests/test_painel_api.py::test_nenhum_path_contem_enviar` e
-`test_nenhum_modulo_do_painel_importa_transport`, que conferem isso por AST,
-não por grep).
+Este módulo (`api.py`) não importa `camucrm.transport` diretamente — a única
+rota com "enviar" no path (`POST /prospeccao/{id}/enviar`, change
+`envio-prospeccao-pela-evolution-api`) delega para `camucrm.painel.envio`,
+o único módulo do pacote que importa transporte (ver docstring de
+`envio.py`). `tests/test_painel_api.py` confere por AST que nenhum OUTRO
+módulo do painel importa `camucrm.transport`.
 
 **Change `acoes-no-painel`**: as três rotas de escrita abaixo (marcos, funil,
 correções) existem para o kanban ter drag-and-drop. Nenhuma delas implementa a
@@ -63,7 +64,7 @@ from ..whatsapp_export import (
     NomeOperadorNaoEncontradoError,
 )
 from ..whatsapp_export import parse as parse_whatsapp_export
-from . import server, views
+from . import envio, server, views
 from .server import exigir_token
 from .stream import gerador_sse
 
@@ -755,14 +756,27 @@ def extrair_conversa_agora(conversa_id: int, db: Database = Depends(_db)):
 # contatos/conversas"): nenhuma rota aqui toca `contatos`/`conversas` para
 # escrever, e nenhuma rota de kanban/fila/conversas/métricas lê
 # `prospeccoes`. Nenhuma chamada a `camucrm.llm` (o texto é template fixo,
-# `camucrm.prospeccao.montar_mensagem`) nem a `camucrm.transport` (decisão 2
-# do design.md: o "disparo" é o link `api.whatsapp.com/send`, nunca uma rota
-# de envio — o clique do operador abre o link, o envio de fato é humano,
-# dentro do WhatsApp).
+# `camucrm.prospeccao.montar_mensagem`).
+#
+# ATUALIZAÇÃO (change `envio-prospeccao-pela-evolution-api`): a decisão 2 do
+# design.md original — nunca chamar `camucrm.transport`, só o link
+# `api.whatsapp.com/send` — foi revertida a pedido do usuário, só para esta
+# aba. `POST /prospeccao/{id}/enviar` chama `camucrm.painel.envio.
+# enviar_prospeccao`, que É o único lugar de `camucrm/painel/` que importa
+# `camucrm.transport` (ver docstring de `envio.py` para o porquê e o que
+# continua garantido). Este módulo (`api.py`) continua sem importar
+# `camucrm.transport` diretamente — só `envio`. O link `wa.me` continua
+# existindo, sem mudança; os dois caminhos coexistem.
 # --------------------------------------------------------------------------
 
 
 class AbrirProspeccaoBody(BaseModel):
+    por: str | None = None
+
+
+class EnviarProspeccaoBody(BaseModel):
+    telefone: str
+    mensagem: str
     por: str | None = None
 
 
@@ -813,6 +827,43 @@ def abrir_prospeccao(
     outra aba antes desta chamada acontecer (front-end)."""
     db.marcar_prospeccao_aberta(prospeccao_id, por=corpo.por)
     return {"ok": True}
+
+
+@router.post("/prospeccao/{prospeccao_id}/enviar")
+def enviar_prospeccao_rota(
+    prospeccao_id: int, corpo: EnviarProspeccaoBody, db: Database = Depends(_db)
+):
+    """Envia `corpo.mensagem` para `corpo.telefone` pela Evolution API
+    (change `envio-prospeccao-pela-evolution-api`) — `telefone`/`mensagem`
+    são o que o operador reviu/editou no popup do painel, não relidos do
+    banco nem recalculados do template aqui (ver `envio.enviar_prospeccao`).
+
+    422 quando `por`/`telefone`/`mensagem` vier vazio — recusado ANTES de
+    `envio.enviar_prospeccao` tocar rede (`CampoObrigatorioError`). 502
+    quando a Evolution API recusar ou estiver inacessível
+    (`TransporteError`, inclusive faltando configuração no processo do
+    painel) — o operador vê o detalhe no popup e decide se tenta de novo ou
+    usa o link `wa.me`.
+    """
+    try:
+        resultado = envio.enviar_prospeccao(
+            db,
+            prospeccao_id,
+            telefone=corpo.telefone,
+            mensagem=corpo.mensagem,
+            por=corpo.por or "",
+        )
+    except envio.CampoObrigatorioError as exc:
+        return JSONResponse(status_code=422, content=views.erro(str(exc), None))
+    except envio.TransporteError as exc:
+        # `TransporteError` não é importado diretamente aqui — `envio.py` é
+        # o único módulo do painel que importa `camucrm.transport`; este
+        # arquivo referencia o tipo como atributo de `envio` (reexportado por
+        # causa do `from ..transport import ... TransporteError` de lá), não
+        # com um `from ..transport import TransporteError` próprio, que
+        # quebraria a garantia que `tests/test_painel_api.py` prova por AST.
+        return JSONResponse(status_code=502, content=views.erro(str(exc), None))
+    return {"ok": resultado.ok, "externa_id": resultado.externa_id}
 
 
 # --------------------------------------------------------------------------

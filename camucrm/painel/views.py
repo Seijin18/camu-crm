@@ -817,6 +817,14 @@ def prospeccao_para_json(
         "conversa_id": registro.conversa_id,
         "mensagem": mensagem,
         "link_whatsapp": link,
+        # ADIÇÃO (change `envio-prospeccao-pela-evolution-api`): resultado da
+        # última tentativa de envio pela API — distinto de aberto_em/
+        # aberto_por acima (aquele é intenção; isto é confirmação). Mesma
+        # cautela de telefone: nenhum campo `telefone` novo é exposto aqui —
+        # o popup de envio extrai o número do `link_whatsapp` já presente.
+        "enviado_em": registro.enviado_em.isoformat() if registro.enviado_em else None,
+        "enviado_por": registro.enviado_por,
+        "enviado_erro": registro.enviado_erro,
     }
 
 

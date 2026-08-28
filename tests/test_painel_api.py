@@ -15,9 +15,34 @@ from fastapi.testclient import TestClient
 from camucrm import metrics
 from camucrm.llm import FakeLlm
 from camucrm.painel import api, server
+from camucrm.transport import ResultadoEnvio, TransporteError
 from tests.fakes import FakeDatabase
 
 PAINEL_DIR = Path(server.__file__).resolve().parent
+
+
+class FakeTransporteEvolution:
+    """Satisfaz o protocolo `Transporte` (change
+    `envio-prospeccao-pela-evolution-api`) — nunca a rede real. Mesmo
+    espírito de `FakeLlm`: um objeto de verdade que exercita o caminho real
+    de chamada (`enviar(Destinatario(...), texto, aprovado_por=...)`), não
+    um `Mock` genérico que só confirma "algo foi chamado"."""
+
+    nome = "evolution-fake"
+
+    def __init__(self, *, sucesso: bool, externa_id: str | None = None, mensagem_erro: str = "falhou"):
+        self.sucesso = sucesso
+        self.externa_id = externa_id
+        self.mensagem_erro = mensagem_erro
+        self.chamadas: list[dict] = []
+
+    def enviar(self, contato, texto, *, aprovado_por):
+        self.chamadas.append(
+            {"telefone": contato.telefone, "texto": texto, "aprovado_por": aprovado_por}
+        )
+        if not self.sucesso:
+            raise TransporteError(self.nome, self.mensagem_erro)
+        return ResultadoEnvio(entregue=True, externa_id=self.externa_id)
 
 
 class TesteToken(unittest.TestCase):
@@ -63,17 +88,40 @@ class TesteToken(unittest.TestCase):
 
 
 class TesteSemRotaDeEnvio(unittest.TestCase):
-    """§10: o painel só lê. Nenhuma rota escreve nem importa transporte."""
+    """§1/§10: envio é sempre humano, nunca automático.
 
-    def test_nenhum_path_contem_enviar(self):
+    Até o change `envio-prospeccao-pela-evolution-api`, essa garantia tomava
+    a forma "o painel só lê, nenhuma rota chama transporte" — nenhuma rota
+    continha "enviar", nenhum módulo importava `camucrm.transport`. Aquele
+    change reabriu essa forma de propósito (pedido do usuário), isolando o
+    novo caminho num único módulo nomeado (`camucrm.painel.envio`) em vez de
+    espalhar `import camucrm.transport` pelo pacote. A garantia que continua
+    de pé, e que estes testes provam: `aprovado_por` é obrigatório antes de
+    qualquer chamada de rede (ver `TesteEnvioProspeccao` mais abaixo) — não
+    "nenhum módulo toca transporte", que deixou de ser verdade por decisão
+    explícita, registrada em `openspec/changes/
+    envio-prospeccao-pela-evolution-api/design.md`.
+    """
+
+    # Único path autorizado a conter "enviar" — qualquer OUTRO é bug, e
+    # nenhum novo pode ser adicionado sem atualizar este teste (o que força
+    # quem adicionar a justificar a exceção, mesmo padrão de `_EXCECAO`).
+    _UNICO_PATH_DE_ENVIO = "/api/prospeccao/{prospeccao_id}/enviar"
+
+    # Único módulo do painel autorizado a importar `camucrm.transport` —
+    # mesma lógica: adicionar um segundo exige mexer neste teste.
+    _EXCECAO_TRANSPORT = "envio.py"
+
+    def test_apenas_o_path_de_envio_de_prospeccao_contem_enviar(self):
         caminhos = set(server.app.openapi()["paths"].keys())
         self.assertTrue(caminhos, "esperava pelo menos uma rota")
-        for caminho in caminhos:
-            self.assertNotIn("enviar", caminho)
+        com_enviar = {c for c in caminhos if "enviar" in c}
+        self.assertEqual(com_enviar, {self._UNICO_PATH_DE_ENVIO})
 
-    def test_nenhum_modulo_do_painel_importa_transport(self):
-        """Checagem por AST — não por grep — de que `camucrm.transport` não
-        é importado por nenhum módulo de `camucrm/painel/`."""
+    def test_nenhum_modulo_do_painel_importa_transport_exceto_envio(self):
+        """Checagem por AST — não por grep — de que `camucrm.transport` só
+        é importado por `envio.py`, e por nenhum outro módulo de
+        `camucrm/painel/`."""
         for arquivo in ("__init__.py", "server.py", "api.py", "views.py", "stream.py"):
             caminho = PAINEL_DIR / arquivo
             with self.subTest(arquivo=arquivo):
@@ -91,6 +139,23 @@ class TesteSemRotaDeEnvio(unittest.TestCase):
                             "transport", modulo,
                             f"{arquivo} importa de {modulo}",
                         )
+
+    def test_envio_py_de_fato_importa_transport(self):
+        """O outro lado da exceção: `envio.py` PRECISA importar transporte,
+        senão a rota de envio não teria como funcionar — um teste que só
+        provasse ausência em outros módulos não pegaria "esqueceram de
+        implementar o envio de verdade"."""
+        caminho = PAINEL_DIR / self._EXCECAO_TRANSPORT
+        arvore = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        importa_transport = any(
+            (isinstance(node, ast.ImportFrom) and "transport" in (node.module or ""))
+            or (
+                isinstance(node, ast.Import)
+                and any("transport" in a.name for a in node.names)
+            )
+            for node in ast.walk(arvore)
+        )
+        self.assertTrue(importa_transport, f"{self._EXCECAO_TRANSPORT} deveria importar transport")
 
 
 class TesteRotas(unittest.TestCase):
@@ -944,11 +1009,122 @@ class TesteRotasDeProspeccao(unittest.TestCase):
         self.assertIsNotNone(registro.aberto_em)
         self.assertEqual(registro.aberto_por, "marcos")
 
-    def test_nenhuma_rota_de_prospeccao_contem_enviar(self):
-        caminhos = set(server.app.openapi()["paths"].keys())
-        for caminho in caminhos:
-            if "prospeccao" in caminho:
-                self.assertNotIn("enviar", caminho)
+    def test_rota_de_envio_de_prospeccao_e_a_unica_com_enviar(self):
+        """Até o change `envio-prospeccao-pela-evolution-api`, nenhuma rota
+        de prospecção continha "enviar" — o disparo era só o link `wa.me`.
+        Esse change adicionou EXATAMENTE uma, de propósito (ver
+        `TesteEnvioProspeccao`); qualquer outra seria bug."""
+        caminhos = {c for c in server.app.openapi()["paths"].keys() if "prospeccao" in c}
+        com_enviar = {c for c in caminhos if "enviar" in c}
+        self.assertEqual(com_enviar, {"/api/prospeccao/{prospeccao_id}/enviar"})
+
+
+class TesteEnvioProspeccao(unittest.TestCase):
+    """Change `envio-prospeccao-pela-evolution-api`: `POST /prospeccao/{id}/
+    enviar` chama a Evolution API de verdade, via `camucrm.painel.envio`.
+
+    `criar_transporte` é substituído por um fake local (nunca a rede real) —
+    mesmo padrão de `FakeLlm` para LLM: um objeto que satisfaz o protocolo
+    de `Transporte`, não um `Mock` genérico, para exercitar o caminho real
+    de chamada (`transporte.enviar(Destinatario(...), texto,
+    aprovado_por=...)`) em vez de só verificar que "algo foi chamado"."""
+
+    def setUp(self):
+        self.cliente = TestClient(server.app)
+        contexto = patch.dict("os.environ", {}, clear=False)
+        contexto.start()
+        self.addCleanup(contexto.stop)
+        os.environ.pop(server.ENV_TOKEN, None)
+        self.fake = FakeDatabase()
+        patcher = patch.object(server, "get_db", return_value=self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.prospeccao = self.fake.criar_prospeccao(
+            nome="Petshop Envio", telefone="5512999990099"
+        )
+
+    def _enviar(self, **corpo):
+        base = {"telefone": "5512999990099", "mensagem": "Oi, tudo bem?", "por": "marcos"}
+        base.update(corpo)
+        return self.cliente.post(
+            f"/api/prospeccao/{self.prospeccao.id}/enviar", json=base
+        )
+
+    def test_envio_com_sucesso_grava_enviado_em_e_devolve_ok(self):
+        transporte = FakeTransporteEvolution(sucesso=True, externa_id="MSG1")
+        with patch("camucrm.painel.envio.criar_transporte", return_value=transporte):
+            resposta = self._enviar()
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertTrue(corpo["ok"])
+        self.assertEqual(corpo["externa_id"], "MSG1")
+        registro = self.fake.listar_prospeccoes()[0]
+        self.assertIsNotNone(registro.enviado_em)
+        self.assertEqual(registro.enviado_por, "marcos")
+        self.assertIsNone(registro.enviado_erro)
+
+    def test_texto_e_telefone_enviados_sao_os_do_corpo_da_requisicao(self):
+        """Requirement do spec.md: o que o operador editou no popup é o que
+        sai — não o telefone/mensagem originais de `prospeccoes`/template."""
+        transporte = FakeTransporteEvolution(sucesso=True)
+        with patch("camucrm.painel.envio.criar_transporte", return_value=transporte):
+            self._enviar(telefone="5511888887777", mensagem="Texto editado à mão")
+        self.assertEqual(transporte.chamadas[0]["telefone"], "5511888887777")
+        self.assertEqual(transporte.chamadas[0]["texto"], "Texto editado à mão")
+        self.assertEqual(transporte.chamadas[0]["aprovado_por"], "marcos")
+
+    def test_falha_de_transporte_devolve_502_e_grava_erro(self):
+        transporte = FakeTransporteEvolution(sucesso=False, mensagem_erro="Evolution fora do ar")
+        with patch("camucrm.painel.envio.criar_transporte", return_value=transporte):
+            resposta = self._enviar()
+        self.assertEqual(resposta.status_code, 502)
+        self.assertIn("Evolution fora do ar", resposta.json()["erro"])
+        registro = self.fake.listar_prospeccoes()[0]
+        self.assertIsNone(registro.enviado_em)
+        self.assertIn("Evolution fora do ar", registro.enviado_erro)
+
+    def test_sucesso_anterior_sobrevive_a_falha_seguinte(self):
+        """`enviado_em` de uma tentativa que funcionou não é apagado por uma
+        tentativa seguinte que falha (design.md)."""
+        ok = FakeTransporteEvolution(sucesso=True)
+        with patch("camucrm.painel.envio.criar_transporte", return_value=ok):
+            self._enviar()
+        enviado_em_original = self.fake.listar_prospeccoes()[0].enviado_em
+
+        ruim = FakeTransporteEvolution(sucesso=False, mensagem_erro="timeout")
+        with patch("camucrm.painel.envio.criar_transporte", return_value=ruim):
+            self._enviar()
+        registro = self.fake.listar_prospeccoes()[0]
+        self.assertEqual(registro.enviado_em, enviado_em_original)
+        self.assertIn("timeout", registro.enviado_erro)
+
+    def test_por_vazio_e_recusado_antes_de_tocar_rede(self):
+        transporte = FakeTransporteEvolution(sucesso=True)
+        with patch("camucrm.painel.envio.criar_transporte", return_value=transporte) as fabrica:
+            resposta = self._enviar(por="")
+        self.assertEqual(resposta.status_code, 422)
+        fabrica.assert_not_called()
+
+    def test_telefone_vazio_e_recusado(self):
+        resposta = self._enviar(telefone="")
+        self.assertEqual(resposta.status_code, 422)
+
+    def test_mensagem_vazia_e_recusada(self):
+        resposta = self._enviar(mensagem="  ")
+        self.assertEqual(resposta.status_code, 422)
+
+    def test_config_ausente_no_processo_do_painel_devolve_502_com_detalhe(self):
+        """`criar_transporte` levanta `RuntimeError` (não `TransporteError`)
+        quando faltam as env vars da Evolution — caso real até o operador
+        configurar o `.env` do painel. A rota traduz para 502 com o detalhe,
+        não um 500 genérico."""
+        with patch(
+            "camucrm.painel.envio.criar_transporte",
+            side_effect=RuntimeError("CAMU_TRANSPORTE=evolution exige EVOLUTION_API_KEY"),
+        ):
+            resposta = self._enviar()
+        self.assertEqual(resposta.status_code, 502)
+        self.assertIn("EVOLUTION_API_KEY", resposta.json()["erro"])
 
 
 class TesteProspeccaoNuncaAparecEmTelasDeConversa(unittest.TestCase):

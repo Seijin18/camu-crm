@@ -6,9 +6,14 @@ bind: o webhook precisa aceitar conexão da Evolution API (`0.0.0.0`); o painel
 só é usado localmente por quem está operando, então o padrão é `127.0.0.1` —
 expor a rede exige `CAMU_PAINEL_HOST` explícito.
 
-**Este painel não envia nada.** Nenhuma rota daqui escreve no banco nem chama
-`camucrm.transport` — só leitura, por enquanto (SSE é change 2, escrita é
-changes 3/4/5).
+**Este módulo (`server.py`) não importa `camucrm.transport`.** O painel
+ganhou rotas de escrita nos changes seguintes (marcos/funil/correções em
+`acoes-no-painel`, rascunho em `rascunho-registrado`, resumo em
+`resumo-conversa`) e, mais recentemente, um caminho de envio real
+(`envio-prospeccao-pela-evolution-api`) — mas esse último é isolado em
+`camucrm.painel.envio`, o único módulo do pacote que importa transporte
+(ver a docstring de lá). `tests/test_painel_api.py` confere por AST que
+nenhum outro módulo, incluindo este, importa `camucrm.transport`.
 """
 
 from __future__ import annotations

@@ -1193,6 +1193,12 @@ class FakeDatabase:
             tier_origem=dados["tier_origem"], status_origem=dados["status_origem"],
             aberto_em=dados["aberto_em"], aberto_por=dados["aberto_por"],
             criado_em=dados["criado_em"], contato_id=contato_id, conversa_id=conversa_id,
+            # Change `envio-prospeccao-pela-evolution-api`: resultado da
+            # última tentativa de envio pela API — `.get` com default `None`
+            # porque dumps antigos de teste (fixtures que montam o dict à
+            # mão sem passar por `criar_prospeccao`) não têm essas chaves.
+            enviado_em=dados.get("enviado_em"), enviado_por=dados.get("enviado_por"),
+            enviado_erro=dados.get("enviado_erro"),
         )
 
     def criar_prospeccao(
@@ -1222,6 +1228,7 @@ class FakeDatabase:
             "nota": nota, "avaliacoes": avaliacoes, "site": site,
             "tier_origem": tier_origem, "status_origem": status_origem,
             "aberto_em": None, "aberto_por": None, "criado_em": agora,
+            "enviado_em": None, "enviado_por": None, "enviado_erro": None,
         }
         return self._prospeccao_registro(self.prospeccoes[telefone_hash])
 
@@ -1264,6 +1271,9 @@ class FakeDatabase:
                 "aberto_em": existente["aberto_em"] if existente else None,
                 "aberto_por": existente["aberto_por"] if existente else None,
                 "criado_em": existente["criado_em"] if existente else agora,
+                "enviado_em": existente.get("enviado_em") if existente else None,
+                "enviado_por": existente.get("enviado_por") if existente else None,
+                "enviado_erro": existente.get("enviado_erro") if existente else None,
             }
             if existente:
                 atualizados += 1
@@ -1305,6 +1315,22 @@ class FakeDatabase:
                 dados["aberto_por"] = por
                 return
 
+    def registrar_envio_prospeccao(
+        self, prospeccao_id: int, *, por: str, sucesso: bool, erro: str | None = None
+    ) -> None:
+        """Espelha `db.Database.registrar_envio_prospeccao`: sucesso grava
+        `enviado_em`/limpa `enviado_erro`; falha grava só `enviado_erro`,
+        preservando um `enviado_em` de sucesso anterior."""
+        for dados in self.prospeccoes.values():
+            if dados["id"] == prospeccao_id:
+                dados["enviado_por"] = por
+                if sucesso:
+                    dados["enviado_em"] = datetime.now(timezone.utc)
+                    dados["enviado_erro"] = None
+                else:
+                    dados["enviado_erro"] = erro
+                return
+
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
         dados = self.prospeccoes.get(telefone_hash)
         if dados is None:
@@ -1316,4 +1342,6 @@ class FakeDatabase:
             tier_origem=dados["tier_origem"], status_origem=dados["status_origem"],
             aberto_em=dados["aberto_em"], aberto_por=dados["aberto_por"],
             criado_em=dados["criado_em"],
+            enviado_em=dados.get("enviado_em"), enviado_por=dados.get("enviado_por"),
+            enviado_erro=dados.get("enviado_erro"),
         )

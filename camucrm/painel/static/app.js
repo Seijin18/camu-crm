@@ -1565,7 +1565,114 @@ async function renderizarImportarProspeccao(container) {
   container.appendChild(areaResultado);
 }
 
-function linhaProspeccao(p) {
+/**
+ * Extrai o número do `link_whatsapp` já presente no payload (`?phone=...`)
+ * — change `envio-prospeccao-pela-evolution-api`. Nenhum campo `telefone`
+ * novo é pedido ao servidor para isto: `views.prospeccao_para_json` (§12,
+ * mesma cautela de `_contato_para_json`) nunca expõe telefone como campo
+ * próprio, só embutido nesse link — o popup reaproveita o que já está lá.
+ */
+function telefoneDoLinkWhatsapp(linkWhatsapp) {
+  try {
+    return new URL(linkWhatsapp).searchParams.get("phone") || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+/**
+ * Popup de envio direto pela Evolution API (change
+ * `envio-prospeccao-pela-evolution-api`) — telefone e mensagem vêm
+ * pré-preenchidos e são editáveis; nada é enviado sem o operador confirmar
+ * aqui. `aoConcluir` é chamado só depois de sucesso confirmado pelo
+ * servidor, para a linha da lista poder se atualizar (mostrar "enviado às
+ * HH:MM").
+ */
+function abrirPopupEnvioProspeccao(p, aoConcluir) {
+  const fundo = el("div", { class: "modal-fundo" });
+  const caixa = el("div", { class: "modal-caixa" });
+
+  const fechar = () => {
+    document.removeEventListener("keydown", aoTeclarEscape);
+    fundo.remove();
+  };
+  const aoTeclarEscape = (evento) => {
+    if (evento.key === "Escape") fechar();
+  };
+  fundo.addEventListener("click", (evento) => {
+    if (evento.target === fundo) fechar();
+  });
+  document.addEventListener("keydown", aoTeclarEscape);
+
+  caixa.appendChild(el("h3", { texto: `Enviar pela Evolution API — ${p.nome}` }));
+  caixa.appendChild(
+    el("p", {
+      class: "aviso",
+      texto: "Revise o número e o texto antes de enviar. Nada é enviado automaticamente.",
+    })
+  );
+
+  const labelTelefone = el("label", {}, [document.createTextNode("Telefone")]);
+  const campoTelefone = el("input", { type: "text" });
+  campoTelefone.value = telefoneDoLinkWhatsapp(p.link_whatsapp);
+  labelTelefone.appendChild(campoTelefone);
+
+  const labelMensagem = el("label", {}, [document.createTextNode("Mensagem")]);
+  const campoMensagem = el("textarea", {});
+  campoMensagem.value = p.mensagem || "";
+  labelMensagem.appendChild(campoMensagem);
+
+  const labelOperador = el("label", {}, [document.createTextNode("Aprovado por")]);
+  const campoOperador = el("input", { type: "text" });
+  campoOperador.value = obterOperador();
+  labelOperador.appendChild(campoOperador);
+
+  const areaErro = el("p", { class: "modal-erro" });
+
+  const botaoCancelar = el("button", { class: "secundario", texto: "Cancelar" });
+  botaoCancelar.addEventListener("click", fechar);
+
+  const botaoEnviar = el("button", { texto: "Enviar" });
+  botaoEnviar.addEventListener("click", async () => {
+    const telefone = campoTelefone.value.trim();
+    const mensagem = campoMensagem.value.trim();
+    const por = campoOperador.value.trim();
+    if (!telefone || !mensagem || !por) {
+      areaErro.textContent = "Preencha telefone, mensagem e aprovado por.";
+      return;
+    }
+    salvarOperador(por);
+    areaErro.textContent = "";
+    botaoEnviar.disabled = true;
+    botaoEnviar.textContent = "Enviando…";
+    try {
+      await chamarApiEscrever(`/prospeccao/${p.id}/enviar`, { telefone, mensagem, por });
+      fechar();
+      if (aoConcluir) aoConcluir();
+    } catch (e) {
+      // 502 (Evolution fora do ar/recusou) ou 422 (campo faltando, ainda
+      // que já validado acima) — o popup continua aberto e o texto editado
+      // permanece nos campos, para o operador tentar de novo ou copiar a
+      // mensagem e usar o link `wa.me` como alternativa.
+      areaErro.textContent = e.message;
+      botaoEnviar.disabled = false;
+      botaoEnviar.textContent = "Enviar";
+    }
+  });
+
+  const acoes = el("div", { class: "modal-acoes" }, [botaoCancelar, botaoEnviar]);
+
+  caixa.appendChild(labelTelefone);
+  caixa.appendChild(labelMensagem);
+  caixa.appendChild(labelOperador);
+  caixa.appendChild(areaErro);
+  caixa.appendChild(acoes);
+  fundo.appendChild(caixa);
+  document.body.appendChild(fundo);
+  campoMensagem.focus();
+}
+
+function linhaProspeccao(p, recarregar) {
   const linha = el("div", { class: "prospeccao-item" });
   linha.appendChild(
     el("span", {
@@ -1585,6 +1692,26 @@ function linhaProspeccao(p) {
     link.href = `#/conversas/${p.conversa_id}`;
     linha.appendChild(link);
     return linha;
+  }
+
+  // Resultado da última tentativa de envio pela API — distinto de "abriu o
+  // link" (aquilo nunca teve confirmação; isto é o servidor dizendo que a
+  // Evolution aceitou, ou não, o envio).
+  if (p.enviado_erro) {
+    linha.appendChild(
+      el("span", {
+        class: "enviado-selo com-erro",
+        texto: `envio falhou: ${p.enviado_erro}`,
+      })
+    );
+  } else if (p.enviado_em) {
+    const quando = new Date(p.enviado_em);
+    linha.appendChild(
+      el("span", {
+        class: "enviado-selo",
+        texto: `enviado às ${quando.toLocaleString()}`,
+      })
+    );
   }
 
   if (!p.mensagem || !p.link_whatsapp) {
@@ -1624,8 +1751,20 @@ function linhaProspeccao(p) {
     });
   });
 
+  // Change `envio-prospeccao-pela-evolution-api`: caminho alternativo ao
+  // link acima — este de fato chama a Evolution API pelo servidor, depois
+  // de o operador revisar/editar no popup. Os dois convivem.
+  const botaoEnviarApi = el("button", {
+    class: "prospeccao-btn-enviar",
+    texto: "Enviar pela Evolution API",
+  });
+  botaoEnviarApi.addEventListener("click", () => {
+    abrirPopupEnvioProspeccao(p, recarregar);
+  });
+
   linha.appendChild(botaoCopiar);
   linha.appendChild(linkWhatsapp);
+  linha.appendChild(botaoEnviarApi);
   return linha;
 }
 
@@ -1665,7 +1804,7 @@ async function renderizarProspeccao(container) {
     if (dados.prospeccoes.length === 0) {
       lista.appendChild(el("p", { class: "aviso", texto: "nenhuma linha para os filtros atuais" }));
     }
-    dados.prospeccoes.forEach((p) => lista.appendChild(linhaProspeccao(p)));
+    dados.prospeccoes.forEach((p) => lista.appendChild(linhaProspeccao(p, carregar)));
   };
 
   [campoZona, campoBairro, campoNota, campoTier].forEach((campo) => {
