@@ -1266,6 +1266,7 @@ class FakeDatabase:
             # mão sem passar por `criar_prospeccao`) não têm essas chaves.
             enviado_em=dados.get("enviado_em"), enviado_por=dados.get("enviado_por"),
             enviado_erro=dados.get("enviado_erro"),
+            enviado_instancia=dados.get("enviado_instancia"),
         )
 
     def criar_prospeccao(
@@ -1296,6 +1297,7 @@ class FakeDatabase:
             "tier_origem": tier_origem, "status_origem": status_origem,
             "aberto_em": None, "aberto_por": None, "criado_em": agora,
             "enviado_em": None, "enviado_por": None, "enviado_erro": None,
+            "enviado_instancia": None,
         }
         return self._prospeccao_registro(self.prospeccoes[telefone_hash])
 
@@ -1341,6 +1343,7 @@ class FakeDatabase:
                 "enviado_em": existente.get("enviado_em") if existente else None,
                 "enviado_por": existente.get("enviado_por") if existente else None,
                 "enviado_erro": existente.get("enviado_erro") if existente else None,
+                "enviado_instancia": existente.get("enviado_instancia") if existente else None,
             }
             if existente:
                 atualizados += 1
@@ -1383,14 +1386,23 @@ class FakeDatabase:
                 return
 
     def registrar_envio_prospeccao(
-        self, prospeccao_id: int, *, por: str, sucesso: bool, erro: str | None = None
+        self,
+        prospeccao_id: int,
+        *,
+        por: str,
+        sucesso: bool,
+        erro: str | None = None,
+        instancia: str | None = None,
     ) -> None:
         """Espelha `db.Database.registrar_envio_prospeccao`: sucesso grava
         `enviado_em`/limpa `enviado_erro`; falha grava só `enviado_erro`,
-        preservando um `enviado_em` de sucesso anterior."""
+        preservando um `enviado_em` de sucesso anterior. `enviado_instancia`
+        é gravado nos dois casos (change
+        `escolher-instancia-no-envio-prospeccao`)."""
         for dados in self.prospeccoes.values():
             if dados["id"] == prospeccao_id:
                 dados["enviado_por"] = por
+                dados["enviado_instancia"] = instancia
                 if sucesso:
                     dados["enviado_em"] = datetime.now(timezone.utc)
                     dados["enviado_erro"] = None
@@ -1411,4 +1423,5 @@ class FakeDatabase:
             criado_em=dados["criado_em"],
             enviado_em=dados.get("enviado_em"), enviado_por=dados.get("enviado_por"),
             enviado_erro=dados.get("enviado_erro"),
+            enviado_instancia=dados.get("enviado_instancia"),
         )

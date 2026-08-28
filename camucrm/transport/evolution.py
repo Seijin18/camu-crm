@@ -10,6 +10,7 @@ não o adaptador.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -30,6 +31,17 @@ logger = logging.getLogger("camucrm.transporte.evolution")
 # Problema de transporte vale retentar; erro HTTP significa que a API
 # respondeu e recusou — repetir não muda nada.
 _RETENTAVEIS = (requests.ConnectionError, requests.Timeout)
+
+
+@dataclass(frozen=True)
+class InstanciaEvolution:
+    """Uma instância (número) cadastrada na Evolution API — change
+    `escolher-instancia-no-envio-prospeccao`. `conectada` reflete o estado de
+    conexão no momento da consulta (`open` = pareada); a UI usa isso só para
+    avisar, não para bloquear a escolha."""
+
+    nome: str
+    conectada: bool
 
 
 class EvolutionTransporte:
@@ -86,6 +98,67 @@ class EvolutionTransporte:
             raise TransporteError(
                 self.nome, str(exc), retentavel=isinstance(exc, _RETENTAVEIS)
             ) from exc
+
+    def listar_instancias(self) -> list[InstanciaEvolution]:
+        """Números cadastrados na Evolution API (`GET /instance/fetchInstances`)
+        — change `escolher-instancia-no-envio-prospeccao`.
+
+        Só precisa de `EVOLUTION_API_BASE_URL`/`_API_KEY` (não de
+        `_INSTANCE` — a pergunta é justamente "quais existem"). O formato de
+        `fetchInstances` mudou entre as versões da Evolution API: v1 aninha
+        em `{"instance": {"instanceName": ..., "connectionStatus": ...}}`, v2
+        devolve o objeto plano (`{"name": ..., "connectionStatus": ...}`).
+        Os dois são tolerados aqui.
+        """
+        faltando = [
+            nome
+            for nome, valor in (
+                ("EVOLUTION_API_BASE_URL", self.base_url),
+                ("EVOLUTION_API_KEY", self.api_key),
+            )
+            if not valor
+        ]
+        if faltando:
+            raise TransporteError(
+                self.nome,
+                f"listar instâncias exige {', '.join(faltando)}",
+            )
+        try:
+            resposta = requests.get(
+                f"{self.base_url}/instance/fetchInstances",
+                headers={"apikey": self.api_key},
+                timeout=self.timeout,
+            )
+            resposta.raise_for_status()
+            corpo = resposta.json() if resposta.content else []
+        except requests.RequestException as exc:
+            raise TransporteError(
+                self.nome, str(exc), retentavel=isinstance(exc, _RETENTAVEIS)
+            ) from exc
+        except ValueError as exc:  # JSON inválido
+            raise TransporteError(self.nome, f"resposta ilegível: {exc}") from exc
+
+        itens = corpo if isinstance(corpo, list) else corpo.get("instances", [])
+        instancias = []
+        for item in itens:
+            if not isinstance(item, Mapping):
+                continue
+            interno = item.get("instance") if isinstance(item.get("instance"), Mapping) else item
+            nome = (
+                interno.get("name")
+                or interno.get("instanceName")
+                or interno.get("instance")
+            )
+            if not nome:
+                continue
+            estado = str(
+                interno.get("connectionStatus")
+                or interno.get("status")
+                or interno.get("state")
+                or ""
+            ).lower()
+            instancias.append(InstanciaEvolution(nome=str(nome), conectada=estado == "open"))
+        return instancias
 
     def _exigir_credenciais(self) -> None:
         faltando = [

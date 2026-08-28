@@ -825,6 +825,9 @@ def prospeccao_para_json(
         "enviado_em": registro.enviado_em.isoformat() if registro.enviado_em else None,
         "enviado_por": registro.enviado_por,
         "enviado_erro": registro.enviado_erro,
+        # Change `escolher-instancia-no-envio-prospeccao`: por qual número a
+        # última tentativa saiu (`None` = instância única do `.env`).
+        "enviado_instancia": registro.enviado_instancia,
     }
 
 

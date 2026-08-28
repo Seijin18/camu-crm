@@ -1126,6 +1126,69 @@ class TesteEnvioProspeccao(unittest.TestCase):
         self.assertEqual(resposta.status_code, 502)
         self.assertIn("EVOLUTION_API_KEY", resposta.json()["erro"])
 
+    def test_instancia_escolhida_e_repassada_e_registrada(self):
+        """Change `escolher-instancia-no-envio-prospeccao`: o número escolhido
+        no popup vai para `criar_transporte(..., instancia=...)` e é gravado
+        em `prospeccoes.enviado_instancia`."""
+        transporte = FakeTransporteEvolution(sucesso=True)
+        with patch(
+            "camucrm.painel.envio.criar_transporte", return_value=transporte
+        ) as fabrica:
+            resposta = self._enviar(instancia="pessoal-felipe")
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(fabrica.call_args.kwargs["instancia"], "pessoal-felipe")
+        registro = self.fake.listar_prospeccoes()[0]
+        self.assertEqual(registro.enviado_instancia, "pessoal-felipe")
+
+    def test_sem_instancia_no_corpo_usa_o_padrao_do_env(self):
+        transporte = FakeTransporteEvolution(sucesso=True)
+        with patch(
+            "camucrm.painel.envio.criar_transporte", return_value=transporte
+        ) as fabrica:
+            self._enviar()
+        self.assertIsNone(fabrica.call_args.kwargs["instancia"])
+        self.assertIsNone(self.fake.listar_prospeccoes()[0].enviado_instancia)
+
+    def test_falha_grava_a_instancia_da_tentativa(self):
+        transporte = FakeTransporteEvolution(sucesso=False, mensagem_erro="chip caiu")
+        with patch("camucrm.painel.envio.criar_transporte", return_value=transporte):
+            resposta = self._enviar(instancia="pessoal-marcos")
+        self.assertEqual(resposta.status_code, 502)
+        registro = self.fake.listar_prospeccoes()[0]
+        self.assertEqual(registro.enviado_instancia, "pessoal-marcos")
+        self.assertIsNone(registro.enviado_em)
+
+    def test_lista_de_instancias_vem_da_evolution(self):
+        from camucrm.painel.envio import InstanciaDisponivel
+
+        with patch(
+            "camucrm.painel.envio.listar_instancias_evolution",
+            return_value=[
+                InstanciaDisponivel(nome="camu_whatsapp", conectada=True),
+                InstanciaDisponivel(nome="pessoal-felipe", conectada=False),
+            ],
+        ):
+            resposta = self.cliente.get("/api/prospeccao/instancias")
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(
+            resposta.json()["instancias"],
+            [
+                {"nome": "camu_whatsapp", "conectada": True},
+                {"nome": "pessoal-felipe", "conectada": False},
+            ],
+        )
+
+    def test_lista_de_instancias_502_quando_evolution_indisponivel(self):
+        from camucrm.transport import TransporteError
+
+        with patch(
+            "camucrm.painel.envio.listar_instancias_evolution",
+            side_effect=TransporteError("evolution", "connection refused"),
+        ):
+            resposta = self.cliente.get("/api/prospeccao/instancias")
+        self.assertEqual(resposta.status_code, 502)
+        self.assertIn("connection refused", resposta.json()["erro"])
+
 
 class TesteProspeccaoNuncaAparecEmTelasDeConversa(unittest.TestCase):
     """Requirement "Shortlist separada de contatos/conversas" (design.md):

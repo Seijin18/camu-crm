@@ -26,6 +26,12 @@ Consequência aceita e documentada: o processo do painel passa a carregar
 propósito"). Isolado aqui: nenhum outro arquivo do painel precisa saber que
 `camucrm.transport` existe — `camucrm/painel/api.py` chama
 `enviar_prospeccao`, não `transport.criar_transporte` diretamente.
+
+Change `escolher-instancia-no-envio-prospeccao`: este módulo também expõe
+`instancias_disponiveis()` (lista os números cadastrados na Evolution API
+para o popup escolher) e `enviar_prospeccao(..., instancia=...)` repassa a
+escolha. A consulta de instâncias é mais uma chamada à Evolution API com
+credencial — mesmo risco do envio —, por isso mora aqui e não em `api.py`.
 """
 
 from __future__ import annotations
@@ -34,7 +40,12 @@ import logging
 from dataclasses import dataclass
 
 from ..db import Database
-from ..transport import Destinatario, TransporteError, criar_transporte
+from ..transport import (
+    Destinatario,
+    TransporteError,
+    criar_transporte,
+    listar_instancias_evolution,
+)
 
 logger = logging.getLogger("camucrm.painel.envio")
 
@@ -54,6 +65,26 @@ class ResultadoEnvioProspeccao:
     erro: str | None = None
 
 
+@dataclass(frozen=True)
+class InstanciaDisponivel:
+    nome: str
+    conectada: bool
+
+
+def instancias_disponiveis() -> list[InstanciaDisponivel]:
+    """Números cadastrados na Evolution API, para o popup de envio escolher
+    por qual enviar (change `escolher-instancia-no-envio-prospeccao`).
+
+    `TransporteError` propaga (falta de credencial no processo do painel, ou
+    Evolution fora do ar) — a rota em `api.py` traduz para 502, e a tela cai
+    de volta no comportamento de antes: envia pela instância única do `.env`.
+    """
+    return [
+        InstanciaDisponivel(nome=i.nome, conectada=i.conectada)
+        for i in listar_instancias_evolution()
+    ]
+
+
 def enviar_prospeccao(
     db: Database,
     prospeccao_id: int,
@@ -61,6 +92,7 @@ def enviar_prospeccao(
     telefone: str,
     mensagem: str,
     por: str,
+    instancia: str | None = None,
 ) -> ResultadoEnvioProspeccao:
     """Envia `mensagem` para `telefone` pela Evolution API e registra o
     resultado na linha de `prospeccoes`.
@@ -86,6 +118,9 @@ def enviar_prospeccao(
     texto = (mensagem or "").strip()
     if not texto:
         raise CampoObrigatorioError("mensagem")
+    # `escolher-instancia-no-envio-prospeccao`: número escolhido no popup.
+    # Vazio/ausente = instância única do `.env` (comportamento de antes).
+    escolhida = (instancia or "").strip() or None
 
     try:
         # `criar_transporte` levanta `RuntimeError` simples (não
@@ -96,11 +131,11 @@ def enviar_prospeccao(
         # perderia o tipo específico) quando faltam
         # `EVOLUTION_API_BASE_URL`/`_API_KEY`/`_INSTANCE` no processo do
         # painel — caso real e esperado até o operador configurar o `.env`.
-        transporte = criar_transporte("evolution")
+        transporte = criar_transporte("evolution", instancia=escolhida)
     except RuntimeError as exc:
         erro = TransporteError("evolution", str(exc))
         db.registrar_envio_prospeccao(
-            prospeccao_id, por=quem, sucesso=False, erro=str(erro)
+            prospeccao_id, por=quem, sucesso=False, erro=str(erro), instancia=escolhida
         )
         raise erro from exc
 
@@ -114,13 +149,15 @@ def enviar_prospeccao(
             prospeccao_id, quem, exc,
         )
         db.registrar_envio_prospeccao(
-            prospeccao_id, por=quem, sucesso=False, erro=str(exc)
+            prospeccao_id, por=quem, sucesso=False, erro=str(exc), instancia=escolhida
         )
         raise
 
     logger.info(
-        "Prospecção %s enviada pela Evolution API (aprovado por %s)",
-        prospeccao_id, quem,
+        "Prospecção %s enviada pela Evolution API (aprovado por %s, instância %s)",
+        prospeccao_id, quem, escolhida or "(padrão do .env)",
     )
-    db.registrar_envio_prospeccao(prospeccao_id, por=quem, sucesso=True)
+    db.registrar_envio_prospeccao(
+        prospeccao_id, por=quem, sucesso=True, instancia=escolhida
+    )
     return ResultadoEnvioProspeccao(ok=True, externa_id=resultado.externa_id)

@@ -1622,6 +1622,32 @@ function abrirPopupEnvioProspeccao(p, aoConcluir) {
   campoMensagem.value = p.mensagem || "";
   labelMensagem.appendChild(campoMensagem);
 
+  // Change `escolher-instancia-no-envio-prospeccao`: seletor "Enviar pelo
+  // número", populado ao vivo de `/api/prospeccao/instancias`. Fica oculto
+  // enquanto a lista não carrega (ou se a Evolution API não responde) — aí o
+  // envio segue pela instância única do `.env`, como antes.
+  const labelInstancia = el("label", { class: "escondido" }, [
+    document.createTextNode("Enviar pelo número"),
+  ]);
+  const campoInstancia = el("select", {});
+  labelInstancia.appendChild(campoInstancia);
+  chamarApi("/prospeccao/instancias")
+    .then((dados) => {
+      const lista = (dados && dados.instancias) || [];
+      if (lista.length === 0) return;
+      lista.forEach((inst) => {
+        const opcao = el("option", {
+          value: inst.nome,
+          texto: inst.conectada ? inst.nome : `${inst.nome} (desconectado)`,
+        });
+        campoInstancia.appendChild(opcao);
+      });
+      labelInstancia.classList.remove("escondido");
+    })
+    .catch(() => {
+      /* sem lista: o seletor fica oculto e o envio usa a instância do .env. */
+    });
+
   const labelOperador = el("label", {}, [document.createTextNode("Aprovado por")]);
   const campoOperador = el("input", { type: "text" });
   campoOperador.value = obterOperador();
@@ -1637,6 +1663,7 @@ function abrirPopupEnvioProspeccao(p, aoConcluir) {
     const telefone = campoTelefone.value.trim();
     const mensagem = campoMensagem.value.trim();
     const por = campoOperador.value.trim();
+    const instancia = campoInstancia.value || undefined;
     if (!telefone || !mensagem || !por) {
       areaErro.textContent = "Preencha telefone, mensagem e aprovado por.";
       return;
@@ -1646,7 +1673,12 @@ function abrirPopupEnvioProspeccao(p, aoConcluir) {
     botaoEnviar.disabled = true;
     botaoEnviar.textContent = "Enviando…";
     try {
-      await chamarApiEscrever(`/prospeccao/${p.id}/enviar`, { telefone, mensagem, por });
+      await chamarApiEscrever(`/prospeccao/${p.id}/enviar`, {
+        telefone,
+        mensagem,
+        por,
+        instancia,
+      });
       fechar();
       if (aoConcluir) aoConcluir();
     } catch (e) {
@@ -1664,6 +1696,7 @@ function abrirPopupEnvioProspeccao(p, aoConcluir) {
 
   caixa.appendChild(labelTelefone);
   caixa.appendChild(labelMensagem);
+  caixa.appendChild(labelInstancia);
   caixa.appendChild(labelOperador);
   caixa.appendChild(areaErro);
   caixa.appendChild(acoes);
@@ -1697,11 +1730,13 @@ function linhaProspeccao(p, recarregar) {
   // Resultado da última tentativa de envio pela API — distinto de "abriu o
   // link" (aquilo nunca teve confirmação; isto é o servidor dizendo que a
   // Evolution aceitou, ou não, o envio).
+  // Change `escolher-instancia-no-envio-prospeccao`: por qual número saiu.
+  const porNumero = p.enviado_instancia ? ` pelo ${p.enviado_instancia}` : "";
   if (p.enviado_erro) {
     linha.appendChild(
       el("span", {
         class: "enviado-selo com-erro",
-        texto: `envio falhou: ${p.enviado_erro}`,
+        texto: `envio falhou${porNumero}: ${p.enviado_erro}`,
       })
     );
   } else if (p.enviado_em) {
@@ -1709,7 +1744,7 @@ function linhaProspeccao(p, recarregar) {
     linha.appendChild(
       el("span", {
         class: "enviado-selo",
-        texto: `enviado às ${quando.toLocaleString()}`,
+        texto: `enviado às ${quando.toLocaleString()}${porNumero}`,
       })
     );
   }

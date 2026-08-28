@@ -785,6 +785,9 @@ class EnviarProspeccaoBody(BaseModel):
     telefone: str
     mensagem: str
     por: str | None = None
+    # Change `escolher-instancia-no-envio-prospeccao`: número escolhido no
+    # popup entre os cadastrados. Ausente/vazio = instância única do `.env`.
+    instancia: str | None = None
 
 
 @router.post("/prospeccao/importar")
@@ -859,6 +862,7 @@ def enviar_prospeccao_rota(
             telefone=corpo.telefone,
             mensagem=corpo.mensagem,
             por=corpo.por or "",
+            instancia=corpo.instancia,
         )
     except envio.CampoObrigatorioError as exc:
         return JSONResponse(status_code=422, content=views.erro(str(exc), None))
@@ -871,6 +875,27 @@ def enviar_prospeccao_rota(
         # quebraria a garantia que `tests/test_painel_api.py` prova por AST.
         return JSONResponse(status_code=502, content=views.erro(str(exc), None))
     return {"ok": resultado.ok, "externa_id": resultado.externa_id}
+
+
+@router.get("/prospeccao/instancias")
+def listar_instancias_prospeccao():
+    """Números cadastrados na Evolution API, para o popup de envio escolher
+    por qual enviar (change `escolher-instancia-no-envio-prospeccao`).
+
+    Delega a `envio.instancias_disponiveis` — `envio.py` continua o único
+    módulo do painel que toca `camucrm.transport`. 502 (com detalhe) quando
+    falta credencial no processo do painel ou a Evolution API não responde;
+    a tela então esconde o seletor e envia pela instância única do `.env`.
+    """
+    try:
+        instancias = envio.instancias_disponiveis()
+    except envio.TransporteError as exc:
+        return JSONResponse(status_code=502, content=views.erro(str(exc), None))
+    return {
+        "instancias": [
+            {"nome": i.nome, "conectada": i.conectada} for i in instancias
+        ]
+    }
 
 
 # --------------------------------------------------------------------------

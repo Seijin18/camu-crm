@@ -445,6 +445,10 @@ class ProspeccaoRegistro:
     enviado_em: datetime | None = None
     enviado_por: str | None = None
     enviado_erro: str | None = None
+    # ADIÇÃO (change `escolher-instancia-no-envio-prospeccao`): instância da
+    # Evolution API por onde saiu a última tentativa — mesma posição relativa
+    # que os campos `enviado_*` acima (antes de contato_id/conversa_id).
+    enviado_instancia: str | None = None
     contato_id: int | None = None
     conversa_id: int | None = None
 
@@ -811,6 +815,12 @@ CREATE INDEX IF NOT EXISTS prospeccoes_zona_idx ON prospeccoes (zona, bairro);
 ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_em TIMESTAMP WITH TIME ZONE;
 ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_por VARCHAR(48);
 ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_erro TEXT;
+-- ADIÇÃO (change `escolher-instancia-no-envio-prospeccao`): nome da instância
+-- da Evolution API por onde a ÚLTIMA tentativa de envio saiu — o operador
+-- escolhe entre os números cadastrados no popup. Gravado tanto no sucesso
+-- quanto na falha (a tela mostra "falhou pelo número X"). `NULL` para as
+-- linhas enviadas antes deste change.
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_instancia VARCHAR(64);
 
 -- ADIÇÃO (change `backfill-cobertura-por-prompt`): até onde CADA versão de
 -- prompt de extração já leu uma conversa. Existe para `forcar=True`
@@ -3075,7 +3085,7 @@ class Database:
         SELECT p.id, p.nome, p.telefone, p.bairro, p.zona, p.nota,
                p.avaliacoes, p.site, p.tier_origem, p.status_origem,
                p.aberto_em, p.aberto_por, p.criado_em,
-               p.enviado_em, p.enviado_por, p.enviado_erro
+               p.enviado_em, p.enviado_por, p.enviado_erro, p.enviado_instancia
           FROM prospeccoes p
     """
 
@@ -3208,6 +3218,7 @@ class Database:
                            p.avaliacoes, p.site, p.tier_origem, p.status_origem,
                            p.aberto_em, p.aberto_por, p.criado_em,
                            p.enviado_em, p.enviado_por, p.enviado_erro,
+                           p.enviado_instancia,
                            c.id AS contato_id, cv.id AS conversa_id
                       FROM prospeccoes p
                       LEFT JOIN contatos c ON c.telefone_hash = p.telefone_hash
@@ -3238,7 +3249,13 @@ class Database:
                 )
 
     def registrar_envio_prospeccao(
-        self, prospeccao_id: int, *, por: str, sucesso: bool, erro: str | None = None
+        self,
+        prospeccao_id: int,
+        *,
+        por: str,
+        sucesso: bool,
+        erro: str | None = None,
+        instancia: str | None = None,
     ) -> None:
         """Grava o resultado de UMA tentativa de envio pela Evolution API
         (change `envio-prospeccao-pela-evolution-api`) — distinto de
@@ -3251,20 +3268,24 @@ class Database:
         esse registro precisa sobreviver a uma tentativa nova que falhou,
         para a tela poder mostrar "enviado em X, mas a tentativa mais
         recente falhou" em vez de perder o histórico do que funcionou.
+
+        `instancia` (change `escolher-instancia-no-envio-prospeccao`): o
+        número escolhido no popup. Gravado nos dois casos — a tela precisa
+        dizer por qual número a tentativa (bem-sucedida OU falha) saiu.
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
                 if sucesso:
                     cur.execute(
                         "UPDATE prospeccoes SET enviado_em = now(), enviado_por = %s, "
-                        "enviado_erro = NULL WHERE id = %s",
-                        (por, prospeccao_id),
+                        "enviado_erro = NULL, enviado_instancia = %s WHERE id = %s",
+                        (por, instancia, prospeccao_id),
                     )
                 else:
                     cur.execute(
-                        "UPDATE prospeccoes SET enviado_por = %s, enviado_erro = %s "
-                        "WHERE id = %s",
-                        (por, erro, prospeccao_id),
+                        "UPDATE prospeccoes SET enviado_por = %s, enviado_erro = %s, "
+                        "enviado_instancia = %s WHERE id = %s",
+                        (por, erro, instancia, prospeccao_id),
                     )
 
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:

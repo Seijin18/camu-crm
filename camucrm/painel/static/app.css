@@ -603,7 +603,8 @@ main {
 }
 
 .modal-caixa input[type="text"],
-.modal-caixa textarea {
+.modal-caixa textarea,
+.modal-caixa select {
   background: var(--bg);
   color: var(--texto);
   border: 1px solid var(--borda);
@@ -612,6 +613,13 @@ main {
   font-family: inherit;
   font-size: 0.9rem;
   resize: vertical;
+}
+
+/* Change `escolher-instancia-no-envio-prospeccao`: o seletor de número fica
+   oculto até a lista de instâncias carregar (ou de vez, se a Evolution API
+   não responder). */
+.modal-caixa label.escondido {
+  display: none;
 }
 
 .modal-caixa textarea {

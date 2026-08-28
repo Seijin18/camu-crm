@@ -277,6 +277,64 @@ class TesteRecepcaoNaoPrecisaDeCredencial(unittest.TestCase):
         self.assertEqual(transporte.nome, "evolution")
 
 
+class TesteListarInstancias(unittest.TestCase):
+    """Change `escolher-instancia-no-envio-prospeccao`: `listar_instancias`
+    normaliza os dois formatos de `fetchInstances` da Evolution API."""
+
+    def _resposta(self, corpo):
+        from unittest import mock
+
+        resp = mock.Mock()
+        resp.content = b"x"
+        resp.json.return_value = corpo
+        resp.raise_for_status.return_value = None
+        return resp
+
+    def test_formato_v2_plano(self):
+        from unittest import mock
+
+        t = EvolutionTransporte("http://x", "k")
+        corpo = [
+            {"name": "camu_whatsapp", "connectionStatus": "open"},
+            {"name": "pessoal-felipe", "connectionStatus": "close"},
+        ]
+        with mock.patch("camucrm.transport.evolution.requests.get", return_value=self._resposta(corpo)):
+            instancias = t.listar_instancias()
+        self.assertEqual([i.nome for i in instancias], ["camu_whatsapp", "pessoal-felipe"])
+        self.assertEqual([i.conectada for i in instancias], [True, False])
+
+    def test_formato_v1_aninhado(self):
+        from unittest import mock
+
+        t = EvolutionTransporte("http://x", "k")
+        corpo = [{"instance": {"instanceName": "camu_whatsapp", "status": "open"}}]
+        with mock.patch("camucrm.transport.evolution.requests.get", return_value=self._resposta(corpo)):
+            instancias = t.listar_instancias()
+        self.assertEqual(instancias[0].nome, "camu_whatsapp")
+        self.assertTrue(instancias[0].conectada)
+
+    def test_sem_credencial_recusa(self):
+        from camucrm.transport.base import TransporteError
+
+        with self.assertRaises(TransporteError):
+            EvolutionTransporte().listar_instancias()
+
+    def test_rede_fora_do_ar_vira_transporte_error(self):
+        from unittest import mock
+
+        import requests as requests_mod
+
+        from camucrm.transport.base import TransporteError
+
+        t = EvolutionTransporte("http://x", "k")
+        with mock.patch(
+            "camucrm.transport.evolution.requests.get",
+            side_effect=requests_mod.ConnectionError("recusado"),
+        ):
+            with self.assertRaises(TransporteError):
+                t.listar_instancias()
+
+
 class TesteBroadcastEStatusIgnorados(unittest.TestCase):
     """Change `identificacao-e-relogio-confiaveis`: nunca é conversa 1:1."""
 

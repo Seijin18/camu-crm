@@ -145,6 +145,21 @@ Todas justificadas no ponto de uso; listadas aqui para não se perderem.
   `enviado_erro`, distintas de `aberto_em`/`aberto_por` (intenção de clique
   no link, sem confirmação) — estas são confirmação real, só gravadas
   depois que a Evolution API respondeu.
+- **Escolha da instância no envio de prospecção** (change
+  `escolher-instancia-no-envio-prospeccao`, estende o item acima). O popup
+  "Enviar pela Evolution API" passou a listar ao vivo os números cadastrados
+  (`GET /instance/fetchInstances`) e deixa o operador escolher por qual
+  enviar — antes era sempre `EVOLUTION_INSTANCE`. Motivador: o número
+  pessoal do Marcos e o do Felipe viram instâncias próprias (ver
+  `ingestao-restrita-por-instancia`). `criar_transporte("evolution",
+  instancia=...)` sobrepõe a instância só para aquela chamada; sem o
+  parâmetro, todo o resto (`camucrm enviar`, webhook) continua lendo
+  `EVOLUTION_INSTANCE`. Coluna nova `prospeccoes.enviado_instancia`, gravada
+  no sucesso E na falha (a tela mostra por qual número a tentativa saiu). A
+  garantia AST não muda: a consulta e o repasse passam por
+  `camucrm/painel/envio.py`, ainda o único módulo do painel que importa
+  `camucrm.transport`. Se `fetchInstances` falhar, o seletor some e o envio
+  segue pela instância do `.env` — nunca um bloqueio novo.
 
 ## Correções pendentes — auditoria completa do pipeline (2026-08)
 
