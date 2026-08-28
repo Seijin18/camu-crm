@@ -61,18 +61,46 @@ PORTA_PAINEL="${CAMU_PAINEL_PORT:-8093}"
 # --------------------------------------------------------------------------
 etapa "Banco"
 
-if docker compose ps --format '{{.Name}} {{.Status}}' 2>/dev/null | grep -q "camucrm_db.*Up"; then
-  ok "Postgres já no ar"
-else
-  docker compose up -d db >/dev/null 2>&1 && ok "Postgres subindo" || { erro "falha ao subir o Postgres"; exit 1; }
-fi
+# `CAMU_DB_DSN` decide qual banco é usado — nunca assumir que é o Postgres
+# local do docker-compose. Assumir isso escondeu, de verdade, uma migração
+# para o Supabase: este script dizia "Postgres no ar" testando o container
+# certo enquanto o processo real conectava em outro banco, e não havia
+# nenhum sinal de que os dois tinham se desalinhado.
+DB_HOST=$("$PY" -c "
+from camucrm import config
+import re
+m = re.search(r'@([^:/?]+)', config.dsn())
+print(m.group(1) if m else '?')
+" 2>/dev/null || echo "?")
 
-# `pg_isready` e não um sleep fixo: o schema aplicado contra um banco ainda
-# subindo falha de formas que parecem bug de aplicação.
-if timeout 60 bash -c 'until docker exec camucrm_db pg_isready -U camu -d camucrm >/dev/null 2>&1; do sleep 1; done'; then
-  ok "Postgres aceitando conexão"
+if [[ "$DB_HOST" == "localhost" || "$DB_HOST" == "127.0.0.1" ]]; then
+  if docker compose ps --format '{{.Name}} {{.Status}}' 2>/dev/null | grep -q "camucrm_db.*Up"; then
+    ok "Postgres local já no ar"
+  else
+    docker compose up -d db >/dev/null 2>&1 && ok "Postgres local subindo" \
+      || { erro "falha ao subir o Postgres local"; exit 1; }
+  fi
+  # `pg_isready` e não um sleep fixo: o schema aplicado contra um banco ainda
+  # subindo falha de formas que parecem bug de aplicação.
+  if timeout 60 bash -c 'until docker exec camucrm_db pg_isready -U camu -d camucrm >/dev/null 2>&1; do sleep 1; done'; then
+    ok "Postgres local aceitando conexão"
+  else
+    erro "Postgres local não ficou pronto em 60s"; exit 1
+  fi
 else
-  erro "Postgres não ficou pronto em 60s"; exit 1
+  # Banco remoto (Supabase ou outro) — nada para subir aqui; só confirmar
+  # que dá para conectar antes de tentar aplicar o schema.
+  if saida=$("$PY" -c "
+from camucrm import config
+import psycopg
+psycopg.connect(config.dsn(), connect_timeout=8).close()
+" 2>&1); then
+    ok "banco remoto respondendo ($DB_HOST)"
+  else
+    erro "não conectou no banco remoto ($DB_HOST):"
+    printf '%s\n' "$saida" | tail -3 | sed 's/^/      /'
+    exit 1
+  fi
 fi
 
 # A saída é capturada e mostrada só em caso de falha. Descartá-la esconderia

@@ -867,7 +867,35 @@ class Database:
     def init_pool(self) -> None:
         if self._pool is None:
             self._pool = ConnectionPool(
-                conninfo=self._dsn, min_size=1, max_size=self._max_size, open=True
+                conninfo=self._dsn,
+                min_size=1,
+                max_size=self._max_size,
+                open=True,
+                # Migração para o pooler do Supabase (Supavisor, change de
+                # 2026-08-28): a hipótese inicial aqui foi "conexão ociosa
+                # derrubada em silêncio" — INVESTIGADA E DESCARTADA. Uma
+                # conexão isolada nova é rápida (~1s) e uma reaproveitada do
+                # pool também é, individualmente; o que trava é a SOMA de
+                # muitas operações sequenciais na mesma requisição (o padrão
+                # N+1 de `camucrm/painel/api.py::_carregar_candidatos`, ~20
+                # idas ao banco por conversa) — cada round-trip paga a
+                # latência de rede até o Supabase (~0,5-0,7s medidos, contra
+                # frações de ms no Postgres local de antes da migração), e
+                # 4 conversas × ~20 chamadas ficam na casa de 40-50s. Não é
+                # travamento: uma espera de ~120s confirmou que a rota SEMPRE
+                # termina, só muito devagar — devagar o bastante para parecer
+                # "não carrega" num navegador com timeout padrão. A correção
+                # de fundo é reduzir o número de idas ao banco por conversa
+                # (fora do escopo desta sessão); `keepalives_*` fica como
+                # prática padrão para um pool de longa duração contra um
+                # banco remoto, não como a correção do problema medido.
+                kwargs={
+                    "connect_timeout": 10,
+                    "keepalives": 1,
+                    "keepalives_idle": 30,
+                    "keepalives_interval": 10,
+                    "keepalives_count": 3,
+                },
             )
 
     def close(self) -> None:
