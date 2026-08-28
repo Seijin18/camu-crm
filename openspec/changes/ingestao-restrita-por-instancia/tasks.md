@@ -76,9 +76,20 @@
 
 - [x] 7.1 Nenhuma mudança de schema (`contatos_por_telefone_hash` é
       `SELECT`, não `ALTER`) — confirmar antes de fechar.
-- [ ] 7.2 **Pendente, fora do código** — quando as instâncias novas forem
-      de fato registradas na Evolution API, confirmar contra um payload
-      real que o campo `instance` chega como assumido em `design.md`
-      (Decisão 3) — se divergir, é ajuste de uma linha em `webhook.py`,
-      registrado aqui para não se perder. Não bloqueia o resto do change
-      (falha segura: `instancia=None` não restringe nada).
+- [x] 7.2 **Verificado em produção em 2026-08-28.** Instância
+      `pessoal-marcos` registrada na Evolution API e webhook apontado para
+      o CRM (`data/backup/webhook-pessoal-marcos-original.json`). Teste
+      real: mensagem "oi" da instância `camu_whatsapp` (não restrita) para
+      o número pessoal, ida e volta gerou dois eventos de webhook.
+
+      Confirmado no log do receptor:
+      `INFO camucrm.ingest: Ingestão ignorada: instância restrita
+      'pessoal-marcos', telefone desconhecido (não é contato nem
+      prospecção)` — o campo `instance` do payload real da Evolution API
+      chega exatamente como assumido em `design.md` (Decisão 3), sem
+      divergência nenhuma. Confirmado no banco: `contatos` não mudou (10
+      antes e depois), e nenhuma linha com `payload->>'instance' =
+      'pessoal-marcos'` sobrou em `eventos_recebidos_bruto` — a exclusão
+      (item 4.2/4.3) também funcionou contra o banco real, não só contra o
+      fake dos testes unitários. O lado `camu_whatsapp` (não restrito)
+      processou normalmente, como esperado.

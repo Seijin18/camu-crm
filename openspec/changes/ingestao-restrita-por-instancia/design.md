@@ -70,25 +70,30 @@ específico.
 
 ## Decisão 3: nome do campo `instance` no payload da Evolution API
 
-Assumido, não verificado contra o payload real das duas instâncias novas
-(ainda não registradas): o evento `messages.upsert` da Evolution API traz
-`instance` no nível raiz do corpo do webhook (`{"event": ..., "instance":
-"nome-da-instancia", "data": {...}}`) — formato documentado da Evolution
-API, e não uma suposição sem base, mas também não testado contra tráfego
-real desta integração especificamente.
+**Verificado em produção em 2026-08-28** (`tasks.md`, item 7.2) — quando
+escrita, esta decisão era uma suposição não testada; deixo o raciocínio
+original abaixo porque ele continua valendo como princípio (o "e se eu
+tivesse errado"), mesmo já confirmado.
 
-**Falha segura**: se o campo vier ausente ou com nome diferente do
-esperado, `payload.get("instance")` devolve `None`, e `ingerir(...,
-instancia=None)` não aplica restrição nenhuma — o evento segue pelo caminho
-de hoje (sem restrição), nunca é descartado por engano. Errar aqui do lado
-"restringe menos do que devia" é reversível e visível (contato indevido
-aparece no painel, um humano percebe e ajusta); errar do lado "restringe
-mais do que devia" é o modo de falha caro (mensagem de petshop de verdade
-some sem rastro). O padrão do parâmetro protege contra o pior caso.
+O evento `messages.upsert` da Evolution API traz `instance` no nível raiz
+do corpo do webhook (`{"event": ..., "instance": "nome-da-instancia",
+"data": {...}}`). Confirmado contra tráfego real: instância `pessoal-
+marcos` registrada, webhook apontado, mensagem de teste enviada — o log do
+receptor mostrou a restrição disparando (`instância restrita 'pessoal-
+marcos'`), e `webhook.py::_processar` só chega nesse ponto se `payload.get(
+"instance")` já tiver extraído o nome certo. Sem divergência nenhuma do
+formato assumido.
 
-Quando as instâncias forem registradas de verdade, vale confirmar o nome
-exato do campo contra um payload real antes de configurar `CAMU_INSTANCIAS_
-RESTRITAS` em produção — ver task dedicada em `tasks.md`.
+**Falha segura, princípio que continua valendo pra qualquer instância
+futura não testada ainda**: se o campo viesse ausente ou com nome
+diferente do esperado, `payload.get("instance")` devolveria `None`, e
+`ingerir(..., instancia=None)` não aplicaria restrição nenhuma — o evento
+seguiria pelo caminho de hoje (sem restrição), nunca descartado por
+engano. Errar do lado "restringe menos do que devia" é reversível e
+visível (contato indevido aparece no painel, um humano percebe e ajusta);
+errar do lado "restringe mais do que devia" é o modo de falha caro
+(mensagem de petshop de verdade some sem rastro). O padrão do parâmetro
+protegia contra o pior caso, e não precisou ser acionado.
 
 ## Fluxo
 
