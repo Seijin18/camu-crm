@@ -807,6 +807,13 @@ CREATE TABLE IF NOT EXISTS prospeccoes (
     aberto_em       TIMESTAMP WITH TIME ZONE,
     aberto_por      VARCHAR(48),
     criado_em       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    -- `atualizado_em` nasceu com o upsert de reimportação (change
+    -- `prospeccao-b2b-shortlist`). ADIÇÃO de uso (change
+    -- `prospeccao-tempo-real-sem-pulo`): passou a ser a 4ª parte de
+    -- `Database.token_de_mudanca` — TODA mutação da aba de prospecção
+    -- (aberta, envio, marcas manuais) grava `atualizado_em = now()`, e é só
+    -- isso que faz a aba `/prospeccao` de outro operador se atualizar sem
+    -- depender de uma mensagem de WhatsApp qualquer bumpar o token.
     atualizado_em   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS prospeccoes_zona_idx ON prospeccoes (zona, bairro);
@@ -1373,17 +1380,27 @@ class Database:
         """Cursor barato de "algo mudou" para o SSE do painel (change
         `painel-tempo-real`, design.md).
 
-        Três subselects escalares — `MAX(mensagens.id)`,
-        `MAX(eventos_estagio.id)`, `epoch(MAX(conversas.atualizado_em))` —
-        concatenados em `"m:e:c"`. Três partes porque são três motivos
-        distintos de a tela estar desatualizada, e só o primeiro move
-        `mensagens.id`: uma correção manual ou uma mudança de resultado pode
-        tocar `conversas.atualizado_em` sem gerar mensagem nem evento de
-        estágio novo.
+        Quatro subselects escalares — `MAX(mensagens.id)`,
+        `MAX(eventos_estagio.id)`, `epoch(MAX(conversas.atualizado_em))`,
+        `epoch(MAX(prospeccoes.atualizado_em))` — concatenados em `"m:e:c:p"`.
+        Quatro partes porque são quatro motivos distintos de a tela estar
+        desatualizada, e cada parte se move sozinha: uma correção manual ou
+        uma mudança de resultado toca `conversas.atualizado_em` sem gerar
+        mensagem nem evento; uma marca de triagem na aba de prospecção
+        (change `prospeccao-tempo-real-sem-pulo`) toca só
+        `prospeccoes.atualizado_em` — nada nas três primeiras partes.
+
+        Comparar parte a parte é o que deixa o cliente decidir o que
+        redesenhar: quem está na aba de prospecção reage à quarta parte e
+        ignora as outras três (uma mensagem de WhatsApp qualquer não muda a
+        shortlist); quem está na fila/kanban/conversas reage às três
+        primeiras e ignora a quarta. `painel/stream.py` continua disparando
+        o evento com qualquer diferença de string — o recorte por parte é do
+        cliente (`static/app.js::reagirAMudanca`).
 
         O mesmo valor serve de cursor de reconexão (`?desde_id=N` no stream):
-        comparar strings anteriores/posteriores é suficiente para o poller de
-        `painel/stream.py` decidir se dispara o evento — nenhuma parte deste
+        `stream.gerador_sse` lê só `token.split(":")[0]` (o id de mensagem);
+        acrescentar uma quarta parte não muda esse uso. Nenhuma parte deste
         método interpreta o conteúdo do token além de igualdade.
         """
         with self._conn() as conn:
@@ -1392,10 +1409,14 @@ class Database:
                     "SELECT "
                     "(SELECT MAX(id) FROM mensagens), "
                     "(SELECT MAX(id) FROM eventos_estagio), "
-                    "(SELECT extract(epoch FROM MAX(atualizado_em)) FROM conversas)"
+                    "(SELECT extract(epoch FROM MAX(atualizado_em)) FROM conversas), "
+                    "(SELECT extract(epoch FROM MAX(atualizado_em)) FROM prospeccoes)"
                 )
-                max_mensagem, max_evento, max_atualizado = cur.fetchone()
-        return f"{max_mensagem or 0}:{max_evento or 0}:{max_atualizado or 0}"
+                max_mensagem, max_evento, max_atualizado, max_prospeccao = cur.fetchone()
+        return (
+            f"{max_mensagem or 0}:{max_evento or 0}:"
+            f"{max_atualizado or 0}:{max_prospeccao or 0}"
+        )
 
     def atualizar_estado_conversa(
         self,
@@ -3262,8 +3283,8 @@ class Database:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE prospeccoes SET aberto_em = now(), aberto_por = %s "
-                    "WHERE id = %s",
+                    "UPDATE prospeccoes SET aberto_em = now(), aberto_por = %s, "
+                    "atualizado_em = now() WHERE id = %s",
                     (por, prospeccao_id),
                 )
 
@@ -3297,13 +3318,14 @@ class Database:
                 if sucesso:
                     cur.execute(
                         "UPDATE prospeccoes SET enviado_em = now(), enviado_por = %s, "
-                        "enviado_erro = NULL, enviado_instancia = %s WHERE id = %s",
+                        "enviado_erro = NULL, enviado_instancia = %s, "
+                        "atualizado_em = now() WHERE id = %s",
                         (por, instancia, prospeccao_id),
                     )
                 else:
                     cur.execute(
                         "UPDATE prospeccoes SET enviado_por = %s, enviado_erro = %s, "
-                        "enviado_instancia = %s WHERE id = %s",
+                        "enviado_instancia = %s, atualizado_em = now() WHERE id = %s",
                         (por, erro, instancia, prospeccao_id),
                     )
 
@@ -3326,13 +3348,15 @@ class Database:
                 if valor:
                     cur.execute(
                         "UPDATE prospeccoes SET enviado_em = now(), enviado_por = %s, "
-                        "enviado_erro = NULL, enviado_instancia = 'manual' WHERE id = %s",
+                        "enviado_erro = NULL, enviado_instancia = 'manual', "
+                        "atualizado_em = now() WHERE id = %s",
                         (por, prospeccao_id),
                     )
                 else:
                     cur.execute(
                         "UPDATE prospeccoes SET enviado_em = NULL, enviado_por = %s, "
-                        "enviado_erro = NULL, enviado_instancia = NULL "
+                        "enviado_erro = NULL, enviado_instancia = NULL, "
+                        "atualizado_em = now() "
                         "WHERE id = %s AND enviado_instancia = 'manual'",
                         (por, prospeccao_id),
                     )
@@ -3350,13 +3374,15 @@ class Database:
                 if valor:
                     cur.execute(
                         "UPDATE prospeccoes SET nao_whatsapp = TRUE, "
-                        "nao_whatsapp_em = now(), nao_whatsapp_por = %s WHERE id = %s",
+                        "nao_whatsapp_em = now(), nao_whatsapp_por = %s, "
+                        "atualizado_em = now() WHERE id = %s",
                         (por, prospeccao_id),
                     )
                 else:
                     cur.execute(
                         "UPDATE prospeccoes SET nao_whatsapp = FALSE, "
-                        "nao_whatsapp_em = NULL, nao_whatsapp_por = %s WHERE id = %s",
+                        "nao_whatsapp_em = NULL, nao_whatsapp_por = %s, "
+                        "atualizado_em = now() WHERE id = %s",
                         (por, prospeccao_id),
                     )
 

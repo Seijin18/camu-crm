@@ -11,8 +11,8 @@ processo").
 
 Por que não `LISTEN/NOTIFY` já nesta entrega: seria exato (zero polling), mas
 não resolve sozinho o buraco de reconexão — um cliente que caiu e volta ainda
-precisa de um cursor para saber o que perdeu entre a queda e a reconexão. O
-token de 3 partes (`db.token_de_mudanca`) **é** esse cursor
+precisa de um cursor para saber o que perdeu entre a queda e a reconexão. A
+1ª parte do token (`db.token_de_mudanca`, hoje 4 partes) **é** esse cursor
 (`?desde_id=N` no stream), então ele é necessário de qualquer forma.
 
 **Caminho de upgrade, registrado para ficar barato no futuro:** trocar o

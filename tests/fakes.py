@@ -223,6 +223,11 @@ class FakeDatabase:
         # pontos que a `Database` real toca a coluna (registrar mensagem,
         # atualizar estado, gravar evento de estágio).
         self._toques_conversa = 0
+        # Proxy de `prospeccoes.atualizado_em` para a 4ª parte de
+        # `token_de_mudanca` (change `prospeccao-tempo-real-sem-pulo`): mesma
+        # ideia do contador acima, nos pontos que a `Database` real toca
+        # `prospeccoes.atualizado_em` (abrir, envio, marcas manuais, import).
+        self._toques_prospeccao = 0
 
     # -- helpers de montagem ---------------------------------------------
 
@@ -636,18 +641,21 @@ class FakeDatabase:
         )
 
     def token_de_mudanca(self) -> str:
-        """Espelho pobre de `Database.token_de_mudanca` — três números que só
+        """Espelho pobre de `Database.token_de_mudanca` — quatro números que só
         crescem, um por motivo de mudança (mensagem, evento de estágio,
-        toque em conversa). Não é a mesma fórmula da `Database` real (não há
-        `atualizado_em` guardado no fake), só a mesma propriedade que os
-        testes de `stream.py` precisam: muda sempre que um dos três motivos
-        acontece, nunca de outro jeito.
+        toque em conversa, toque em prospecção). Não é a mesma fórmula da
+        `Database` real (não há `atualizado_em` guardado no fake), só a mesma
+        propriedade que os testes de `stream.py` precisam: muda sempre que um
+        dos quatro motivos acontece, nunca de outro jeito.
         """
         max_mensagem = 0
         for linhas in self.mensagens.values():
             for identificador, *_ in linhas:
                 max_mensagem = max(max_mensagem, identificador)
-        return f"{max_mensagem}:{len(self.eventos)}:{self._toques_conversa}"
+        return (
+            f"{max_mensagem}:{len(self.eventos)}:"
+            f"{self._toques_conversa}:{self._toques_prospeccao}"
+        )
 
     def registrar_followup(self, conversa_id, texto=None) -> int:
         enviados = self.followups.setdefault(conversa_id, [])
@@ -1355,6 +1363,7 @@ class FakeDatabase:
                 "nao_whatsapp_em": existente.get("nao_whatsapp_em") if existente else None,
                 "nao_whatsapp_por": existente.get("nao_whatsapp_por") if existente else None,
             }
+            self._toques_prospeccao += 1
             if existente:
                 atualizados += 1
             else:
@@ -1393,6 +1402,7 @@ class FakeDatabase:
             if dados["id"] == prospeccao_id:
                 dados["aberto_em"] = datetime.now(timezone.utc)
                 dados["aberto_por"] = por
+                self._toques_prospeccao += 1
                 return
 
     def registrar_envio_prospeccao(
@@ -1418,6 +1428,7 @@ class FakeDatabase:
                     dados["enviado_erro"] = None
                 else:
                     dados["enviado_erro"] = erro
+                self._toques_prospeccao += 1
                 return
 
     def marcar_prospeccao_enviada_manual(
@@ -1432,11 +1443,13 @@ class FakeDatabase:
                     dados["enviado_por"] = por
                     dados["enviado_erro"] = None
                     dados["enviado_instancia"] = "manual"
+                    self._toques_prospeccao += 1
                 elif dados.get("enviado_instancia") == "manual":
                     dados["enviado_em"] = None
                     dados["enviado_por"] = por
                     dados["enviado_erro"] = None
                     dados["enviado_instancia"] = None
+                    self._toques_prospeccao += 1
                 return
 
     def marcar_prospeccao_nao_whatsapp(
@@ -1449,6 +1462,7 @@ class FakeDatabase:
                 dados["nao_whatsapp"] = valor
                 dados["nao_whatsapp_em"] = datetime.now(timezone.utc) if valor else None
                 dados["nao_whatsapp_por"] = por
+                self._toques_prospeccao += 1
                 return
 
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
