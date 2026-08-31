@@ -8,6 +8,10 @@ __pycache__/
 data/eval/conversas.jsonl
 data/backfill/
 
+# Backups locais avulsos (não são artefato do projeto)
+backup_pre_supabase.sql
+data/backup/webhook-pessoal-felipe-original.json
+
 # Estado local do Claude Code
 .claude/
 logs/
