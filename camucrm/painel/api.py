@@ -795,7 +795,11 @@ def importar_prospeccao(arquivo: UploadFile, db: Database = Depends(_db)):
     """Upload de CSV (`petshop,bairro,zona,telefone,nota,avaliacoes,site,
     tier_origem,status_origem`) — parsing aqui, upsert em
     `db.importar_prospeccoes`. `utf-8-sig` tolera planilha exportada com BOM
-    (comum em CSV salvo por Excel), sem exigir que o operador reexporte."""
+    (comum em CSV salvo por Excel), sem exigir que o operador reexporte.
+
+    Change `tier-calculado-na-importacao`: mesmo se a planilha trouxer a
+    coluna `tier_origem`, o valor é ignorado — `db.importar_prospeccoes`
+    calcula o tier a partir de `nota`/`avaliacoes`."""
     bruto = arquivo.file.read().decode("utf-8-sig")
     linhas = list(csv.DictReader(io.StringIO(bruto)))
     resumo = db.importar_prospeccoes(linhas)

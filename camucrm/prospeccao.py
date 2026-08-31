@@ -17,7 +17,53 @@ importa `camucrm.transport`.
 
 from __future__ import annotations
 
+import re
 from urllib.parse import quote
+
+# Change `tier-calculado-na-importacao`: "ração"/"racao", com ou sem
+# cedilha/acento — cobre grafia informal comum em nome de loja ("Racao
+# Center", "Casa da Ração"). `\w` com `re.UNICODE` (padrão em str no
+# Python 3) não confunde com palavras que só contêm o prefixo por
+# coincidência (ex. "traçado") porque exige a sequência completa "ra[çc]"
+# + "a" + "o"/"ao" nas duas variantes abaixo — não é um prefixo solto.
+_REGEX_LOJA_RACAO = re.compile(r"ra[çc][aã]o", re.IGNORECASE)
+
+
+def calcular_tier(nota: float | None, avaliacoes: int | None) -> str:
+    """Tier `"A"`/`"B"`/`"C"` calculado a partir de nota e número de
+    avaliações — substitui o `tier_origem` que antes vinha pronto da
+    planilha (change `tier-calculado-na-importacao`; ver proposal.md para
+    o porquê: valor externo, inconsistente entre remessas, sem critério
+    recalculável).
+
+    Critério é **E**, não **OU**: nota alta com poucas avaliações não é
+    sinal forte o bastante sozinho (pode ser um punhado de avaliações
+    tendenciosas), e o inverso também não basta. `nota`/`avaliacoes`
+    ausentes (planilha incompleta) caem em `"C"` — o tier mais baixo é o
+    padrão seguro quando falta informação, nunca `"A"`.
+
+    - `A`: `nota >= 4.5` e `avaliacoes >= 100`
+    - `B`: `nota >= 4.0` e `avaliacoes >= 30`
+    - `C`: qualquer outra combinação
+    """
+    if nota is not None and avaliacoes is not None:
+        if nota >= 4.5 and avaliacoes >= 100:
+            return "A"
+        if nota >= 4.0 and avaliacoes >= 30:
+            return "B"
+    return "C"
+
+
+def eh_provavel_loja_de_racao(nome: str | None) -> bool:
+    """`True` quando o nome do petshop sugere uma loja focada em ração —
+    sinal isolado (change `tier-calculado-na-importacao`), NÃO entra no
+    cálculo de `calcular_tier`: o produto da Camu é personalização com
+    foto do pet, não ração, então uma loja assim tende a ser um lead de
+    menor retorno para esta abordagem — mas é só um sinal para quem lê a
+    lista decidir, não uma desqualificação automática (ex. petshop grande
+    que também vende ração no nome não deveria ser rebaixado sozinho).
+    """
+    return bool(_REGEX_LOJA_RACAO.search(nome or ""))
 
 
 def normalizar_telefone_br(telefone: str | None) -> str | None:

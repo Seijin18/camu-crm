@@ -809,6 +809,9 @@ def prospeccao_para_json(
         "site": registro.site,
         "tier_origem": registro.tier_origem,
         "status_origem": registro.status_origem,
+        # Change `tier-calculado-na-importacao`: sinal isolado de nome
+        # sugerindo loja de ração — não afeta tier_origem, ver db.py.
+        "provavel_loja_racao": registro.provavel_loja_racao,
         "aberto_em": registro.aberto_em.isoformat() if registro.aberto_em else None,
         "aberto_por": registro.aberto_por,
         "criado_em": registro.criado_em.isoformat(),

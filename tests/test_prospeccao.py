@@ -17,6 +17,8 @@ from fakes import FakeDatabase  # noqa: E402
 
 from camucrm.db import hash_telefone  # noqa: E402
 from camucrm.prospeccao import (  # noqa: E402
+    calcular_tier,
+    eh_provavel_loja_de_racao,
     link_whatsapp,
     montar_mensagem,
     nome_curto,
@@ -92,6 +94,59 @@ class TesteLinkWhatsapp(unittest.TestCase):
         self.assertIn("%C3%A7", link)  # "ç" percent-encoded (UTF-8)
 
 
+class TesteCalcularTier(unittest.TestCase):
+    """Change `tier-calculado-na-importacao`: tier passa a ser calculado a
+    partir de nota/avaliações, critério E (não OU) — nota alta com poucas
+    avaliações, ou vice-versa, não basta sozinha para o tier mais alto."""
+
+    def test_tier_a_exige_nota_e_avaliacoes_altas(self):
+        self.assertEqual(calcular_tier(4.5, 100), "A")
+        self.assertEqual(calcular_tier(4.9, 500), "A")
+
+    def test_nota_alta_com_poucas_avaliacoes_nao_e_tier_a(self):
+        # avaliacoes=12 fica abaixo até do piso de B (>=30) — cai em C.
+        self.assertEqual(calcular_tier(4.9, 12), "C")
+
+    def test_nota_alta_com_avaliacoes_no_piso_de_b_vira_b_nao_a(self):
+        self.assertEqual(calcular_tier(4.9, 30), "B")
+
+    def test_muitas_avaliacoes_com_nota_baixa_nao_e_tier_a(self):
+        self.assertEqual(calcular_tier(4.0, 500), "B")
+
+    def test_tier_b_exige_nota_e_avaliacoes_no_piso(self):
+        self.assertEqual(calcular_tier(4.0, 30), "B")
+
+    def test_abaixo_do_piso_de_b_e_tier_c(self):
+        self.assertEqual(calcular_tier(3.9, 30), "C")
+        self.assertEqual(calcular_tier(4.0, 29), "C")
+
+    def test_nota_ou_avaliacoes_ausentes_e_tier_c(self):
+        self.assertEqual(calcular_tier(None, 500), "C")
+        self.assertEqual(calcular_tier(4.9, None), "C")
+        self.assertEqual(calcular_tier(None, None), "C")
+
+
+class TesteLojaDeRacao(unittest.TestCase):
+    """Change `tier-calculado-na-importacao`: sinal isolado de nome, não
+    entra no cálculo do tier — testado à parte de `calcular_tier`."""
+
+    def test_reconhece_racao_com_cedilha(self):
+        self.assertTrue(eh_provavel_loja_de_racao("Casa da Ração"))
+
+    def test_reconhece_racao_sem_acento(self):
+        self.assertTrue(eh_provavel_loja_de_racao("Racao Center"))
+
+    def test_case_insensitive(self):
+        self.assertTrue(eh_provavel_loja_de_racao("RAÇÃO E CIA"))
+
+    def test_nome_sem_racao_e_falso(self):
+        self.assertFalse(eh_provavel_loja_de_racao("Vale Pet - Clínica Veterinária"))
+
+    def test_nome_ausente_e_falso(self):
+        self.assertFalse(eh_provavel_loja_de_racao(None))
+        self.assertFalse(eh_provavel_loja_de_racao(""))
+
+
 class TesteImportacao(unittest.TestCase):
     def setUp(self):
         self.db = FakeDatabase()
@@ -132,6 +187,24 @@ class TesteImportacao(unittest.TestCase):
         ])
         self.assertEqual(resumo.novos, 1)
         self.assertEqual(len(resumo.invalidas), 1)
+
+    def test_tier_origem_da_planilha_e_ignorado_tier_e_calculado(self):
+        """Change `tier-calculado-na-importacao`: a coluna `tier_origem` do
+        CSV nunca chega ao banco — o valor gravado é sempre
+        `calcular_tier(nota, avaliacoes)`."""
+        self.db.importar_prospeccoes([
+            _linha(nota="3.0", avaliacoes="5", tier_origem="A"),
+        ])
+        registro = self.db.listar_prospeccoes()[0]
+        self.assertEqual(registro.tier_origem, "C")
+
+    def test_flag_de_loja_de_racao_gravada_sem_afetar_tier(self):
+        self.db.importar_prospeccoes([
+            _linha(petshop="Ração e Cia", nota="4.9", avaliacoes="500"),
+        ])
+        registro = self.db.listar_prospeccoes()[0]
+        self.assertEqual(registro.tier_origem, "A")
+        self.assertTrue(registro.provavel_loja_racao)
 
 
 class TesteListagemComFiltros(unittest.TestCase):

@@ -30,7 +30,7 @@ import psycopg
 from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool
 
-from .prospeccao import normalizar_telefone_br
+from .prospeccao import calcular_tier, eh_provavel_loja_de_racao, normalizar_telefone_br
 from .rules.estagio import ORIGEM_LIVE
 from .rules.sinais import ENTRADA, SAIDA, Mensagem
 from .taxonomia import B2B, B2C, BOLA_CLIENTE, MAX_FOLLOWUPS
@@ -449,6 +449,13 @@ class ProspeccaoRegistro:
     # Evolution API por onde saiu a última tentativa — mesma posição relativa
     # que os campos `enviado_*` acima (antes de contato_id/conversa_id).
     enviado_instancia: str | None = None
+    # ADIÇÃO (change `tier-calculado-na-importacao`): sinal isolado de nome
+    # sugerindo loja de ração (regex), não usado no cálculo de tier_origem
+    # — ver comentário do schema. Mesma posição relativa que enviado_* —
+    # ANTES de contato_id/conversa_id, que só o SELECT com `LEFT JOIN` de
+    # `listar_prospeccoes` preenche (`_PROSPECCAO_SELECT` não tem essas
+    # duas colunas, então precisa ser a última posição antes delas).
+    provavel_loja_racao: bool | None = None
     contato_id: int | None = None
     conversa_id: int | None = None
 
@@ -821,6 +828,13 @@ ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_erro TEXT;
 -- quanto na falha (a tela mostra "falhou pelo número X"). `NULL` para as
 -- linhas enviadas antes deste change.
 ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_instancia VARCHAR(64);
+-- ADIÇÃO (change `tier-calculado-na-importacao`): sinal isolado de "nome
+-- sugere loja focada em ração" (regex em `prospeccao.
+-- eh_provavel_loja_de_racao`), calculado na importação — NÃO afeta
+-- `tier_origem`, que a partir deste change também passa a ser CALCULADO
+-- (nota/avaliações) em vez de copiado da coluna `tier_origem` do CSV; ver
+-- `Database.importar_prospeccoes`.
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS provavel_loja_racao BOOLEAN;
 
 -- ADIÇÃO (change `backfill-cobertura-por-prompt`): até onde CADA versão de
 -- prompt de extração já leu uma conversa. Existe para `forcar=True`
@@ -3085,7 +3099,8 @@ class Database:
         SELECT p.id, p.nome, p.telefone, p.bairro, p.zona, p.nota,
                p.avaliacoes, p.site, p.tier_origem, p.status_origem,
                p.aberto_em, p.aberto_por, p.criado_em,
-               p.enviado_em, p.enviado_por, p.enviado_erro, p.enviado_instancia
+               p.enviado_em, p.enviado_por, p.enviado_erro, p.enviado_instancia,
+               p.provavel_loja_racao
           FROM prospeccoes p
     """
 
@@ -3109,6 +3124,13 @@ class Database:
         mesmo `INSERT ... ON CONFLICT DO UPDATE`, se a linha era nova ou já
         existia — evita uma segunda consulta só para contar novos/
         atualizados.
+
+        Change `tier-calculado-na-importacao`: `tier_origem` NÃO vem mais
+        da coluna `tier_origem` do CSV — a coluna do arquivo é ignorada de
+        propósito, e o valor gravado é sempre `prospeccao.calcular_tier
+        (nota, avaliacoes)`. `provavel_loja_racao` (sinal isolado, regex
+        sobre o nome) é calculado junto, mas não influencia o tier — ver
+        `proposal.md` do change para o porquê das duas decisões.
         """
         novos = 0
         atualizados = 0
@@ -3137,12 +3159,17 @@ class Database:
                         )
                         continue
                     telefone_hash = hash_telefone(telefone)
+                    nota = _float_ou_none(linha.get("nota"))
+                    avaliacoes = _int_ou_none(linha.get("avaliacoes"))
+                    tier_origem = calcular_tier(nota, avaliacoes)
+                    provavel_loja_racao = eh_provavel_loja_de_racao(nome)
                     cur.execute(
                         """
                         INSERT INTO prospeccoes (
                             nome, telefone, telefone_hash, bairro, zona, nota,
-                            avaliacoes, site, tier_origem, status_origem
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            avaliacoes, site, tier_origem, status_origem,
+                            provavel_loja_racao
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (telefone_hash) DO UPDATE SET
                             nome = EXCLUDED.nome,
                             bairro = EXCLUDED.bairro,
@@ -3152,17 +3179,18 @@ class Database:
                             site = EXCLUDED.site,
                             tier_origem = EXCLUDED.tier_origem,
                             status_origem = EXCLUDED.status_origem,
+                            provavel_loja_racao = EXCLUDED.provavel_loja_racao,
                             atualizado_em = now()
                         RETURNING (xmax = 0) AS inserida
                         """,
                         (
                             nome, telefone, telefone_hash,
                             linha.get("bairro") or None, linha.get("zona") or None,
-                            _float_ou_none(linha.get("nota")),
-                            _int_ou_none(linha.get("avaliacoes")),
+                            nota, avaliacoes,
                             linha.get("site") or None,
-                            linha.get("tier_origem") or None,
+                            tier_origem,
                             linha.get("status_origem") or None,
+                            provavel_loja_racao,
                         ),
                     )
                     if cur.fetchone()[0]:
@@ -3218,7 +3246,7 @@ class Database:
                            p.avaliacoes, p.site, p.tier_origem, p.status_origem,
                            p.aberto_em, p.aberto_por, p.criado_em,
                            p.enviado_em, p.enviado_por, p.enviado_erro,
-                           p.enviado_instancia,
+                           p.enviado_instancia, p.provavel_loja_racao,
                            c.id AS contato_id, cv.id AS conversa_id
                       FROM prospeccoes p
                       LEFT JOIN contatos c ON c.telefone_hash = p.telefone_hash

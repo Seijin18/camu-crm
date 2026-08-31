@@ -37,7 +37,11 @@ from camucrm.db import (
     _normalizar_texto,
     hash_telefone,
 )
-from camucrm.prospeccao import normalizar_telefone_br
+from camucrm.prospeccao import (
+    calcular_tier,
+    eh_provavel_loja_de_racao,
+    normalizar_telefone_br,
+)
 from camucrm.rules.sinais import Mensagem
 from camucrm.taxonomia import MAX_FOLLOWUPS, is_terminal, rank_estagio
 
@@ -1267,6 +1271,7 @@ class FakeDatabase:
             enviado_em=dados.get("enviado_em"), enviado_por=dados.get("enviado_por"),
             enviado_erro=dados.get("enviado_erro"),
             enviado_instancia=dados.get("enviado_instancia"),
+            provavel_loja_racao=dados.get("provavel_loja_racao"),
         )
 
     def criar_prospeccao(
@@ -1281,12 +1286,20 @@ class FakeDatabase:
         site: str | None = None,
         tier_origem: str | None = None,
         status_origem: str | None = None,
+        provavel_loja_racao: bool | None = None,
     ) -> ProspeccaoRegistro:
         """Helper de teste — espelha `criar_conversa`, mas para
         `prospeccoes`. `telefone` já deve vir normalizado (dígitos + código
         do país) quando o teste precisa bater com um `contato` real; use
         `camucrm.prospeccao.normalizar_telefone_br` se estiver simulando o
-        formato bruto da planilha."""
+        formato bruto da planilha.
+
+        Diferente de `importar_prospeccoes` (que sempre CALCULA
+        `tier_origem`/`provavel_loja_racao`, change
+        `tier-calculado-na-importacao`), este helper insere a linha direto
+        — os dois campos vêm como o teste passar, sem recalcular, porque
+        aqui o objetivo é montar um estado de banco arbitrário para o
+        teste, não simular a importação."""
         telefone_hash = hash_telefone(telefone)
         prospeccao_id = self._novo_id()
         agora = datetime.now(timezone.utc)
@@ -1297,14 +1310,18 @@ class FakeDatabase:
             "tier_origem": tier_origem, "status_origem": status_origem,
             "aberto_em": None, "aberto_por": None, "criado_em": agora,
             "enviado_em": None, "enviado_por": None, "enviado_erro": None,
-            "enviado_instancia": None,
+            "enviado_instancia": None, "provavel_loja_racao": provavel_loja_racao,
         }
         return self._prospeccao_registro(self.prospeccoes[telefone_hash])
 
     def importar_prospeccoes(self, linhas) -> ResumoImportacao:
         """Espelha `db.Database.importar_prospeccoes`: upsert por
         `telefone_hash`, telefone ilegível ou nome vazio vira `invalidas`
-        (nunca descartado em silêncio), nunca lança."""
+        (nunca descartado em silêncio), nunca lança.
+
+        Change `tier-calculado-na-importacao`: `tier_origem` é sempre
+        `calcular_tier(nota, avaliacoes)` — a coluna `tier_origem` da
+        planilha (`linha.get("tier_origem")`) é ignorada, igual ao real."""
         novos = 0
         atualizados = 0
         invalidas: list[LinhaInvalida] = []
@@ -1328,15 +1345,17 @@ class FakeDatabase:
             telefone_hash = hash_telefone(telefone)
             existente = self.prospeccoes.get(telefone_hash)
             agora = datetime.now(timezone.utc)
+            nota = _float_ou_none(linha.get("nota"))
+            avaliacoes = _int_ou_none(linha.get("avaliacoes"))
             self.prospeccoes[telefone_hash] = {
                 "id": existente["id"] if existente else self._novo_id(),
                 "nome": nome, "telefone": telefone, "telefone_hash": telefone_hash,
                 "bairro": linha.get("bairro") or None, "zona": linha.get("zona") or None,
-                "nota": _float_ou_none(linha.get("nota")),
-                "avaliacoes": _int_ou_none(linha.get("avaliacoes")),
+                "nota": nota, "avaliacoes": avaliacoes,
                 "site": linha.get("site") or None,
-                "tier_origem": linha.get("tier_origem") or None,
+                "tier_origem": calcular_tier(nota, avaliacoes),
                 "status_origem": linha.get("status_origem") or None,
+                "provavel_loja_racao": eh_provavel_loja_de_racao(nome),
                 "aberto_em": existente["aberto_em"] if existente else None,
                 "aberto_por": existente["aberto_por"] if existente else None,
                 "criado_em": existente["criado_em"] if existente else agora,
@@ -1424,4 +1443,5 @@ class FakeDatabase:
             enviado_em=dados.get("enviado_em"), enviado_por=dados.get("enviado_por"),
             enviado_erro=dados.get("enviado_erro"),
             enviado_instancia=dados.get("enviado_instancia"),
+            provavel_loja_racao=dados.get("provavel_loja_racao"),
         )
