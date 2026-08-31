@@ -93,15 +93,23 @@ numa sessão.
 
 ## Onda 4 — `midia-foto-pet`
 
-7. **`midia-foto-pet`** — ainda sem `proposal.md`, é o maior item de valor
+7. **[PROPOSTO 2026-08-31, aguardando revisão] `midia-foto-pet`** — é o maior item de valor
    pendente no sistema inteiro. **S2 (foto recebida) é o estágio-chave do
    funil B2C (§3)** e hoje só avança se o cliente escrever algo junto da
    foto — a extração não olha a mídia em si, então um cliente que manda só
    a foto, sem texto, nunca avança. Isso é uma lacuna estrutural na métrica
-   que justifica o sistema (§14: `S1→S2`), não um detalhe de UI. Traz LGPD
-   junto (§12: mídia é dado pessoal, retenção precisa de critério próprio)
-   — por isso é capability separada, não um ajuste pontual em
-   `extraction/`.
+   que justifica o sistema (§14: `S1→S2`), não um detalhe de UI.
+   `proposal.md`/`design.md` já escritos em
+   `openspec/changes/midia-foto-pet/` — decisão central do design: o fato
+   é gravado deterministicamente (payload estruturado da Evolution API diz
+   "tem imagem", sem inferência, então não passa pelo LLM/`extraction/`) e
+   **nenhum binário de mídia é baixado ou guardado**, o que elimina a
+   necessidade de critério de retenção próprio que esta linha do roadmap
+   originalmente antecipava — `midia_tipo` é só uma coluna de enum curto,
+   coberta pela retenção que `mensagens` já tem (§12, 12 meses). Ainda não
+   implementado — pendente de revisão do Marcos sobre o risco aceito no
+   design (ver design.md, Decisão 3: qualquer imagem no DM B2C conta como
+   foto do pet, sem visão computacional).
    - Depende logicamente da Onda 0 item 1 (eval): mudar o que aciona S2 é
      exatamente o tipo de mudança de critério que o eval existe para medir
      antes/depois (§7, "Falso positivo de avanço de estágio: 0"). Não é um

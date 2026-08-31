@@ -301,8 +301,14 @@ Nesta ordem de dependência:
    pelo painel. Bloqueia qualquer afirmação sobre qualidade de extração,
    incluindo a tela `/funciona` do painel.
 3. **`midia-foto-pet`** — S2 é o estágio-chave e hoje depende de o cliente
-   escrever algo junto da foto. Tratar mídia traz retenção e LGPD (§12) junto,
-   e por isso é capability própria.
+   escrever algo junto da foto. **`proposal.md`/`design.md` escritos em
+   2026-08-31** (`openspec/changes/midia-foto-pet/`) — decisão central:
+   fato gravado deterministicamente a partir do payload estruturado da
+   Evolution API (não passa por `extraction/`/LLM), e nenhum binário de
+   mídia é baixado ou guardado, o que elimina a necessidade de retenção
+   própria que se antecipava aqui. Ainda não implementado — pendente de
+   revisão do Marcos sobre o risco aceito (ver design.md, Decisão 3).
+   Ver `openspec/roadmap.md`, onda 4, para o estado atualizado.
 4. **`prospeccao-b2b-shortlist`** — pedido do usuário, sem dependência das
    outras três. Lista de petshops levantada externamente, anterior a
    qualquer conversa — capability nova, separada do modelo de conversa da
