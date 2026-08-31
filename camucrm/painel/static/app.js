@@ -1770,7 +1770,7 @@ function abrirPopupEnvioProspeccao(p, aoConcluir) {
       areaErro.textContent = "Preencha telefone, mensagem e aprovado por.";
       return;
     }
-    salvarOperador(por);
+    salvarOperadorEAtualizarTopo(por);
     areaErro.textContent = "";
     botaoEnviar.disabled = true;
     botaoEnviar.textContent = "Enviando…";
@@ -1807,6 +1807,87 @@ function abrirPopupEnvioProspeccao(p, aoConcluir) {
   campoMensagem.focus();
 }
 
+/** Grava o operador escolhido e reflete no `<select>` do topo — sem isto,
+ * escolher o operador dentro de um popup (`abrirPopupEnvioProspeccao`,
+ * `garantirOperador` abaixo) salvava em `localStorage`, mas o dropdown do
+ * cabeçalho continuava mostrando o valor antigo até o próximo carregamento
+ * de página, dando a impressão de que a escolha não "pegou". */
+function salvarOperadorEAtualizarTopo(valor) {
+  salvarOperador(valor);
+  const topo = document.getElementById("campo-operador");
+  if (topo) topo.value = valor;
+}
+
+/**
+ * Popup "quem está operando?" — usado por ações da Prospecção (marcar como
+ * enviada, marcar como não-WhatsApp, desfazer) que precisam de `por`
+ * (§1/§10: toda ação fica associada a um humano nomeado) mas não têm um
+ * formulário próprio como `abrirPopupEnvioProspeccao`. Antes deste popup,
+ * clicar um desses botões sem operador escolhido só estourava o erro do
+ * servidor (`por é obrigatório`) num `alert()` cru — o operador tinha que
+ * fechar o alerta, ir até o topo, escolher, e clicar de novo.
+ *
+ * Devolve o operador escolhido (e já grava/reflete no topo via
+ * `salvarOperadorEAtualizarTopo`), ou `null` se cancelado. Se já existe um
+ * operador válido salvo, resolve na hora sem mostrar nada — o popup só
+ * aparece quando falta essa escolha.
+ */
+function garantirOperador() {
+  const atual = obterOperador();
+  if (OPERADORES.includes(atual)) return Promise.resolve(atual);
+
+  return new Promise((resolve) => {
+    const fundo = el("div", { class: "modal-fundo" });
+    const caixa = el("div", { class: "modal-caixa" });
+
+    const fechar = (valor) => {
+      document.removeEventListener("keydown", aoTeclarEscape);
+      fundo.remove();
+      resolve(valor);
+    };
+    const aoTeclarEscape = (evento) => {
+      if (evento.key === "Escape") fechar(null);
+    };
+    fundo.addEventListener("click", (evento) => {
+      if (evento.target === fundo) fechar(null);
+    });
+    document.addEventListener("keydown", aoTeclarEscape);
+
+    caixa.appendChild(el("h3", { texto: "Quem está operando?" }));
+    caixa.appendChild(
+      el("p", {
+        class: "aviso",
+        texto: "Esta ação fica registrada em nome de quem confirmar aqui.",
+      })
+    );
+
+    const sel = criarSeletorOperador();
+    caixa.appendChild(sel);
+
+    const areaErro = el("p", { class: "modal-erro" });
+    caixa.appendChild(areaErro);
+
+    const botaoCancelar = el("button", { class: "secundario", texto: "Cancelar" });
+    botaoCancelar.addEventListener("click", () => fechar(null));
+
+    const botaoConfirmar = el("button", { texto: "Confirmar" });
+    botaoConfirmar.addEventListener("click", () => {
+      const valor = sel.value;
+      if (!valor) {
+        areaErro.textContent = "Escolha um operador.";
+        return;
+      }
+      salvarOperadorEAtualizarTopo(valor);
+      fechar(valor);
+    });
+
+    caixa.appendChild(el("div", { class: "modal-acoes" }, [botaoCancelar, botaoConfirmar]));
+    fundo.appendChild(caixa);
+    document.body.appendChild(fundo);
+    sel.focus();
+  });
+}
+
 function linhaProspeccao(p, recarregar) {
   const linha = el("div", { class: "prospeccao-item" });
   linha.appendChild(
@@ -1839,9 +1920,11 @@ function linhaProspeccao(p, recarregar) {
     );
     const desfazer = el("button", { class: "secundario", texto: "Desfazer" });
     desfazer.addEventListener("click", async () => {
+      const por = await garantirOperador();
+      if (!por) return;
       try {
         await chamarApiEscrever(`/prospeccao/${p.id}/nao-whatsapp`, {
-          por: obterOperador(),
+          por,
           valor: false,
         });
         recarregar();
@@ -1890,9 +1973,11 @@ function linhaProspeccao(p, recarregar) {
     texto: p.enviado_manual ? "Desfazer 'já enviado'" : "Marcar como já enviado",
   });
   botaoEnviadaManual.addEventListener("click", async () => {
+    const por = await garantirOperador();
+    if (!por) return;
     try {
       await chamarApiEscrever(`/prospeccao/${p.id}/enviada-manual`, {
-        por: obterOperador(),
+        por,
         valor: !p.enviado_manual,
       });
       recarregar();
@@ -1908,9 +1993,11 @@ function linhaProspeccao(p, recarregar) {
   });
   botaoNaoWhatsapp.addEventListener("click", async () => {
     if (!confirm(`Marcar "${p.nome}" como número que não atende no WhatsApp?`)) return;
+    const por = await garantirOperador();
+    if (!por) return;
     try {
       await chamarApiEscrever(`/prospeccao/${p.id}/nao-whatsapp`, {
-        por: obterOperador(),
+        por,
         valor: true,
       });
       recarregar();
