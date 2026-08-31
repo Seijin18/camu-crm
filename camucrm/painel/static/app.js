@@ -193,6 +193,16 @@ function el(tag, props, filhos) {
   return elemento;
 }
 
+// Rótulo fixo acima de um campo de `.filtros` — os `<select>` da tela já
+// se auto-rotulam (primeira opção "estágio: todos" continua visível depois
+// de escolher), mas um `<input>` de texto/número só tinha `placeholder`, que
+// some assim que o operador digita. Achado na revisão visual (2026-08-31):
+// sem rótulo fixo, "4.5" sozinho no meio da linha de filtros não diz se é
+// nota mínima ou outra coisa qualquer.
+function campoComRotulo(rotulo, input) {
+  return el("label", { class: "filtro-campo" }, [el("span", { texto: rotulo }), input]);
+}
+
 function formatarHoras(horas) {
   if (horas === null || horas === undefined) return "—";
   if (horas < 1) return `${Math.round(horas * 60)}min`;
@@ -2122,10 +2132,13 @@ async function renderizarProspeccao(container) {
   );
 
   const filtros = el("div", { class: "filtros" });
-  const campoZona = el("input", { type: "text", placeholder: "zona" });
-  const campoBairro = el("input", { type: "text", placeholder: "bairro" });
-  const campoNota = el("input", { type: "number", step: "0.1", placeholder: "nota mínima" });
-  const campoTier = el("input", { type: "text", placeholder: "tier" });
+  // Placeholder agora é só exemplo — o rótulo fixo (`campoComRotulo`, abaixo)
+  // é quem identifica o campo, então repetir o mesmo texto nos dois seria
+  // redundante.
+  const campoZona = el("input", { type: "text", placeholder: "ex.: Norte" });
+  const campoBairro = el("input", { type: "text", placeholder: "ex.: Jardim Paraíso" });
+  const campoNota = el("input", { type: "number", step: "0.1", placeholder: "ex.: 4.5" });
+  const campoTier = el("input", { type: "text", placeholder: "ex.: 1" });
   const labelNaoConvertidas = el("label", { class: "modo-teste" });
   const checkNaoConvertidas = el("input", { type: "checkbox" });
   labelNaoConvertidas.appendChild(checkNaoConvertidas);
@@ -2184,10 +2197,10 @@ async function renderizarProspeccao(container) {
   });
   checkNaoConvertidas.addEventListener("change", carregar);
 
-  filtros.appendChild(campoZona);
-  filtros.appendChild(campoBairro);
-  filtros.appendChild(campoNota);
-  filtros.appendChild(campoTier);
+  filtros.appendChild(campoComRotulo("zona", campoZona));
+  filtros.appendChild(campoComRotulo("bairro", campoBairro));
+  filtros.appendChild(campoComRotulo("nota mínima", campoNota));
+  filtros.appendChild(campoComRotulo("tier", campoTier));
   filtros.appendChild(labelNaoConvertidas);
   filtros.appendChild(selOrdenarProspeccao);
 

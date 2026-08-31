@@ -170,6 +170,15 @@ main {
   border: 1px solid var(--borda);
   border-radius: 8px;
   margin-bottom: 0.5rem;
+  transition: border-color 0.1s, background 0.1s;
+}
+
+/* A linha inteira é clicável (`cursor:pointer` vem do JS), mas até agora
+   nada avisava disso antes do clique — achado na revisão visual
+   (2026-08-31). */
+.fila-item:hover {
+  border-color: var(--acento);
+  background: #1c2029;
 }
 
 .fila-item .prioridade {
@@ -248,6 +257,16 @@ main {
   margin-bottom: 0.4rem;
   font-size: 0.8rem;
   cursor: grab;
+  transition: border-color 0.1s;
+}
+
+/* Mesmo raciocínio do `.fila-item:hover` — o card é clicável (abre a
+   conversa) E arrastável; o hover cobre o primeiro sinal antes do usuário
+   descobrir o segundo. Coluna derivada não arrasta (`cursor:default` já
+   sinaliza isso), mas o card ainda abre a conversa no clique — hover
+   continua valendo. */
+.card:hover {
+  border-color: var(--acento);
 }
 
 .card.arrastando {
@@ -400,6 +419,23 @@ main {
 .filtros input[type="number"]::-webkit-outer-spin-button {
   -webkit-appearance: none;
   margin: 0;
+}
+
+/* Rótulo fixo acima de um campo de filtro de texto/número — ver
+   `campoComRotulo` em app.js. Fica com a mesma altura dos outros campos de
+   `.filtros` (select, checkbox) porque o rótulo some do fluxo de layout,
+   plantado só visualmente acima via `margin-top` negativa não seria robusto
+   o bastante; em vez disso o próprio campo cresce um pouco (duas linhas). */
+.filtro-campo {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 0.7rem;
+  color: var(--texto-fraco);
+}
+
+.filtro-campo input {
+  font-size: 0.85rem;
 }
 
 /* -- Resumo por LLM (§1/CLAUDE.md, change `resumo-conversa`) -------------- */
