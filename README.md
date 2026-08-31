@@ -19,10 +19,10 @@ reinterpretar conversa antiga.
 
 ```bash
 cp .env.example .env   # defina CAMU_TELEFONE_SALT e GEMINI_API_KEY
-./start.sh
+make up
 ```
 
-`start.sh` sobe tudo na ordem de dependência e verifica cada etapa em vez de
+`make up` sobe tudo na ordem de dependência e verifica cada etapa em vez de
 assumi-la: Postgres, schema, o banco da Evolution, a Evolution API, o
 pareamento do chip, para onde o webhook aponta, o receptor e o painel. É
 idempotente — rodar duas vezes não duplica processo.
@@ -31,13 +31,14 @@ Se alguma peça faltar, ele diz qual e sai com código 2. Subir metade do
 sistema em silêncio é pior que não subir nada, porque a fila parece vazia em
 vez de parecer quebrada.
 
-| Script | O que faz |
-|---|---|
-| `./start.sh` | Sobe tudo (`--sem-painel` para servidor sem UI) |
-| `./stop.sh` | Para receptor e painel; preserva banco e pareamento |
-| `./status.sh` | Uma tela dizendo o que está no ar e o que falta |
-| `./scripts/parear.py` | Página local com o QR, renovado sozinho |
-| `./scripts/apontar_webhook.sh` | Aponta o webhook da Evolution para o CRM |
+| Script                           | O que faz                                           |
+| -------------------------------- | --------------------------------------------------- |
+| `make up`                      | Sobe tudo                                         |
+| `make up-sem-painel`           | Sobe só a recepção, sem UI                       |
+| `./stop.sh`                    | Para receptor e painel; preserva banco e pareamento |
+| `./status.sh`                  | Uma tela dizendo o que está no ar e o que falta    |
+| `./scripts/parear.py`          | Página local com o QR, renovado sozinho            |
+| `./scripts/apontar_webhook.sh` | Aponta o webhook da Evolution para o CRM            |
 
 Os mesmos comandos estão no Makefile: `make up`, `make down`, `make status`.
 
@@ -47,17 +48,17 @@ CRM significaria repareamento frequente.
 
 ## Comandos
 
-| Comando | O que faz |
-|---|---|
-| `make fila` | A fila do dia. É este que precisa ser aberto toda manhã |
-| `make extrair` | Roda a extração sobre os blocos novos de mensagem |
-| `make recalcular` | Reaplica as regras sobre os fatos já extraídos, sem LLM |
-| `make eval` | Roda o eval contra o conjunto rotulado (§7) |
-| `make metricas` | Os três números da §14 |
-| `make backfill ARQUIVO=dump.json` | Importa e extrai o histórico (§8) |
-| `camucrm rascunho <id>` | Duas opções de resposta, para escolher |
-| `camucrm marcar <id> ganho` | Registra um marco manual (S6/P5/P6) |
-| `camucrm corrigir <id> <campo> --de X --para Y` | Grava uma correção humana (§7) |
+| Comando                                           | O que faz                                                 |
+| ------------------------------------------------- | --------------------------------------------------------- |
+| `make fila`                                     | A fila do dia. É este que precisa ser aberto toda manhã |
+| `make extrair`                                  | Roda a extração sobre os blocos novos de mensagem       |
+| `make recalcular`                               | Reaplica as regras sobre os fatos já extraídos, sem LLM |
+| `make eval`                                     | Roda o eval contra o conjunto rotulado (§7)              |
+| `make metricas`                                 | Os três números da §14                                 |
+| `make backfill ARQUIVO=dump.json`               | Importa e extrai o histórico (§8)                       |
+| `camucrm rascunho <id>`                         | Duas opções de resposta, para escolher                  |
+| `camucrm marcar <id> ganho`                     | Registra um marco manual (S6/P5/P6)                       |
+| `camucrm corrigir <id> <campo> --de X --para Y` | Grava uma correção humana (§7)                         |
 
 `camucrm --help` lista tudo.
 

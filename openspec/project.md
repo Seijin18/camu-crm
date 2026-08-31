@@ -160,6 +160,32 @@ Todas justificadas no ponto de uso; listadas aqui para não se perderem.
   `camucrm/painel/envio.py`, ainda o único módulo do painel que importa
   `camucrm.transport`. Se `fetchInstances` falhar, o seletor some e o envio
   segue pela instância do `.env` — nunca um bloqueio novo.
+- **Marcas manuais de triagem na aba de prospecção** (change
+  `prospeccao-marcar-enviada-e-nao-whatsapp`, 2026-08-31, pedido do
+  usuário). Dois botões por linha: "Marcar como já enviado" (o petshop foi
+  contatado por outro canal — reaproveita `enviado_*` com
+  `enviado_instancia = 'manual'`, sem coluna nova; o "desfazer" nunca apaga
+  um envio real da API) e "Não é número de WhatsApp" (coluna nova
+  `prospeccoes.nao_whatsapp` — a linha sai da fila de disparo mas continua
+  na tabela e sobrevive à reimportação da planilha). Ambas manuais, nunca
+  inferidas (mesmo princípio de `contatos.e_teste`). Rotas
+  `POST /api/prospeccao/{id}/enviada-manual` e `.../nao-whatsapp` — `por`
+  obrigatório, nenhuma toca `camucrm.transport`, nenhuma contém "enviar" no
+  path (teste-guarda de `test_painel_api.py` mantido).
+- **Token de mudança de 4 partes + re-render recortado por rota** (change
+  `prospeccao-tempo-real-sem-pulo`, 2026-08-31, pedido do usuário). Com dois
+  operadores na aba `/prospeccao`, cada mensagem que a Evolution API recebia
+  redesenhava a tela inteira e jogava o operador pro topo — a aba nem
+  depende do stream de conversas. `db.token_de_mudanca` ganhou uma 4ª parte
+  (`epoch(MAX(prospeccoes.atualizado_em))`, token `"m:e:c:p"`) e toda
+  mutação da aba de prospecção passa a gravar `atualizado_em = now()`. O
+  cliente (`static/app.js`) compara o token **parte a parte**: partes 0-2 só
+  redesenham fila/kanban/conversas; a parte 3 só recarrega
+  `#lista-prospeccao` (sem limpar `#conteudo`, preservando scroll e
+  filtros), e só quando a aba aberta é a de prospecção. As demais abas
+  (métricas, ground truth, importações) deixam de reagir ao stream — o botão
+  "Atualizar" manual continua. `stream.py`/`PollerMudanca` não mudam: o
+  recorte é todo do cliente.
 
 ## Correções pendentes — auditoria completa do pipeline (2026-08)
 

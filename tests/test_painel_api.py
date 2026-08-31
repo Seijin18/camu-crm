@@ -1039,6 +1039,57 @@ class TesteRotasDeProspeccao(unittest.TestCase):
         self.assertIsNotNone(registro.aberto_em)
         self.assertEqual(registro.aberto_por, "marcos")
 
+    def test_marcar_enviada_manual_grava_e_aparece_no_json(self):
+        prospeccao = self.fake.criar_prospeccao(nome="Petshop EM", telefone="5512999990030")
+        resposta = self.cliente.post(
+            f"/api/prospeccao/{prospeccao.id}/enviada-manual", json={"por": "marcos"}
+        )
+        self.assertEqual(resposta.status_code, 200)
+        item = self.cliente.get("/api/prospeccao").json()["prospeccoes"][0]
+        self.assertTrue(item["enviado_manual"])
+        self.assertIsNotNone(item["enviado_em"])
+
+    def test_marcar_enviada_manual_sem_por_e_422(self):
+        prospeccao = self.fake.criar_prospeccao(nome="Petshop EM2", telefone="5512999990031")
+        resposta = self.cliente.post(
+            f"/api/prospeccao/{prospeccao.id}/enviada-manual", json={"por": " "}
+        )
+        self.assertEqual(resposta.status_code, 422)
+
+    def test_marcar_nao_whatsapp_grava_e_aparece_no_json(self):
+        prospeccao = self.fake.criar_prospeccao(nome="Petshop NW", telefone="5512999990032")
+        resposta = self.cliente.post(
+            f"/api/prospeccao/{prospeccao.id}/nao-whatsapp", json={"por": "marcos"}
+        )
+        self.assertEqual(resposta.status_code, 200)
+        item = self.cliente.get("/api/prospeccao").json()["prospeccoes"][0]
+        self.assertTrue(item["nao_whatsapp"])
+        self.assertEqual(item["nao_whatsapp_por"], "marcos")
+
+    def test_desfazer_nao_whatsapp(self):
+        prospeccao = self.fake.criar_prospeccao(nome="Petshop NW2", telefone="5512999990033")
+        self.cliente.post(
+            f"/api/prospeccao/{prospeccao.id}/nao-whatsapp", json={"por": "marcos"}
+        )
+        self.cliente.post(
+            f"/api/prospeccao/{prospeccao.id}/nao-whatsapp",
+            json={"por": "marcos", "valor": False},
+        )
+        item = self.cliente.get("/api/prospeccao").json()["prospeccoes"][0]
+        self.assertFalse(item["nao_whatsapp"])
+
+    def test_rotas_de_marca_manual_nao_contem_enviar_no_path(self):
+        """As duas rotas novas (change `prospeccao-marcar-enviada-e-nao-
+        whatsapp`) são marcas manuais, não envio — nenhuma pode entrar no
+        conjunto guardado por `_UNICO_PATH_DE_ENVIO`."""
+        caminhos = set(server.app.openapi()["paths"].keys())
+        self.assertIn("/api/prospeccao/{prospeccao_id}/enviada-manual", caminhos)
+        self.assertIn("/api/prospeccao/{prospeccao_id}/nao-whatsapp", caminhos)
+        self.assertEqual(
+            {c for c in caminhos if "enviar" in c},
+            {"/api/prospeccao/{prospeccao_id}/enviar"},
+        )
+
     def test_rota_de_envio_de_prospeccao_e_a_unica_com_enviar(self):
         """Até o change `envio-prospeccao-pela-evolution-api`, nenhuma rota
         de prospecção continha "enviar" — o disparo era só o link `wa.me`.

@@ -98,6 +98,30 @@ class TesteTokenComparacaoPura(unittest.TestCase):
         depois = db.token_de_mudanca()
         self.assertNotEqual(antes, depois)
 
+    def test_marca_de_prospeccao_mexe_so_na_quarta_parte(self):
+        """Change `prospeccao-tempo-real-sem-pulo`: triar uma linha da
+        prospecção move a 4ª parte do token e SÓ ela — as três primeiras
+        (mensagem, evento, conversa) ficam iguais, para o cliente na aba de
+        prospecção reagir sem que a fila/kanban de outro operador redesenhe."""
+        db = FakeDatabase()
+        p = db.criar_prospeccao(nome="Pet X", telefone="5512999990000")
+        antes = db.token_de_mudanca()
+
+        db.marcar_prospeccao_nao_whatsapp(p.id, por="op")
+        depois = db.token_de_mudanca()
+
+        self.assertNotEqual(antes, depois)
+        self.assertEqual(antes.split(":")[:3], depois.split(":")[:3])
+        self.assertNotEqual(antes.split(":")[3], depois.split(":")[3])
+
+    def test_mensagem_nova_nao_mexe_na_parte_de_prospeccao(self):
+        db = FakeDatabase()
+        conversa = db.criar_conversa()
+        antes = db.token_de_mudanca()
+        db.registrar_mensagem(conversa.id, "in", "oi")
+        depois = db.token_de_mudanca()
+        self.assertEqual(antes.split(":")[3], depois.split(":")[3])
+
 
 class TestePollerUnico(unittest.TestCase):
     """Requirement "Poller único por processo": um `PollerMudanca`, quantos

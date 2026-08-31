@@ -17,6 +17,24 @@
 
 const CHAVE_TOKEN = "camu_painel_token";
 const CHAVE_OPERADOR = "camu_painel_operador";
+// Change `dropdown-operador`: lista fixa dos dois operadores do projeto (ver
+// openspec/project.md — "dele e do Felipe"). Um dropdown evita o erro
+// `por é obrigatório` que o texto livre deixava passar em branco; se um
+// terceiro operador entrar, é só adicionar aqui.
+const OPERADORES = ["Marcos", "Felipe"];
+
+/** Monta um <select> de operador, com o valor salvo pré-selecionado quando
+ *  bate com a lista (senão fica no placeholder, forçando escolha explícita). */
+function criarSeletorOperador() {
+  const sel = el("select", {});
+  sel.appendChild(el("option", { value: "", texto: "Quem está operando" }));
+  OPERADORES.forEach((nome) => {
+    sel.appendChild(el("option", { value: nome, texto: nome }));
+  });
+  const salvo = obterOperador();
+  if (OPERADORES.includes(salvo)) sel.value = salvo;
+  return sel;
+}
 // Change `contatos-de-teste-isolados`: "Modo teste" é o toggle binário do
 // topo do painel — ligado mostra só contato de teste, desligado (padrão) só
 // os reais, nunca os dois juntos na mesma tela (mesmo padrão de persistência
@@ -1734,8 +1752,7 @@ function abrirPopupEnvioProspeccao(p, aoConcluir) {
     });
 
   const labelOperador = el("label", {}, [document.createTextNode("Aprovado por")]);
-  const campoOperador = el("input", { type: "text" });
-  campoOperador.value = obterOperador();
+  const campoOperador = criarSeletorOperador();
   labelOperador.appendChild(campoOperador);
 
   const areaErro = el("p", { class: "modal-erro" });
@@ -1812,12 +1829,43 @@ function linhaProspeccao(p, recarregar) {
     return linha;
   }
 
+  // Change `prospeccao-marcar-enviada-e-nao-whatsapp`: telefone comercial que
+  // não atende no WhatsApp — a linha some da fila de disparo (nenhum botão de
+  // envio abaixo), mas continua na tabela. Só um "Desfazer" caso tenha sido
+  // marca errada.
+  if (p.nao_whatsapp) {
+    linha.appendChild(
+      el("span", { class: "enviado-selo com-erro", texto: "não é número de WhatsApp" })
+    );
+    const desfazer = el("button", { class: "secundario", texto: "Desfazer" });
+    desfazer.addEventListener("click", async () => {
+      try {
+        await chamarApiEscrever(`/prospeccao/${p.id}/nao-whatsapp`, {
+          por: obterOperador(),
+          valor: false,
+        });
+        recarregar();
+      } catch (e) {
+        alert(e.message);
+      }
+    });
+    linha.appendChild(desfazer);
+    return linha;
+  }
+
   // Resultado da última tentativa de envio pela API — distinto de "abriu o
   // link" (aquilo nunca teve confirmação; isto é o servidor dizendo que a
   // Evolution aceitou, ou não, o envio).
   // Change `escolher-instancia-no-envio-prospeccao`: por qual número saiu.
   const porNumero = p.enviado_instancia ? ` pelo ${p.enviado_instancia}` : "";
-  if (p.enviado_erro) {
+  if (p.enviado_manual && p.enviado_em) {
+    // Change `prospeccao-marcar-enviada-e-nao-whatsapp`: marcado à mão como já
+    // enviado (por outro canal), sem ter passado pela Evolution API.
+    const quando = new Date(p.enviado_em);
+    linha.appendChild(
+      el("span", { class: "enviado-selo", texto: `marcado como já enviado (${quando.toLocaleString()})` })
+    );
+  } else if (p.enviado_erro) {
     linha.appendChild(
       el("span", {
         class: "enviado-selo com-erro",
@@ -1833,6 +1881,44 @@ function linhaProspeccao(p, recarregar) {
       })
     );
   }
+
+  // Change `prospeccao-marcar-enviada-e-nao-whatsapp`: as duas marcas manuais
+  // — disponíveis mesmo sem template de mensagem, o operador ainda precisa
+  // conseguir triar a linha.
+  const botaoEnviadaManual = el("button", {
+    class: "secundario",
+    texto: p.enviado_manual ? "Desfazer 'já enviado'" : "Marcar como já enviado",
+  });
+  botaoEnviadaManual.addEventListener("click", async () => {
+    try {
+      await chamarApiEscrever(`/prospeccao/${p.id}/enviada-manual`, {
+        por: obterOperador(),
+        valor: !p.enviado_manual,
+      });
+      recarregar();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+  linha.appendChild(botaoEnviadaManual);
+
+  const botaoNaoWhatsapp = el("button", {
+    class: "secundario",
+    texto: "Não é número de WhatsApp",
+  });
+  botaoNaoWhatsapp.addEventListener("click", async () => {
+    if (!confirm(`Marcar "${p.nome}" como número que não atende no WhatsApp?`)) return;
+    try {
+      await chamarApiEscrever(`/prospeccao/${p.id}/nao-whatsapp`, {
+        por: obterOperador(),
+        valor: true,
+      });
+      recarregar();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+  linha.appendChild(botaoNaoWhatsapp);
 
   if (!p.mensagem || !p.link_whatsapp) {
     linha.appendChild(
@@ -1972,6 +2058,14 @@ async function renderizarProspeccao(container) {
   container.appendChild(filtros);
   container.appendChild(lista);
   await carregar();
+
+  // Change `prospeccao-tempo-real-sem-pulo`: quando outro operador marca uma
+  // linha (já enviado / não é WhatsApp / abriu / enviou pela API), o stream
+  // avisa e esta closure recarrega SÓ `#lista-prospeccao` — sem tocar em
+  // `#conteudo` nem nos campos de filtro, então o scroll e o que o operador
+  // estava digitando ficam onde estavam. Uma mensagem de WhatsApp qualquer
+  // (que não mexe na 4ª parte do token) nunca chega aqui.
+  refreshSuaveAtual = carregar;
 }
 
 /*
@@ -2182,6 +2276,14 @@ async function renderizarRotaSegura() {
   }
 }
 
+// Change `prospeccao-tempo-real-sem-pulo`: uma tela que sabe se redesenhar
+// sem limpar `#conteudo` inteiro (mantendo scroll e os filtros que o
+// operador digitou) registra aqui o seu "recarregar". O stream chama isto
+// em vez de `renderizarRotaSegura` quando só a parte de prospecção do token
+// mudou — ver `reagirAMudanca`. `renderizarRota` zera a cada navegação para
+// a tela seguinte não herdar o hook da anterior.
+let refreshSuaveAtual = null;
+
 async function renderizarRota() {
   // Change `painel-preserva-estado-em-refresh`: qualquer render de verdade
   // (navegação de aba, hashchange, "Atualizar" manual) está prestes a
@@ -2191,6 +2293,7 @@ async function renderizarRota() {
   haEdicaoEmAndamento = false;
   const conteudo = document.getElementById("conteudo");
   conteudo.textContent = "";
+  refreshSuaveAtual = null;
   document.querySelectorAll("nav.abas a").forEach((a) => a.classList.remove("ativa"));
 
   const hash = window.location.hash.replace(/^#/, "") || "/";
@@ -2256,6 +2359,35 @@ const ATRASO_INICIAL_MS = 1000;
 const ATRASO_MAXIMO_MS = 10000;
 let atrasoReconexaoMs = ATRASO_INICIAL_MS;
 
+// Change `prospeccao-tempo-real-sem-pulo`: último token `"m:e:c:p"` visto no
+// evento `mudanca` (camucrm/db.py::token_de_mudanca) — comparado parte a
+// parte com o próximo para saber O QUE mudou. `null` até o primeiro evento.
+let ultimoTokenMudanca = null;
+
+/**
+ * A tela atual reflete o stream de CONVERSAS (mensagens, eventos de estágio,
+ * `conversas.atualizado_em` — as três primeiras partes do token)?
+ *
+ * Só fila (`#/`), kanban, lista de conversas e detalhe de conversa. As
+ * demais abas (prospecção, importações, ground truth, métricas, "o que
+ * funciona") têm o botão "Atualizar" manual e NÃO são redesenhadas — nem
+ * jogadas de volta pro topo — porque a Evolution API recebeu uma mensagem
+ * que não muda nada do que elas mostram (change `prospeccao-tempo-real-
+ * sem-pulo`, "Correção recomendada" da investigação).
+ */
+function rotaRefleteConversas() {
+  const partes = (window.location.hash.replace(/^#/, "") || "/").split("/").filter(Boolean);
+  const raiz = partes[0] || "";
+  return raiz === "" || raiz === "kanban" || raiz === "conversas";
+}
+
+/** A tela atual é a lista de prospecção (`#/prospeccao`, não `.../importar`)?
+ * É a única que reage à 4ª parte do token, e só via `refreshSuaveAtual`. */
+function rotaEhListaProspeccao() {
+  const partes = (window.location.hash.replace(/^#/, "") || "/").split("/").filter(Boolean);
+  return partes.length === 1 && partes[0] === "prospeccao";
+}
+
 /**
  * Parser SSE manual (~25 linhas, como o plano pede): um bloco é tudo entre
  * duas quebras de linha duplas, com linhas `id:`/`event:`/`data:`. O
@@ -2264,33 +2396,74 @@ let atrasoReconexaoMs = ATRASO_INICIAL_MS;
  */
 function processarBlocoSse(bloco) {
   let evento = "message";
-  let temDados = false;
+  let dados = null;
   bloco.split("\n").forEach((linha) => {
     if (linha.startsWith("id:")) {
       ultimoIdStream = Number(linha.slice(3).trim());
     } else if (linha.startsWith("event:")) {
       evento = linha.slice(6).trim();
     } else if (linha.startsWith("data:")) {
-      temDados = true;
+      const bruto = linha.slice(5).trim();
+      try {
+        dados = JSON.parse(bruto);
+      } catch (e) {
+        dados = bruto;
+      }
     }
   });
-  if (!temDados) return; // heartbeat
-  if (evento === "mensagem" || evento === "mudanca") {
-    // Change `painel-preserva-estado-em-refresh`: `token_de_mudanca` é um
-    // cursor global (design.md do change `painel-tempo-real`) — qualquer
-    // mensagem em QUALQUER conversa cai aqui, mesmo sem relação com o que
-    // está na tela. Se há edição em risco (formulário com conteúdo, ou uma
-    // escrita em voo), não apaga `conteudo` por baixo do operador: só marca
-    // que há atualização esperando o botão "Atualizar".
-    if (haEdicaoEmAndamento) {
-      atualizacaoPendente = true;
-      atualizarIndicadorAtualizacaoPendente();
-      return;
-    }
-    // Recarrega a tela atual com os mesmos dados que "Atualizar" busca —
-    // o stream só avisa que algo mudou, não tenta atualizar o DOM à mão
-    // por cima do que `renderizarRota` já sabe montar.
-    renderizarRotaSegura();
+  if (dados === null) return; // heartbeat
+
+  if (evento === "mensagem") {
+    // Mensagem nova sempre mexe no stream de conversas.
+    if (rotaRefleteConversas()) renderizarOuAdiar(renderizarRotaSegura);
+  } else if (evento === "mudanca") {
+    reagirAMudanca(dados && typeof dados === "object" ? dados.token : null);
+  }
+}
+
+// Change `painel-preserva-estado-em-refresh`: se há edição em risco
+// (formulário com conteúdo, ou uma escrita em voo), não apaga `conteudo`
+// por baixo do operador — só marca que há atualização esperando o botão
+// "Atualizar". Usado tanto pelo refresh de conversas quanto pelo suave de
+// prospecção (change `prospeccao-tempo-real-sem-pulo`): os dois podem cair
+// no meio de uma edição, o gate é o mesmo.
+function renderizarOuAdiar(fn) {
+  if (haEdicaoEmAndamento) {
+    atualizacaoPendente = true;
+    atualizarIndicadorAtualizacaoPendente();
+    return;
+  }
+  fn();
+}
+
+/**
+ * Decide o que redesenhar a partir do token `"m:e:c:p"`. Comparar parte a
+ * parte é o que separa "chegou mensagem/mudou estágio" (partes 0-2, mexe na
+ * tela de conversas) de "outro operador triou uma linha da prospecção"
+ * (parte 3, mexe só na aba de prospecção) — cada tela reage à sua parte e
+ * ignora a da outra. Sem token legível, cai no comportamento antigo
+ * (conservador: redesenha a tela de conversas se for o caso).
+ */
+function reagirAMudanca(token) {
+  if (typeof token !== "string") {
+    if (rotaRefleteConversas()) renderizarOuAdiar(renderizarRotaSegura);
+    return;
+  }
+  const partes = token.split(":");
+  const anterior = ultimoTokenMudanca ? ultimoTokenMudanca.split(":") : [];
+  ultimoTokenMudanca = token;
+
+  const mudouConversas = [0, 1, 2].some((i) => partes[i] !== anterior[i]);
+  const mudouProspeccao = partes[3] !== anterior[3];
+
+  if (mudouConversas && rotaRefleteConversas()) {
+    // Mesmos dados que "Atualizar" busca — o stream só avisa que algo mudou,
+    // não tenta remendar o DOM por cima do que `renderizarRota` já monta.
+    renderizarOuAdiar(renderizarRotaSegura);
+  }
+  if (mudouProspeccao && rotaEhListaProspeccao() && refreshSuaveAtual) {
+    // Recarrega só a lista, sem limpar `#conteudo`: scroll e filtros ficam.
+    renderizarOuAdiar(refreshSuaveAtual);
   }
 }
 
@@ -2341,7 +2514,10 @@ async function conectarStream() {
 
 function iniciar() {
   document.getElementById("campo-token").value = obterToken();
-  document.getElementById("campo-operador").value = obterOperador();
+  const salvoOperador = obterOperador();
+  if (OPERADORES.includes(salvoOperador)) {
+    document.getElementById("campo-operador").value = salvoOperador;
+  }
   const campoModoTeste = document.getElementById("campo-modo-teste");
   campoModoTeste.checked = modoTesteAtivo();
   document.body.classList.toggle("modo-teste-ativo", modoTesteAtivo());

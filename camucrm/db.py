@@ -461,6 +461,14 @@ class ProspeccaoRegistro:
     # `listar_prospeccoes` preenche (`_PROSPECCAO_SELECT` não tem essas
     # duas colunas, então precisa ser a última posição antes delas).
     provavel_loja_racao: bool | None = None
+    # ADIÇÃO (change `prospeccao-marcar-enviada-e-nao-whatsapp`): marca manual
+    # "não atende no WhatsApp" — mesma posição relativa dos campos `enviado_*`
+    # (antes de contato_id/conversa_id), pelo mesmo motivo posicional. Vem
+    # DEPOIS de `provavel_loja_racao` — os dois SELECTs precisam concordar
+    # nessa ordem também (`_PROSPECCAO_SELECT` e o de `listar_prospeccoes`).
+    nao_whatsapp: bool = False
+    nao_whatsapp_em: datetime | None = None
+    nao_whatsapp_por: str | None = None
     contato_id: int | None = None
     conversa_id: int | None = None
 
@@ -813,6 +821,13 @@ CREATE TABLE IF NOT EXISTS prospeccoes (
     aberto_em       TIMESTAMP WITH TIME ZONE,
     aberto_por      VARCHAR(48),
     criado_em       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    -- `atualizado_em` nasceu com o upsert de reimportação (change
+    -- `prospeccao-b2b-shortlist`). ADIÇÃO de uso (change
+    -- `prospeccao-tempo-real-sem-pulo`): passou a ser a 4ª parte de
+    -- `Database.token_de_mudanca` — TODA mutação da aba de prospecção
+    -- (aberta, envio, marcas manuais) grava `atualizado_em = now()`, e é só
+    -- isso que faz a aba `/prospeccao` de outro operador se atualizar sem
+    -- depender de uma mensagem de WhatsApp qualquer bumpar o token.
     atualizado_em   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS prospeccoes_zona_idx ON prospeccoes (zona, bairro);
@@ -840,6 +855,18 @@ ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_instancia VARCHAR(64);
 -- (nota/avaliações) em vez de copiado da coluna `tier_origem` do CSV; ver
 -- `Database.importar_prospeccoes`.
 ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS provavel_loja_racao BOOLEAN;
+
+-- ADIÇÃO (change `prospeccao-marcar-enviada-e-nao-whatsapp`): dois estados
+-- MANUAIS que o operador marca na aba de prospecção, nenhum inferido (mesmo
+-- princípio de `marcos_manuais`/`contatos.e_teste`). `nao_whatsapp` é o
+-- petshop cujo telefone comercial não atende no WhatsApp — a linha sai da
+-- lista de disparo mas nunca é apagada (a planilha reimportada não deve
+-- ressuscitar o número). O envio manual reaproveita as colunas `enviado_*`
+-- acima com `enviado_instancia = 'manual'` — não é coluna nova, é o mesmo
+-- "foi enviado" gravado sem ter passado pela Evolution API.
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS nao_whatsapp BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS nao_whatsapp_em TIMESTAMP WITH TIME ZONE;
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS nao_whatsapp_por VARCHAR(48);
 
 -- ADIÇÃO (change `backfill-cobertura-por-prompt`): até onde CADA versão de
 -- prompt de extração já leu uma conversa. Existe para `forcar=True`
@@ -1375,17 +1402,27 @@ class Database:
         """Cursor barato de "algo mudou" para o SSE do painel (change
         `painel-tempo-real`, design.md).
 
-        Três subselects escalares — `MAX(mensagens.id)`,
-        `MAX(eventos_estagio.id)`, `epoch(MAX(conversas.atualizado_em))` —
-        concatenados em `"m:e:c"`. Três partes porque são três motivos
-        distintos de a tela estar desatualizada, e só o primeiro move
-        `mensagens.id`: uma correção manual ou uma mudança de resultado pode
-        tocar `conversas.atualizado_em` sem gerar mensagem nem evento de
-        estágio novo.
+        Quatro subselects escalares — `MAX(mensagens.id)`,
+        `MAX(eventos_estagio.id)`, `epoch(MAX(conversas.atualizado_em))`,
+        `epoch(MAX(prospeccoes.atualizado_em))` — concatenados em `"m:e:c:p"`.
+        Quatro partes porque são quatro motivos distintos de a tela estar
+        desatualizada, e cada parte se move sozinha: uma correção manual ou
+        uma mudança de resultado toca `conversas.atualizado_em` sem gerar
+        mensagem nem evento; uma marca de triagem na aba de prospecção
+        (change `prospeccao-tempo-real-sem-pulo`) toca só
+        `prospeccoes.atualizado_em` — nada nas três primeiras partes.
+
+        Comparar parte a parte é o que deixa o cliente decidir o que
+        redesenhar: quem está na aba de prospecção reage à quarta parte e
+        ignora as outras três (uma mensagem de WhatsApp qualquer não muda a
+        shortlist); quem está na fila/kanban/conversas reage às três
+        primeiras e ignora a quarta. `painel/stream.py` continua disparando
+        o evento com qualquer diferença de string — o recorte por parte é do
+        cliente (`static/app.js::reagirAMudanca`).
 
         O mesmo valor serve de cursor de reconexão (`?desde_id=N` no stream):
-        comparar strings anteriores/posteriores é suficiente para o poller de
-        `painel/stream.py` decidir se dispara o evento — nenhuma parte deste
+        `stream.gerador_sse` lê só `token.split(":")[0]` (o id de mensagem);
+        acrescentar uma quarta parte não muda esse uso. Nenhuma parte deste
         método interpreta o conteúdo do token além de igualdade.
 
         Change `painel-refresh-ignora-contato-de-teste`: as três subconsultas
@@ -1416,10 +1453,16 @@ class Database:
                     "  WHERE ct.e_teste = FALSE), "
                     "(SELECT extract(epoch FROM MAX(c.atualizado_em)) FROM conversas c "
                     "   JOIN contatos ct ON ct.id = c.contato_id "
-                    "  WHERE ct.e_teste = FALSE)"
+                    "  WHERE ct.e_teste = FALSE), "
+                    # Prospecção B2B não tem contato de teste (change
+                    # `prospeccao-tempo-real-sem-pulo`) — nada a filtrar aqui.
+                    "(SELECT extract(epoch FROM MAX(atualizado_em)) FROM prospeccoes)"
                 )
-                max_mensagem, max_evento, max_atualizado = cur.fetchone()
-        return f"{max_mensagem or 0}:{max_evento or 0}:{max_atualizado or 0}"
+                max_mensagem, max_evento, max_atualizado, max_prospeccao = cur.fetchone()
+        return (
+            f"{max_mensagem or 0}:{max_evento or 0}:"
+            f"{max_atualizado or 0}:{max_prospeccao or 0}"
+        )
 
     def atualizar_estado_conversa(
         self,
@@ -3127,7 +3170,8 @@ class Database:
                p.avaliacoes, p.site, p.tier_origem, p.status_origem,
                p.aberto_em, p.aberto_por, p.criado_em,
                p.enviado_em, p.enviado_por, p.enviado_erro, p.enviado_instancia,
-               p.provavel_loja_racao
+               p.provavel_loja_racao,
+               p.nao_whatsapp, p.nao_whatsapp_em, p.nao_whatsapp_por
           FROM prospeccoes p
     """
 
@@ -3276,6 +3320,7 @@ class Database:
                            p.aberto_em, p.aberto_por, p.criado_em,
                            p.enviado_em, p.enviado_por, p.enviado_erro,
                            p.enviado_instancia, p.provavel_loja_racao,
+                           p.nao_whatsapp, p.nao_whatsapp_em, p.nao_whatsapp_por,
                            c.id AS contato_id, cv.id AS conversa_id
                       FROM prospeccoes p
                       LEFT JOIN contatos c ON c.telefone_hash = p.telefone_hash
@@ -3300,8 +3345,8 @@ class Database:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE prospeccoes SET aberto_em = now(), aberto_por = %s "
-                    "WHERE id = %s",
+                    "UPDATE prospeccoes SET aberto_em = now(), aberto_por = %s, "
+                    "atualizado_em = now() WHERE id = %s",
                     (por, prospeccao_id),
                 )
 
@@ -3335,14 +3380,72 @@ class Database:
                 if sucesso:
                     cur.execute(
                         "UPDATE prospeccoes SET enviado_em = now(), enviado_por = %s, "
-                        "enviado_erro = NULL, enviado_instancia = %s WHERE id = %s",
+                        "enviado_erro = NULL, enviado_instancia = %s, "
+                        "atualizado_em = now() WHERE id = %s",
                         (por, instancia, prospeccao_id),
                     )
                 else:
                     cur.execute(
                         "UPDATE prospeccoes SET enviado_por = %s, enviado_erro = %s, "
-                        "enviado_instancia = %s WHERE id = %s",
+                        "enviado_instancia = %s, atualizado_em = now() WHERE id = %s",
                         (por, erro, instancia, prospeccao_id),
+                    )
+
+    def marcar_prospeccao_enviada_manual(
+        self, prospeccao_id: int, *, por: str, valor: bool = True
+    ) -> None:
+        """Marca (ou desmarca) a linha como JÁ ENVIADA sem ter passado pela
+        Evolution API (change `prospeccao-marcar-enviada-e-nao-whatsapp`) — o
+        operador contatou o petshop por outro caminho e não quer o número na
+        fila de disparo.
+
+        Reaproveita as colunas `enviado_*` com `enviado_instancia = 'manual'`:
+        é o mesmo "foi enviado" que `registrar_envio_prospeccao` grava, só sem
+        confirmação da API. `valor=False` desfaz — limpa as quatro colunas,
+        mas SÓ quando a marca era manual (`enviado_instancia = 'manual'`), para
+        um "desfazer" nunca apagar o registro de um envio real pela API.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if valor:
+                    cur.execute(
+                        "UPDATE prospeccoes SET enviado_em = now(), enviado_por = %s, "
+                        "enviado_erro = NULL, enviado_instancia = 'manual', "
+                        "atualizado_em = now() WHERE id = %s",
+                        (por, prospeccao_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE prospeccoes SET enviado_em = NULL, enviado_por = %s, "
+                        "enviado_erro = NULL, enviado_instancia = NULL, "
+                        "atualizado_em = now() "
+                        "WHERE id = %s AND enviado_instancia = 'manual'",
+                        (por, prospeccao_id),
+                    )
+
+    def marcar_prospeccao_nao_whatsapp(
+        self, prospeccao_id: int, *, por: str, valor: bool = True
+    ) -> None:
+        """Marca (ou desmarca) a linha como "o telefone não atende no
+        WhatsApp" (change `prospeccao-marcar-enviada-e-nao-whatsapp`). A linha
+        continua na tabela — a planilha reimportada não deve ressuscitar o
+        número — mas a tela some com o botão de disparo. Marca manual, nunca
+        inferida (mesmo princípio de `contatos.e_teste`)."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if valor:
+                    cur.execute(
+                        "UPDATE prospeccoes SET nao_whatsapp = TRUE, "
+                        "nao_whatsapp_em = now(), nao_whatsapp_por = %s, "
+                        "atualizado_em = now() WHERE id = %s",
+                        (por, prospeccao_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE prospeccoes SET nao_whatsapp = FALSE, "
+                        "nao_whatsapp_em = NULL, nao_whatsapp_por = %s, "
+                        "atualizado_em = now() WHERE id = %s",
+                        (por, prospeccao_id),
                     )
 
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:

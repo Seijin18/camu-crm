@@ -228,6 +228,11 @@ class FakeDatabase:
         # pontos que a `Database` real toca a coluna (registrar mensagem,
         # atualizar estado, gravar evento de estágio).
         self._toques_conversa = 0
+        # Proxy de `prospeccoes.atualizado_em` para a 4ª parte de
+        # `token_de_mudanca` (change `prospeccao-tempo-real-sem-pulo`): mesma
+        # ideia do contador acima, nos pontos que a `Database` real toca
+        # `prospeccoes.atualizado_em` (abrir, envio, marcas manuais, import).
+        self._toques_prospeccao = 0
 
     # -- helpers de montagem ---------------------------------------------
 
@@ -653,20 +658,22 @@ class FakeDatabase:
             self._toques_conversa += 1
 
     def token_de_mudanca(self) -> str:
-        """Espelho pobre de `Database.token_de_mudanca` — três números que só
+        """Espelho pobre de `Database.token_de_mudanca` — quatro números que só
         crescem, um por motivo de mudança (mensagem, evento de estágio,
-        toque em conversa). Não é a mesma fórmula da `Database` real (não há
-        `atualizado_em` guardado no fake), só a mesma propriedade que os
-        testes de `stream.py` precisam: muda sempre que um dos três motivos
-        acontece, nunca de outro jeito.
+        toque em conversa, toque em prospecção). Não é a mesma fórmula da
+        `Database` real (não há `atualizado_em` guardado no fake), só a mesma
+        propriedade que os testes de `stream.py` precisam: muda sempre que um
+        dos quatro motivos acontece, nunca de outro jeito.
 
         Change `painel-refresh-ignora-contato-de-teste`: mensagens e eventos
         de conversa de contato de teste (`_e_teste_da_conversa`) não contam
         para as duas primeiras partes, espelhando o `JOIN`/`WHERE ct.e_teste
         = FALSE` da `Database` real. A terceira parte (`_toques_conversa`) já
         nasce filtrada em `_tocar_conversa`, chamado por todo escritor que
-        conta como "toque" — nenhuma das três partes do token deste fake
-        reage a conversa de teste, igual à consulta real.
+        conta como "toque" — nenhuma das três primeiras partes do token deste
+        fake reage a conversa de teste, igual à consulta real. A quarta
+        parte (`_toques_prospeccao`, change `prospeccao-tempo-real-sem-pulo`)
+        não tem noção de contato de teste — prospecção B2B não tem.
         """
         max_mensagem = 0
         for conversa_id, linhas in self.mensagens.items():
@@ -677,7 +684,10 @@ class FakeDatabase:
         eventos_reais = sum(
             1 for e in self.eventos if not self._e_teste_da_conversa(e["conversa_id"])
         )
-        return f"{max_mensagem}:{eventos_reais}:{self._toques_conversa}"
+        return (
+            f"{max_mensagem}:{eventos_reais}:"
+            f"{self._toques_conversa}:{self._toques_prospeccao}"
+        )
 
     def registrar_followup(self, conversa_id, texto=None) -> int:
         enviados = self.followups.setdefault(conversa_id, [])
@@ -1298,6 +1308,10 @@ class FakeDatabase:
             enviado_erro=dados.get("enviado_erro"),
             enviado_instancia=dados.get("enviado_instancia"),
             provavel_loja_racao=dados.get("provavel_loja_racao"),
+            # Change `prospeccao-marcar-enviada-e-nao-whatsapp`.
+            nao_whatsapp=dados.get("nao_whatsapp", False),
+            nao_whatsapp_em=dados.get("nao_whatsapp_em"),
+            nao_whatsapp_por=dados.get("nao_whatsapp_por"),
         )
 
     def criar_prospeccao(
@@ -1337,6 +1351,7 @@ class FakeDatabase:
             "aberto_em": None, "aberto_por": None, "criado_em": agora,
             "enviado_em": None, "enviado_por": None, "enviado_erro": None,
             "enviado_instancia": None, "provavel_loja_racao": provavel_loja_racao,
+            "nao_whatsapp": False, "nao_whatsapp_em": None, "nao_whatsapp_por": None,
         }
         return self._prospeccao_registro(self.prospeccoes[telefone_hash])
 
@@ -1389,7 +1404,13 @@ class FakeDatabase:
                 "enviado_por": existente.get("enviado_por") if existente else None,
                 "enviado_erro": existente.get("enviado_erro") if existente else None,
                 "enviado_instancia": existente.get("enviado_instancia") if existente else None,
+                # Change `prospeccao-marcar-enviada-e-nao-whatsapp`: marcas
+                # manuais sobrevivem à reimportação da planilha.
+                "nao_whatsapp": existente.get("nao_whatsapp", False) if existente else False,
+                "nao_whatsapp_em": existente.get("nao_whatsapp_em") if existente else None,
+                "nao_whatsapp_por": existente.get("nao_whatsapp_por") if existente else None,
             }
+            self._toques_prospeccao += 1
             if existente:
                 atualizados += 1
             else:
@@ -1446,6 +1467,7 @@ class FakeDatabase:
             if dados["id"] == prospeccao_id:
                 dados["aberto_em"] = datetime.now(timezone.utc)
                 dados["aberto_por"] = por
+                self._toques_prospeccao += 1
                 return
 
     def registrar_envio_prospeccao(
@@ -1471,6 +1493,41 @@ class FakeDatabase:
                     dados["enviado_erro"] = None
                 else:
                     dados["enviado_erro"] = erro
+                self._toques_prospeccao += 1
+                return
+
+    def marcar_prospeccao_enviada_manual(
+        self, prospeccao_id: int, *, por: str, valor: bool = True
+    ) -> None:
+        """Espelha `db.Database.marcar_prospeccao_enviada_manual` (change
+        `prospeccao-marcar-enviada-e-nao-whatsapp`)."""
+        for dados in self.prospeccoes.values():
+            if dados["id"] == prospeccao_id:
+                if valor:
+                    dados["enviado_em"] = datetime.now(timezone.utc)
+                    dados["enviado_por"] = por
+                    dados["enviado_erro"] = None
+                    dados["enviado_instancia"] = "manual"
+                    self._toques_prospeccao += 1
+                elif dados.get("enviado_instancia") == "manual":
+                    dados["enviado_em"] = None
+                    dados["enviado_por"] = por
+                    dados["enviado_erro"] = None
+                    dados["enviado_instancia"] = None
+                    self._toques_prospeccao += 1
+                return
+
+    def marcar_prospeccao_nao_whatsapp(
+        self, prospeccao_id: int, *, por: str, valor: bool = True
+    ) -> None:
+        """Espelha `db.Database.marcar_prospeccao_nao_whatsapp` (change
+        `prospeccao-marcar-enviada-e-nao-whatsapp`)."""
+        for dados in self.prospeccoes.values():
+            if dados["id"] == prospeccao_id:
+                dados["nao_whatsapp"] = valor
+                dados["nao_whatsapp_em"] = datetime.now(timezone.utc) if valor else None
+                dados["nao_whatsapp_por"] = por
+                self._toques_prospeccao += 1
                 return
 
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
@@ -1488,4 +1545,8 @@ class FakeDatabase:
             enviado_erro=dados.get("enviado_erro"),
             enviado_instancia=dados.get("enviado_instancia"),
             provavel_loja_racao=dados.get("provavel_loja_racao"),
+            # Change `prospeccao-marcar-enviada-e-nao-whatsapp`.
+            nao_whatsapp=dados.get("nao_whatsapp", False),
+            nao_whatsapp_em=dados.get("nao_whatsapp_em"),
+            nao_whatsapp_por=dados.get("nao_whatsapp_por"),
         )
