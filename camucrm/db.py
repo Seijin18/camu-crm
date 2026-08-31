@@ -30,7 +30,12 @@ import psycopg
 from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool
 
-from .prospeccao import calcular_tier, eh_provavel_loja_de_racao, normalizar_telefone_br
+from .prospeccao import (
+    calcular_tier,
+    eh_provavel_loja_de_racao,
+    normalizar_telefone_br,
+    ordem_prospeccao_valida,
+)
 from .rules.estagio import ORIGEM_LIVE
 from .rules.sinais import ENTRADA, SAIDA, Mensagem
 from .taxonomia import B2B, B2C, BOLA_CLIENTE, MAX_FOLLOWUPS
@@ -3207,6 +3212,7 @@ class Database:
         nota_minima: float | None = None,
         tier: str | None = None,
         apenas_nao_convertidas: bool = False,
+        ordenar: str = "nome",
         limite: int = 500,
     ) -> list[ProspeccaoRegistro]:
         """Lista com filtros + detecção de conversão (design.md: "sem estado
@@ -3237,6 +3243,7 @@ class Database:
         if apenas_nao_convertidas:
             condicoes.append("c.id IS NULL")
         where = f"WHERE {' AND '.join(condicoes)}" if condicoes else ""
+        ordem = ordem_prospeccao_valida(ordenar)
         params.append(limite)
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -3257,7 +3264,7 @@ class Database:
                            LIMIT 1
                       ) cv ON c.id IS NOT NULL
                      {where}
-                     ORDER BY p.nome
+                     ORDER BY {ordem}
                      LIMIT %s
                     """,
                     tuple(params),

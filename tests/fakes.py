@@ -41,6 +41,7 @@ from camucrm.prospeccao import (
     calcular_tier,
     eh_provavel_loja_de_racao,
     normalizar_telefone_br,
+    ordem_prospeccao_valida,
 )
 from camucrm.rules.sinais import Mensagem
 from camucrm.taxonomia import MAX_FOLLOWUPS, is_terminal, rank_estagio
@@ -1378,6 +1379,7 @@ class FakeDatabase:
         nota_minima: float | None = None,
         tier: str | None = None,
         apenas_nao_convertidas: bool = False,
+        ordenar: str = "nome",
         limite: int = 500,
     ) -> list[ProspeccaoRegistro]:
         resultado = []
@@ -1394,7 +1396,24 @@ class FakeDatabase:
             if apenas_nao_convertidas and registro.contato_id is not None:
                 continue
             resultado.append(registro)
-        resultado.sort(key=lambda p: p.nome)
+        # Mesmas quatro chaves de `camucrm.prospeccao.ORDENS_PROSPECCAO` —
+        # chave desconhecida cai em "nome", espelhando `ordem_prospeccao_valida`.
+        chave_ordenacao = ordem_prospeccao_valida(ordenar)
+        if chave_ordenacao == "relevancia":
+            ordem_tier = {"A": 0, "B": 1, "C": 2}
+            resultado.sort(
+                key=lambda p: (
+                    ordem_tier.get(p.tier_origem, 99),
+                    -(p.nota if p.nota is not None else -1),
+                    -(p.avaliacoes if p.avaliacoes is not None else -1),
+                )
+            )
+        elif chave_ordenacao == "nota":
+            resultado.sort(key=lambda p: -(p.nota if p.nota is not None else -1))
+        elif chave_ordenacao == "avaliacoes":
+            resultado.sort(key=lambda p: -(p.avaliacoes if p.avaliacoes is not None else -1))
+        else:
+            resultado.sort(key=lambda p: p.nome)
         return resultado[:limite]
 
     def marcar_prospeccao_aberta(self, prospeccao_id: int, *, por: str | None = None) -> None:

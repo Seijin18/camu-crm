@@ -986,6 +986,36 @@ class TesteRotasDeProspeccao(unittest.TestCase):
         corpo = resposta.json()
         self.assertEqual([p["nome"] for p in corpo["prospeccoes"]], ["Norte"])
 
+    def test_listar_prospeccao_repassa_ordenar(self):
+        """Change `prospeccao-filtro-e-ordenacao`, Requirement "Ordenação
+        por relevância, nota ou avaliações"."""
+        self.fake.criar_prospeccao(
+            nome="B alta nota", tier_origem="B", nota=4.9,
+            telefone="5512999990020",
+        )
+        self.fake.criar_prospeccao(
+            nome="A", tier_origem="A", nota=4.6, telefone="5512999990021",
+        )
+        resposta = self.cliente.get("/api/prospeccao?ordenar=relevancia")
+        corpo = resposta.json()
+        self.assertEqual([p["nome"] for p in corpo["prospeccoes"]], ["A", "B alta nota"])
+
+    def test_listar_prospeccao_sem_ordenar_mantem_ordem_por_nome(self):
+        """Requirement "Padrão inalterado quando `ordenar` não é informado"."""
+        self.fake.criar_prospeccao(nome="Zebra", telefone="5512999990022")
+        self.fake.criar_prospeccao(nome="Alfa", telefone="5512999990023")
+        resposta = self.cliente.get("/api/prospeccao")
+        corpo = resposta.json()
+        self.assertEqual([p["nome"] for p in corpo["prospeccoes"]], ["Alfa", "Zebra"])
+
+    def test_listar_prospeccao_ordenar_invalido_cai_em_nome_sem_erro(self):
+        self.fake.criar_prospeccao(nome="Zebra", telefone="5512999990024")
+        self.fake.criar_prospeccao(nome="Alfa", telefone="5512999990025")
+        resposta = self.cliente.get("/api/prospeccao?ordenar=inventado")
+        self.assertEqual(resposta.status_code, 200)
+        corpo = resposta.json()
+        self.assertEqual([p["nome"] for p in corpo["prospeccoes"]], ["Alfa", "Zebra"])
+
     def test_linha_convertida_nao_traz_link_de_whatsapp(self):
         telefone = "5512999990013"
         self.fake.criar_prospeccao(nome="Convertido", telefone=telefone)

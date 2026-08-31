@@ -1,0 +1,22 @@
+# Roda `camucrm purgar` (retenção de mensagens, §12) uma vez.
+# Ver openspec/roadmap.md, onda 1, item "Agendar `camucrm purgar`" — o
+# comando já existe e é testado; faltava algo chamá-lo sozinho.
+#
+# Instalação (usuário, sem root — `systemctl --user`):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/camucrm-purgar.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now camucrm-purgar.timer
+#   loginctl enable-linger "$USER"   # timer roda mesmo sem sessão gráfica aberta
+#
+# Verificar:
+#   systemctl --user list-timers camucrm-purgar.timer
+#   journalctl --user -u camucrm-purgar.service -n 50
+[Unit]
+Description=camu-crm — purga mensagens e eventos brutos antigos (%h/Projects/camu-crm)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/camu-crm
+EnvironmentFile=%h/Projects/camu-crm/.env
+ExecStart=%h/Projects/camu-crm/.venv/bin/python -m camucrm purgar

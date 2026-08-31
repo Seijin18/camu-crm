@@ -1,4 +1,4 @@
-.PHONY: help up down status db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint painel servir acompanhar
+.PHONY: help up down status db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint painel servir acompanhar purgar
 
 PY = ./.venv/bin/python
 COMPOSE = docker compose
@@ -62,3 +62,6 @@ servir:  ## sobe o receptor de webhook da Evolution API
 
 acompanhar:  ## painel de terminal ao vivo (não é o painel da §13)
 	$(PY) -m camucrm acompanhar
+
+purgar:  ## retenção de mensagens e eventos brutos antigos (§12) — ver deploy/systemd/ para agendar
+	$(PY) -m camucrm purgar

@@ -116,6 +116,30 @@ def montar_mensagem(template: str, nome: str) -> str:
     return template.replace("{nome}", nome_curto(nome))
 
 
+# Change `prospeccao-filtro-e-ordenacao`: mapa fechado de chave pública
+# (vinda do painel, entrada não confiável) para o fragmento `ORDER BY` real
+# — mesmo padrão de dict fechado que `taxonomia.py` usa para as listas do
+# domínio. `relevancia` usa a ordem alfabética do enum `tier_origem`
+# (A < B < C) para colocar tier A primeiro, desempatando por nota e depois
+# por volume de avaliações; `NULLS LAST` evita que prospecção sem nota/
+# avaliações suba ao topo por ausência de dado.
+ORDENS_PROSPECCAO = {
+    "nome": "p.nome ASC",
+    "relevancia": "p.tier_origem ASC, p.nota DESC NULLS LAST, p.avaliacoes DESC NULLS LAST",
+    "nota": "p.nota DESC NULLS LAST",
+    "avaliacoes": "p.avaliacoes DESC NULLS LAST",
+}
+
+
+def ordem_prospeccao_valida(ordenar: str | None) -> str:
+    """Normaliza `ordenar` (parâmetro de UI, não confiável) para uma chave
+    de `ORDENS_PROSPECCAO` — mesma defesa que `rules/fila.py` já aplica a
+    entrada de UI: chave desconhecida (incluindo `None`/string vazia) cai
+    no padrão `"nome"`, nunca em erro.
+    """
+    return ordenar if ordenar in ORDENS_PROSPECCAO else "nome"
+
+
 def link_whatsapp(telefone_normalizado: str, mensagem: str) -> str:
     """Link `api.whatsapp.com/send` com o texto já url-encoded
     (`urllib.parse.quote`, que percent-encoda acento/emoji e escapa o

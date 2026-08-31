@@ -813,18 +813,24 @@ def listar_prospeccao(
     nota_minima: float | None = None,
     tier: str | None = None,
     nao_convertidas: bool = False,
+    ordenar: str = "nome",
     db: Database = Depends(_db),
 ):
     """Lista + link de WhatsApp pronto por linha, calculado a partir do
     template de `config.mensagem_prospeccao()` — `mensagem`/`link_whatsapp`
     vêm `None` quando a linha já é conversa real (`views.
-    prospeccao_para_json` decide) ou quando não há template configurado."""
+    prospeccao_para_json` decide) ou quando não há template configurado.
+
+    `ordenar` (change `prospeccao-filtro-e-ordenacao`): repassado direto a
+    `db.listar_prospeccoes` — chave desconhecida cai em `"nome"` lá dentro
+    (`prospeccao.ordem_prospeccao_valida`), nunca em erro 4xx."""
     registros = db.listar_prospeccoes(
         zona=zona,
         bairro=bairro,
         nota_minima=nota_minima,
         tier=tier,
         apenas_nao_convertidas=nao_convertidas,
+        ordenar=ordenar,
     )
     template = config.mensagem_prospeccao()
     return {

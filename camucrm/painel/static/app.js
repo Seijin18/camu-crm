@@ -23,6 +23,33 @@ const CHAVE_OPERADOR = "camu_painel_operador";
 // de CHAVE_TOKEN/CHAVE_OPERADOR acima).
 const CHAVE_MODO_TESTE = "camu_painel_modo_teste";
 
+// Change `painel-preserva-estado-em-refresh`: `renderizarRota` reconstrói
+// `conteudo` do zero (`textContent = ""`) a cada render — estas variáveis de
+// módulo, fora de qualquer função, são o que sobrevive a isso.
+//   - `estadoFiltrosConversas`/`estadoFiltrosProspeccao`: valor atual dos
+//     filtros de cada aba, lido ao montar os `<select>`/campos e escrito de
+//     volta a cada `change` — sem isso, todo re-render (inclusive o
+//     disparado pelo SSE por uma mensagem em OUTRA conversa) resetava os
+//     filtros para o padrão.
+//   - `haEdicaoEmAndamento`: true enquanto há formulário com conteúdo digitado
+//     ou uma escrita (`chamarApiEscrever`) em voo — suprime o refresh
+//     automático do SSE (ver `processarBlocoSse`) para não apagar trabalho
+//     em risco. O botão "Atualizar" manual ignora esta flag de propósito.
+//   - `atualizacaoPendente`: true quando o SSE anunciou mudança mas o
+//     refresh foi suprimido por `haEdicaoEmAndamento` — vira o aviso não
+//     destrutivo ao lado do botão "Atualizar".
+let estadoFiltrosConversas = { estagio: "", temperatura: "", bola: "", ordenar: "horas_esperando" };
+let estadoFiltrosProspeccao = {
+  zona: "",
+  bairro: "",
+  notaMinima: "",
+  tier: "",
+  naoConvertidas: false,
+  ordenar: "",
+};
+let haEdicaoEmAndamento = false;
+let atualizacaoPendente = false;
+
 function obterToken() {
   try {
     return localStorage.getItem(CHAVE_TOKEN) || "";
@@ -366,6 +393,19 @@ function montarFiltros(recarregar) {
     selOrdenar.appendChild(el("option", { value: valor, texto: rotulo }));
   });
 
+  // Change `painel-preserva-estado-em-refresh`: inicializa a partir do
+  // estado de módulo (sobrevive ao re-render), não sempre no padrão — e
+  // grava de volta a cada `change`, antes de recarregar a lista.
+  selEstagio.value = estadoFiltrosConversas.estagio;
+  selTemperatura.value = estadoFiltrosConversas.temperatura;
+  selBola.value = estadoFiltrosConversas.bola;
+  selOrdenar.value = estadoFiltrosConversas.ordenar;
+
+  selEstagio.addEventListener("change", () => { estadoFiltrosConversas.estagio = selEstagio.value; });
+  selTemperatura.addEventListener("change", () => { estadoFiltrosConversas.temperatura = selTemperatura.value; });
+  selBola.addEventListener("change", () => { estadoFiltrosConversas.bola = selBola.value; });
+  selOrdenar.addEventListener("change", () => { estadoFiltrosConversas.ordenar = selOrdenar.value; });
+
   [selEstagio, selTemperatura, selBola, selOrdenar].forEach((s) => {
     s.addEventListener("change", recarregar);
   });
@@ -522,6 +562,10 @@ async function renderizarDetalhe(container, id) {
       texto: "Desconsiderar recusa explícita (falso positivo)",
     });
     botaoDesconsiderarRecusa.addEventListener("click", async () => {
+      // Change `painel-preserva-estado-em-refresh`: cobre a janela entre o
+      // clique e a resposta chegar — um refresh do SSE no meio não pode
+      // apagar este container antes da escrita terminar.
+      haEdicaoEmAndamento = true;
       try {
         await chamarApiEscrever(`/conversas/${id}/desconsiderar-recusa`, {
           por: obterOperador(),
@@ -531,6 +575,8 @@ async function renderizarDetalhe(container, id) {
         container.appendChild(
           el("p", { class: "aviso", texto: `Erro: ${erro.message}` })
         );
+      } finally {
+        haEdicaoEmAndamento = false;
       }
     });
     container.appendChild(botaoDesconsiderarRecusa);
@@ -701,6 +747,12 @@ async function renderizarRascunhos(container, id) {
   botaoGerar.addEventListener("click", async () => {
     botaoGerar.disabled = true;
     areaResultado.textContent = "Gerando (chama o LLM)…";
+    // Change `painel-preserva-estado-em-refresh`: a chamada ao LLM pode
+    // demorar; se um refresh do SSE apagar `conteudo` antes dela voltar,
+    // `areaResultado` vira um nó órfão e o rascunho — já gravado no banco —
+    // some da tela sem aviso. Suprime o refresh automático até a resposta
+    // chegar (ou falhar).
+    haEdicaoEmAndamento = true;
     try {
       const dados = await chamarApiEscrever(`/conversas/${id}/rascunho`, {
         por: obterOperador(),
@@ -711,6 +763,7 @@ async function renderizarRascunhos(container, id) {
       areaResultado.textContent = `Erro: ${erro.message}${erro.regra ? ` (${erro.regra})` : ""}`;
     } finally {
       botaoGerar.disabled = false;
+      haEdicaoEmAndamento = false;
     }
   });
   secao.appendChild(botaoGerar);
@@ -776,6 +829,10 @@ function montarRascunho(rascunho) {
         texto: `Registrar escolha: opção ${numero}`,
       });
       botaoEscolher.addEventListener("click", async () => {
+        // Change `painel-preserva-estado-em-refresh`: mesma razão do botão
+        // "Gerar rascunho" acima — a escrita acontece de qualquer forma; o
+        // que a flag evita é a atualização de tela ir parar num nó órfão.
+        haEdicaoEmAndamento = true;
         try {
           await chamarApiEscrever(`/rascunhos/${rascunho.id}/escolha`, {
             opcao: numero,
@@ -785,6 +842,8 @@ function montarRascunho(rascunho) {
           botaoEscolher.disabled = true;
         } catch (erro) {
           botaoEscolher.textContent = `Erro: ${erro.message}`;
+        } finally {
+          haEdicaoEmAndamento = false;
         }
       });
       opcaoEl.appendChild(botaoEscolher);
@@ -1475,6 +1534,7 @@ async function renderizarFormularioEval(container, { conversaId, entradaId } = {
       } else {
         await chamarApiEscrever("/eval/rotulos", corpo, "POST");
       }
+      haEdicaoEmAndamento = false; // enviado: nada mais a perder nesta tela
       window.location.hash = "#/groundtruth";
     } catch (erro) {
       areaErro.textContent = `Erro: ${erro.message}${erro.regra ? ` (${erro.regra})` : ""}`;
@@ -1484,6 +1544,22 @@ async function renderizarFormularioEval(container, { conversaId, entradaId } = {
   });
   form.appendChild(botaoSalvar);
   form.appendChild(areaErro);
+
+  // Change `painel-preserva-estado-em-refresh`: qualquer campo do formulário
+  // com valor não vazio levanta `haEdicaoEmAndamento`, para o refresh
+  // automático do SSE não apagar rotulagem em andamento (§7: rotular é
+  // trabalho manual). Delegado no `form` (não em cada campo) porque
+  // `gt-estagio-final` é substituído inteiro quando o funil muda
+  // (`sel.addEventListener("change", ...)` acima, `antigo.replaceWith`).
+  const CAMPOS_EDICAO_GT = ["gt-id", "gt-funil", "gt-estagio-final", "gt-mensagens-digitadas", "gt-nota"];
+  const atualizarEdicaoEmAndamentoGt = () => {
+    haEdicaoEmAndamento = CAMPOS_EDICAO_GT.some((idCampo) => {
+      const campo = document.getElementById(idCampo);
+      return Boolean(campo && campo.value && campo.value.trim() !== "");
+    });
+  };
+  form.addEventListener("input", atualizarEdicaoEmAndamentoGt);
+  form.addEventListener("change", atualizarEdicaoEmAndamentoGt);
 
   container.appendChild(form);
 }
@@ -1519,6 +1595,14 @@ async function renderizarImportarProspeccao(container) {
   const campoArquivo = el("input", { type: "file", accept: ".csv,text/csv" });
   const botaoImportar = el("button", { texto: "Importar" });
   const areaResultado = el("div", { class: "prospeccao-resultado" });
+
+  // Change `painel-preserva-estado-em-refresh`: arquivo selecionado é
+  // trabalho manual do operador (escolher o CSV certo) — não deixa o
+  // refresh automático do SSE limpar o campo enquanto ele ainda não clicou
+  // "Importar".
+  campoArquivo.addEventListener("change", () => {
+    haEdicaoEmAndamento = Boolean(campoArquivo.files && campoArquivo.files.length > 0);
+  });
 
   botaoImportar.addEventListener("click", async () => {
     if (!campoArquivo.files || campoArquivo.files.length === 0) {
@@ -1557,6 +1641,7 @@ async function renderizarImportarProspeccao(container) {
       areaResultado.textContent = `Erro: ${erro.message}`;
     } finally {
       botaoImportar.disabled = false;
+      haEdicaoEmAndamento = false;
     }
   });
 
@@ -1824,16 +1909,46 @@ async function renderizarProspeccao(container) {
   labelNaoConvertidas.appendChild(checkNaoConvertidas);
   labelNaoConvertidas.appendChild(document.createTextNode(" só não convertidas"));
 
+  // Change `prospeccao-filtro-e-ordenacao`: mesmas quatro chaves de
+  // `camucrm.prospeccao.ORDENS_PROSPECCAO` — chave desconhecida cai em
+  // "nome" do lado do servidor, então não há necessidade de validar aqui.
+  const selOrdenarProspeccao = el("select", { id: "ordenar-prospeccao" });
+  [
+    ["nome", "nome"],
+    ["relevancia", "relevância"],
+    ["nota", "nota"],
+    ["avaliacoes", "avaliações"],
+  ].forEach(([valor, rotulo]) => {
+    selOrdenarProspeccao.appendChild(el("option", { value: valor, texto: rotulo }));
+  });
+
+  // Change `painel-preserva-estado-em-refresh`: inicializa a partir do
+  // estado de módulo, mesmo padrão de `montarFiltros` (aba Conversas).
+  campoZona.value = estadoFiltrosProspeccao.zona;
+  campoBairro.value = estadoFiltrosProspeccao.bairro;
+  campoNota.value = estadoFiltrosProspeccao.notaMinima;
+  campoTier.value = estadoFiltrosProspeccao.tier;
+  checkNaoConvertidas.checked = estadoFiltrosProspeccao.naoConvertidas;
+  selOrdenarProspeccao.value = estadoFiltrosProspeccao.ordenar || "nome";
+
   const lista = el("div", { id: "lista-prospeccao" });
 
   const carregar = async () => {
+    estadoFiltrosProspeccao.zona = campoZona.value.trim();
+    estadoFiltrosProspeccao.bairro = campoBairro.value.trim();
+    estadoFiltrosProspeccao.notaMinima = campoNota.value;
+    estadoFiltrosProspeccao.tier = campoTier.value.trim();
+    estadoFiltrosProspeccao.naoConvertidas = checkNaoConvertidas.checked;
+    estadoFiltrosProspeccao.ordenar = selOrdenarProspeccao.value;
+
     lista.textContent = "";
     const params = new URLSearchParams();
-    if (campoZona.value.trim()) params.set("zona", campoZona.value.trim());
-    if (campoBairro.value.trim()) params.set("bairro", campoBairro.value.trim());
-    if (campoNota.value) params.set("nota_minima", campoNota.value);
-    if (campoTier.value.trim()) params.set("tier", campoTier.value.trim());
-    if (checkNaoConvertidas.checked) params.set("nao_convertidas", "1");
+    if (estadoFiltrosProspeccao.zona) params.set("zona", estadoFiltrosProspeccao.zona);
+    if (estadoFiltrosProspeccao.bairro) params.set("bairro", estadoFiltrosProspeccao.bairro);
+    if (estadoFiltrosProspeccao.notaMinima) params.set("nota_minima", estadoFiltrosProspeccao.notaMinima);
+    if (estadoFiltrosProspeccao.tier) params.set("tier", estadoFiltrosProspeccao.tier);
+    if (estadoFiltrosProspeccao.naoConvertidas) params.set("nao_convertidas", "1");
+    if (estadoFiltrosProspeccao.ordenar) params.set("ordenar", estadoFiltrosProspeccao.ordenar);
     const dados = await chamarApi(`/prospeccao?${params.toString()}`);
     lista.appendChild(el("p", { class: "aviso", texto: `${dados.prospeccoes.length} petshop(s)` }));
     if (dados.prospeccoes.length === 0) {
@@ -1842,7 +1957,7 @@ async function renderizarProspeccao(container) {
     dados.prospeccoes.forEach((p) => lista.appendChild(linhaProspeccao(p, carregar)));
   };
 
-  [campoZona, campoBairro, campoNota, campoTier].forEach((campo) => {
+  [campoZona, campoBairro, campoNota, campoTier, selOrdenarProspeccao].forEach((campo) => {
     campo.addEventListener("change", carregar);
   });
   checkNaoConvertidas.addEventListener("change", carregar);
@@ -1852,6 +1967,7 @@ async function renderizarProspeccao(container) {
   filtros.appendChild(campoNota);
   filtros.appendChild(campoTier);
   filtros.appendChild(labelNaoConvertidas);
+  filtros.appendChild(selOrdenarProspeccao);
 
   container.appendChild(filtros);
   container.appendChild(lista);
@@ -1891,6 +2007,11 @@ async function renderizarImportarConversaWhatsapp(container) {
   const form = el("div", { class: "gt-form" });
 
   const campoArquivo = el("input", { type: "file", accept: ".txt,text/plain" });
+  // Change `painel-preserva-estado-em-refresh`: mesma razão do CSV de
+  // prospecção — selecionar o .txt certo é trabalho manual do operador.
+  campoArquivo.addEventListener("change", () => {
+    haEdicaoEmAndamento = Boolean(campoArquivo.files && campoArquivo.files.length > 0);
+  });
   form.appendChild(
     el("div", {}, [el("label", { texto: "Arquivo (.txt exportado):" }), campoArquivo])
   );
@@ -2020,6 +2141,7 @@ async function renderizarImportarConversaWhatsapp(container) {
       areaResultado.textContent = `Erro: ${erro.message}`;
     } finally {
       botaoImportar.disabled = false;
+      haEdicaoEmAndamento = false;
     }
   });
 
@@ -2061,6 +2183,12 @@ async function renderizarRotaSegura() {
 }
 
 async function renderizarRota() {
+  // Change `painel-preserva-estado-em-refresh`: qualquer render de verdade
+  // (navegação de aba, hashchange, "Atualizar" manual) está prestes a
+  // apagar `conteudo` de qualquer forma — a edição em risco que a flag
+  // protegia (formulário da rota antiga) não sobrevive a isto de qualquer
+  // jeito, então a flag reseta aqui, não só nos pontos de "enviado/vazio".
+  haEdicaoEmAndamento = false;
   const conteudo = document.getElementById("conteudo");
   conteudo.textContent = "";
   document.querySelectorAll("nav.abas a").forEach((a) => a.classList.remove("ativa"));
@@ -2148,11 +2276,32 @@ function processarBlocoSse(bloco) {
   });
   if (!temDados) return; // heartbeat
   if (evento === "mensagem" || evento === "mudanca") {
+    // Change `painel-preserva-estado-em-refresh`: `token_de_mudanca` é um
+    // cursor global (design.md do change `painel-tempo-real`) — qualquer
+    // mensagem em QUALQUER conversa cai aqui, mesmo sem relação com o que
+    // está na tela. Se há edição em risco (formulário com conteúdo, ou uma
+    // escrita em voo), não apaga `conteudo` por baixo do operador: só marca
+    // que há atualização esperando o botão "Atualizar".
+    if (haEdicaoEmAndamento) {
+      atualizacaoPendente = true;
+      atualizarIndicadorAtualizacaoPendente();
+      return;
+    }
     // Recarrega a tela atual com os mesmos dados que "Atualizar" busca —
     // o stream só avisa que algo mudou, não tenta atualizar o DOM à mão
     // por cima do que `renderizarRota` já sabe montar.
     renderizarRotaSegura();
   }
+}
+
+// Change `painel-preserva-estado-em-refresh`: aviso não destrutivo ao lado
+// do botão "Atualizar" — nunca popup, nunca bloqueia interação (proposal.md
+// "What Changes"). Criado uma vez, escondido por padrão via `hidden`.
+let indicadorAtualizacaoPendente = null;
+
+function atualizarIndicadorAtualizacaoPendente() {
+  if (!indicadorAtualizacaoPendente) return;
+  indicadorAtualizacaoPendente.hidden = !atualizacaoPendente;
 }
 
 async function conectarStream() {
@@ -2206,7 +2355,22 @@ function iniciar() {
     salvarOperador(document.getElementById("campo-operador").value.trim());
     renderizarRotaSegura();
   });
-  document.getElementById("botao-atualizar").addEventListener("click", renderizarRotaSegura);
+  const botaoAtualizar = document.getElementById("botao-atualizar");
+  // Change `painel-preserva-estado-em-refresh`: indicador não-destrutivo,
+  // montado por JS (nunca no HTML) — some quando não há nada pendente.
+  indicadorAtualizacaoPendente = el("span", {
+    class: "aviso-atualizacao-pendente",
+    texto: "● atualizações disponíveis",
+  });
+  indicadorAtualizacaoPendente.hidden = true;
+  botaoAtualizar.insertAdjacentElement("afterend", indicadorAtualizacaoPendente);
+  botaoAtualizar.addEventListener("click", () => {
+    // Botão manual força o refresh mesmo com `haEdicaoEmAndamento` ativa —
+    // é escolha do operador, não do sistema (tasks.md 2.5).
+    atualizacaoPendente = false;
+    atualizarIndicadorAtualizacaoPendente();
+    renderizarRotaSegura();
+  });
   window.addEventListener("hashchange", renderizarRotaSegura);
   renderizarRotaSegura();
   conectarStream();

@@ -48,24 +48,27 @@ Nenhum dos dois exige decisão do Marcos nem é bloqueado por nada. Ordem
 entre eles é indiferente; ambos são pequenos o bastante para caberem juntos
 numa sessão.
 
-3. **Agendar `camucrm purgar` (§12, LGPD).** O comando existe e é testado,
-   mas nada o chama sozinho — depende de alguém lembrar de rodar
-   manualmente. Sem `proposal.md` próprio (não é mudança de comportamento
-   do sistema, é infraestrutura de operação — um cron/systemd timer
-   chamando um comando que já existe). Se preferir tratar como change
-   formal por tocar retenção de dado pessoal, é o próximo candidato a virar
-   um.
-4. **Arquivar `painel-leitura` corretamente.** `tasks.md` está com as
-   caixas todas `[ ]` apesar de o painel estar em produção e seis outros
-   changes terem sido construídos em cima dele — bookkeeping, não código.
-   Marcar as tarefas batendo com o que existe e mover para o arquivo
-   OpenSpec (`openspec archive`, ou o equivalente manual do projeto).
+3. **[FEITO 2026-08-31] Agendar `camucrm purgar` (§12, LGPD).** Timer
+   `systemd --user` em `deploy/systemd/camucrm-purgar.{service,timer}`,
+   instalado e ativo nesta máquina (`systemctl --user list-timers`, roda
+   semanalmente). Alvo `make purgar` novo. Pendente do usuário:
+   `sudo loginctl enable-linger marshibs` (para o timer rodar mesmo sem
+   sessão aberta) — bloqueado pelo classificador de permissões do agente,
+   não é um passo de código.
+4. **[FEITO 2026-08-31] Arquivar `painel-leitura` corretamente.** `tasks.md`
+   marcado batendo com o que já existia (nada de código novo — só
+   bookkeeping). Ficou em `changes/` marcado "✓ Complete" via `openspec
+   list`, mesma convenção que todo outro change completo do projeto — não
+   foi fisicamente movido com `openspec archive` (nenhum change anterior
+   passou por isso; teria sido o primeiro `openspec/specs/` do projeto,
+   divergindo da prática real).
 
 ---
 
 ## Onda 2 — `painel-preserva-estado-em-refresh`
 
-5. **`painel-preserva-estado-em-refresh`** (proposto, ver
+5. **[CÓDIGO FEITO 2026-08-31, verificação manual pendente]
+   `painel-preserva-estado-em-refresh`** (ver
    `openspec/changes/painel-preserva-estado-em-refresh/`). Entra antes de
    `prospeccao-filtro-e-ordenacao` por uma razão concreta: o novo campo
    `ordenar` que aquele change adiciona à aba Prospecção só sobrevive ao
@@ -81,7 +84,7 @@ numa sessão.
 
 ## Onda 3 — `prospeccao-filtro-e-ordenacao`
 
-6. **`prospeccao-filtro-e-ordenacao`** (proposto, ver
+6. **[FEITO 2026-08-31] `prospeccao-filtro-e-ordenacao`** (ver
    `openspec/changes/prospeccao-filtro-e-ordenacao/`). Pequeno, isolado,
    sem tocar schema nem regra de negócio — só ordenação numa listagem que
    já existe. Depois da Onda 2 para o filtro novo já nascer persistente.

@@ -344,7 +344,8 @@ changes `painel-leitura`, `painel-tempo-real`, `acoes-no-painel`,
 Pedido do usuário depois de perceber que o refresh de tempo real do painel
 mexia em telas sem relação com a mensagem recebida (ex.: filtro de
 Prospecção resetando ao chegar mensagem numa conversa qualquer). Dois
-changes novos, propostos e ainda não implementados:
+changes, implementados em 2026-08-31 (código; verificação manual do
+primeiro contra o painel real ainda pendente — ver nota abaixo):
 
 - **`painel-preserva-estado-em-refresh`** — causa raiz: `token_de_mudanca`
   (`db.py`) é um cursor global, e `renderizarRotaSegura` (`app.js`) apaga e
@@ -366,5 +367,15 @@ changes novos, propostos e ainda não implementados:
 
 Os dois são independentes entre si, mas complementares: o mecanismo de
 persistência de filtro do primeiro é o que evita o `ordenar` novo do
-segundo se perder no mesmo refresh automático. Ver `openspec/roadmap.md`
-para onde esses dois entram na ordem geral de implementação.
+segundo se perder no mesmo refresh automático — por isso implementados
+nessa ordem. Ver `openspec/roadmap.md` para onde esses dois entram na
+ordem geral de implementação.
+
+**Pendência:** `painel-preserva-estado-em-refresh`, tasks 3.1-3.4 (`tasks.md`)
+— verificação manual contra o painel real (`./start.sh`) não foi executada:
+exige subir a Evolution API/WhatsApp de produção, o que um agente não faz
+sem confirmação explícita. `prospeccao-filtro-e-ordenacao` está completo
+(código + testes, 740 no `make test`). Também executadas nesta passada:
+onda 1 do roadmap — `camucrm purgar` agendado via timer `systemd --user`
+(`deploy/systemd/`, alvo `make purgar` novo) e `painel-leitura` marcado
+completo (já estava implementado, faltava o bookkeeping).

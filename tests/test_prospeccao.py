@@ -17,12 +17,14 @@ from fakes import FakeDatabase  # noqa: E402
 
 from camucrm.db import hash_telefone  # noqa: E402
 from camucrm.prospeccao import (  # noqa: E402
+    ORDENS_PROSPECCAO,
     calcular_tier,
     eh_provavel_loja_de_racao,
     link_whatsapp,
     montar_mensagem,
     nome_curto,
     normalizar_telefone_br,
+    ordem_prospeccao_valida,
 )
 
 CAMUCRM_DIR = Path(__file__).parent.parent / "camucrm"
@@ -147,6 +149,27 @@ class TesteLojaDeRacao(unittest.TestCase):
         self.assertFalse(eh_provavel_loja_de_racao(""))
 
 
+class TesteOrdemProspeccaoValida(unittest.TestCase):
+    """Change `prospeccao-filtro-e-ordenacao`: dict fechado + normalização
+    de entrada de UI não confiável — mesmo padrão que `rules/fila.py` já
+    aplica a parâmetro vindo do painel."""
+
+    def test_as_quatro_chaves_validas_retornam_o_fragmento_esperado(self):
+        self.assertEqual(ordem_prospeccao_valida("nome"), "nome")
+        self.assertEqual(ordem_prospeccao_valida("relevancia"), "relevancia")
+        self.assertEqual(ordem_prospeccao_valida("nota"), "nota")
+        self.assertEqual(ordem_prospeccao_valida("avaliacoes"), "avaliacoes")
+        for chave in ("nome", "relevancia", "nota", "avaliacoes"):
+            self.assertIn(chave, ORDENS_PROSPECCAO)
+
+    def test_chave_desconhecida_cai_em_nome(self):
+        self.assertEqual(ordem_prospeccao_valida("inventada"), "nome")
+
+    def test_string_vazia_e_none_caem_em_nome(self):
+        self.assertEqual(ordem_prospeccao_valida(""), "nome")
+        self.assertEqual(ordem_prospeccao_valida(None), "nome")
+
+
 class TesteImportacao(unittest.TestCase):
     def setUp(self):
         self.db = FakeDatabase()
@@ -238,6 +261,50 @@ class TesteListagemComFiltros(unittest.TestCase):
     def test_sem_filtro_lista_as_duas(self):
         resultado = self.db.listar_prospeccoes()
         self.assertEqual(len(resultado), 2)
+
+    def test_ordenar_padrao_nome_sem_regressao(self):
+        # Sem `ordenar`, mantém o comportamento de hoje: ordem alfabética.
+        resultado = self.db.listar_prospeccoes()
+        self.assertEqual([p.nome for p in resultado], ["Petshop Leste", "Petshop Norte"])
+
+
+class TesteOrdenacaoRelevancia(unittest.TestCase):
+    """Change `prospeccao-filtro-e-ordenacao`, Requirement "Ordenação por
+    relevância, nota ou avaliações" — fixture com tiers misturados."""
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.db.criar_prospeccao(
+            nome="Tier B alta nota", tier_origem="B", nota=4.9, avaliacoes=10,
+            telefone="5512999990001",
+        )
+        self.db.criar_prospeccao(
+            nome="Tier A menos avaliado", tier_origem="A", nota=4.6, avaliacoes=100,
+            telefone="5512999990002",
+        )
+        self.db.criar_prospeccao(
+            nome="Tier A mais avaliado", tier_origem="A", nota=4.6, avaliacoes=300,
+            telefone="5512999990003",
+        )
+        self.db.criar_prospeccao(
+            nome="Tier C", tier_origem="C", nota=3.5, avaliacoes=5,
+            telefone="5512999990004",
+        )
+
+    def test_relevancia_ordena_tier_depois_nota_depois_avaliacoes(self):
+        resultado = self.db.listar_prospeccoes(ordenar="relevancia")
+        self.assertEqual(
+            [p.nome for p in resultado],
+            ["Tier A mais avaliado", "Tier A menos avaliado", "Tier B alta nota", "Tier C"],
+        )
+
+    def test_ordenar_por_nota(self):
+        resultado = self.db.listar_prospeccoes(ordenar="nota")
+        self.assertEqual(resultado[0].nome, "Tier B alta nota")
+
+    def test_ordenar_por_avaliacoes(self):
+        resultado = self.db.listar_prospeccoes(ordenar="avaliacoes")
+        self.assertEqual(resultado[0].nome, "Tier A mais avaliado")
 
 
 class TesteDeteccaoDeConversao(unittest.TestCase):

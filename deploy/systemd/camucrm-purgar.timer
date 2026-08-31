@@ -1,0 +1,13 @@
+# Dispara camucrm-purgar.service uma vez por semana. Retenção não é
+# sensível a atraso de algumas horas — semanal evita rodar em cima do
+# horário de pico de mensagens sem exigir precisão de minuto.
+[Unit]
+Description=Dispara camucrm-purgar.service semanalmente
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
