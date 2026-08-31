@@ -1,6 +1,11 @@
 /* Painel de leitura do camu-crm. CSS puro, sem framework (CLAUDE.md). */
 
 :root {
+  /* Sem isso, todo controle nativo sem estilo próprio (lista suspensa de
+     `<select>`, scrollbar, marca do checkbox) cai no tema claro do
+     navegador por padrão — foi exatamente o que deixou o `<select>` de
+     operador cinza-claro destoando do resto do header escuro. */
+  color-scheme: dark;
   --bg: #0f1115;
   --bg-elev: #171a21;
   --borda: #2a2e38;
@@ -63,11 +68,17 @@ nav.abas a.ativa {
 
 .token-config {
   display: flex;
-  gap: 0.4rem;
+  gap: 0.5rem;
   align-items: center;
 }
 
-.token-config input {
+/* Só os campos de texto/senha ganham a largura fixa de 10rem — antes a regra
+   pegava `input` genérico e esticava também o checkbox de "Modo teste" para
+   os mesmos 10rem, empurrando o rótulo dele bem para a direita do quadrado
+   visível (achado na revisão visual de 2026-08-31: a caixa de clique do
+   checkbox tinha 160px de largura). */
+.token-config input[type="text"],
+.token-config input[type="password"] {
   background: var(--bg-elev);
   border: 1px solid var(--borda);
   color: var(--texto);
@@ -76,15 +87,43 @@ nav.abas a.ativa {
   width: 10rem;
 }
 
-/* Change `contatos-de-teste-isolados`: toggle "Modo teste". */
+/* O `<select>` de operador não tinha nenhuma regra própria — ficava com o
+   estilo nativo claro do navegador, destoando do resto do header escuro. */
+.token-config select {
+  background: var(--bg-elev);
+  border: 1px solid var(--borda);
+  color: var(--texto);
+  padding: 0.3rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+/* Change `contatos-de-teste-isolados`: toggle "Modo teste". Pílula com borda
+   própria — sem isso, o checkbox fica solto perto de outros controles e o
+   rótulo lê como texto avulso, não como um controle que se liga/desliga. */
 .modo-teste {
   display: flex;
   align-items: center;
-  gap: 0.3rem;
+  gap: 0.4rem;
   color: var(--texto-fraco);
   font-size: 0.85rem;
   cursor: pointer;
   user-select: none;
+  background: var(--bg-elev);
+  border: 1px solid var(--borda);
+  border-radius: 6px;
+  padding: 0.35rem 0.7rem;
+}
+
+.modo-teste input[type="checkbox"] {
+  width: auto;
+  flex: none;
+  accent-color: var(--acento);
+}
+
+.modo-teste:has(input:checked) {
+  color: var(--texto);
+  border-color: var(--acento);
 }
 
 /* Aviso visual persistente enquanto o painel mostra só teste — o requirement
@@ -336,6 +375,22 @@ main {
   color: var(--texto);
   padding: 0.3rem 0.5rem;
   border-radius: 6px;
+  min-width: 8rem;
+}
+
+/* Campo "nota mínima" (Prospecção): as setas nativas de `<input type=number>`
+   têm contraste de botão de sistema e são fáceis de confundir com um botão
+   de ação de verdade no meio da linha de filtros. O campo continua editável
+   por teclado/colar normalmente. */
+.filtros input[type="number"] {
+  -moz-appearance: textfield;
+  min-width: 6rem;
+}
+
+.filtros input[type="number"]::-webkit-inner-spin-button,
+.filtros input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 /* -- Resumo por LLM (§1/CLAUDE.md, change `resumo-conversa`) -------------- */
@@ -553,13 +608,26 @@ main {
   border: 1px solid var(--acento);
 }
 
+/* Change (revisão visual 2026-08-31): o selo de status era texto cinza no
+   meio da linha — o operador olha os extremos (nome à esquerda, botões de
+   envio à direita) e passava batido por ele. Vira pílula com cor própria,
+   igual em peso visual às tags de temperatura/estágio já usadas na Fila. */
 .prospeccao-item .enviado-selo {
-  font-size: 0.8rem;
-  color: var(--texto-fraco);
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--ganho);
+  background: rgba(46, 158, 91, 0.15);
+  border: 1px solid var(--ganho);
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
 }
 
 .prospeccao-item .enviado-selo.com-erro {
   color: var(--quente);
+  background: rgba(229, 83, 61, 0.15);
+  border-color: var(--quente);
 }
 
 /* -- Popup de envio (modal simples, sem framework) ------------------------ */

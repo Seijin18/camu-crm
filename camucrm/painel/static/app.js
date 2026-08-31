@@ -1890,20 +1890,24 @@ function garantirOperador() {
 
 function linhaProspeccao(p, recarregar) {
   const linha = el("div", { class: "prospeccao-item" });
+  const avisoEl = el("span", {
+    class: "aviso",
+    texto: `nota ${p.nota ?? "?"} (${p.avaliacoes ?? "?"} avaliações) — tier ${p.tier_origem || "?"}`,
+  });
+
+  // Revisão visual 2026-08-31: o selo de status (enviado/não-whatsapp) entra
+  // logo depois do nome, não depois da nota/avaliações — o operador olha os
+  // extremos da linha (nome à esquerda, botões à direita), então o selo
+  // precisa ficar colado no extremo esquerdo pra não passar despercebido.
   linha.appendChild(
     el("span", {
       class: "nome",
       texto: `${p.nome} — ${p.bairro || "?"} / ${p.zona || "?"}`,
     })
   );
-  linha.appendChild(
-    el("span", {
-      class: "aviso",
-      texto: `nota ${p.nota ?? "?"} (${p.avaliacoes ?? "?"} avaliações) — tier ${p.tier_origem || "?"}`,
-    })
-  );
 
   if (p.convertida) {
+    linha.appendChild(avisoEl);
     const link = el("a", { texto: "já é conversa — abrir" });
     link.href = `#/conversas/${p.conversa_id}`;
     linha.appendChild(link);
@@ -1918,6 +1922,7 @@ function linhaProspeccao(p, recarregar) {
     linha.appendChild(
       el("span", { class: "enviado-selo com-erro", texto: "não é número de WhatsApp" })
     );
+    linha.appendChild(avisoEl);
     const desfazer = el("button", { class: "secundario", texto: "Desfazer" });
     desfazer.addEventListener("click", async () => {
       const por = await garantirOperador();
@@ -1964,6 +1969,8 @@ function linhaProspeccao(p, recarregar) {
       })
     );
   }
+
+  linha.appendChild(avisoEl);
 
   // Change `prospeccao-marcar-enviada-e-nao-whatsapp`: as duas marcas manuais
   // — disponíveis mesmo sem template de mensagem, o operador ainda precisa
