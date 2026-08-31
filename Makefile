@@ -1,4 +1,4 @@
-.PHONY: help up down status db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint painel servir acompanhar purgar
+.PHONY: help up down restart status db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint painel servir acompanhar purgar
 
 PY = ./.venv/bin/python
 COMPOSE = docker compose
@@ -11,6 +11,9 @@ up:  ## sobe o sistema inteiro (banco, transporte, receptor, painel)
 
 down:  ## para receptor e painel
 	./stop.sh
+
+restart:  ## para e sobe de novo — use depois de editar código (`up` sozinho não recarrega processo já no ar)
+	./restart.sh
 
 status:  ## mostra o que está no ar
 	./status.sh

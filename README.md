@@ -36,15 +36,26 @@ vez de parecer quebrada.
 | `make up`                      | Sobe tudo                                         |
 | `make up-sem-painel`           | Sobe só a recepção, sem UI                       |
 | `./stop.sh`                    | Para receptor e painel; preserva banco e pareamento |
+| `./restart.sh`                 | Para e sobe de novo — use depois de editar código   |
 | `./status.sh`                  | Uma tela dizendo o que está no ar e o que falta    |
 | `./scripts/parear.py`          | Página local com o QR, renovado sozinho            |
 | `./scripts/apontar_webhook.sh` | Aponta o webhook da Evolution para o CRM            |
 
-Os mesmos comandos estão no Makefile: `make up`, `make down`, `make status`.
+Os mesmos comandos estão no Makefile: `make up`, `make down`, `make restart`,
+`make status`.
 
 `stop.sh` não derruba a Evolution de propósito: ela segura o pareamento do
 chip, e §11 já avisa que essa é a parte frágil. Derrubá-la a cada parada do
 CRM significaria repareamento frequente.
+
+**`./start.sh` sozinho não recarrega código.** `subir()` (dentro de
+`start.sh`) é idempotente de propósito — se o processo já responde em
+`/health`, ele considera "no ar" e não reinicia. Isso é o comportamento
+certo para "sobe o sistema sem duplicar processo", mas significa que editar
+`camucrm/` e rodar `./start.sh`/`make up` de novo **não** coloca o código
+novo em produção: receptor e painel continuam com o processo antigo na
+memória. Depois de qualquer mudança em `camucrm/`, use `./restart.sh` (ou
+`make restart`) para testar — nunca `./start.sh` sozinho.
 
 ## Comandos
 
