@@ -375,6 +375,15 @@ main {
   color: var(--texto);
   padding: 0.3rem 0.5rem;
   border-radius: 6px;
+}
+
+/* Mesmo erro do header (`.token-config input`) reaparecendo aqui: `min-width`
+   pegava o `<input type="checkbox">` de "só não convertidas" (dentro de
+   `.modo-teste`, que já define seu próprio layout de pílula) e esticava a
+   caixa de clique dele bem além do quadradinho visível. Só os campos de
+   texto/número recebem a largura mínima — select e checkbox ficam de fora. */
+.filtros select,
+.filtros input:not([type="checkbox"]) {
   min-width: 8rem;
 }
 
