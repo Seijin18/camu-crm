@@ -338,3 +338,33 @@ O painel não é mais candidato — é change ativo, antecipado. Ver os seis
 changes `painel-leitura`, `painel-tempo-real`, `acoes-no-painel`,
 `rascunho-registrado`, `resumo-conversa` e `analise-desempenho` em
 `openspec/changes/`.
+
+## Revisão do painel em uso real (2026-08-31)
+
+Pedido do usuário depois de perceber que o refresh de tempo real do painel
+mexia em telas sem relação com a mensagem recebida (ex.: filtro de
+Prospecção resetando ao chegar mensagem numa conversa qualquer). Dois
+changes novos, propostos e ainda não implementados:
+
+- **`painel-preserva-estado-em-refresh`** — causa raiz: `token_de_mudanca`
+  (`db.py`) é um cursor global, e `renderizarRotaSegura` (`app.js`) apaga e
+  remonta a aba inteira em qualquer evento SSE, sem saber se a mudança tem
+  relação com o que está na tela. Além do sintoma relatado (filtro
+  resetando), a investigação achou algo mais sério: formulário em edição
+  (ground truth, importações) pode ser apagado sem aviso, e uma escrita em
+  voo (gerar rascunho, registrar escolha) pode terminar escrevendo num nó
+  do DOM já destacado — a tela "não faz nada" mesmo com a gravação tendo
+  funcionado no banco. Corrige na camada de apresentação (persistência de
+  filtro + supressão de refresh durante edição em risco), sem re-arquitetar
+  o SSE.
+- **`prospeccao-filtro-e-ordenacao`** — pedido do usuário: ordenar a lista
+  de prospecção por relevância (tier + nota + avaliações), nota ou
+  avaliações, além dos filtros que já existem. Reaproveita `tier_origem`
+  calculado por `tier-calculado-na-importacao`. Fila e kanban ficam de fora
+  de propósito — são ordenados por regra de negócio (§6), não por
+  preferência do operador.
+
+Os dois são independentes entre si, mas complementares: o mecanismo de
+persistência de filtro do primeiro é o que evita o `ordenar` novo do
+segundo se perder no mesmo refresh automático. Ver `openspec/roadmap.md`
+para onde esses dois entram na ordem geral de implementação.
