@@ -68,6 +68,15 @@ let estadoFiltrosProspeccao = {
 let haEdicaoEmAndamento = false;
 let atualizacaoPendente = false;
 
+// Pedido do usuário na revisão visual (2026-08-31): botão "Importar
+// conversa" de uma linha de Prospecção já enviada leva pra aba de importação
+// de WhatsApp com telefone/nome pré-preenchidos, em vez do operador ter que
+// digitar de novo o que a linha de prospecção já tinha. Estado de módulo
+// simples (mesmo padrão de `refreshSuaveAtual`) — só existe entre o clique
+// no botão e o próximo render de `renderizarImportarConversaWhatsapp`, que
+// consome e zera.
+let prefilhoImportacaoWhatsapp = null;
+
 function obterToken() {
   try {
     return localStorage.getItem(CHAVE_TOKEN) || "";
@@ -1946,26 +1955,59 @@ function linhaProspeccao(p, recarregar) {
   // Evolution aceitou, ou não, o envio).
   // Change `escolher-instancia-no-envio-prospeccao`: por qual número saiu.
   const porNumero = p.enviado_instancia ? ` pelo ${p.enviado_instancia}` : "";
-  if (p.enviado_manual && p.enviado_em) {
-    // Change `prospeccao-marcar-enviada-e-nao-whatsapp`: marcado à mão como já
-    // enviado (por outro canal), sem ter passado pela Evolution API.
-    const quando = new Date(p.enviado_em);
-    linha.appendChild(
-      el("span", { class: "enviado-selo", texto: `marcado como já enviado (${quando.toLocaleString()})` })
-    );
-  } else if (p.enviado_erro) {
-    linha.appendChild(
-      el("span", {
-        class: "enviado-selo com-erro",
-        texto: `envio falhou${porNumero}: ${p.enviado_erro}`,
-      })
-    );
-  } else if (p.enviado_em) {
+
+  // Pedido do usuário na revisão visual (2026-08-31): linha já enviada e
+  // ainda sem conversa vinculada fica tão enxuta quanto o caso `convertida`
+  // acima — nome, selo, e UMA ação primária. Depois de mandar a mensagem, o
+  // próximo passo natural é trazer a resposta pro CRM (Importar conversa),
+  // não continuar oferecendo Copiar/Abrir WhatsApp/Enviar de novo. Erro de
+  // envio (`enviado_erro`) fica de fora disso — falha ainda precisa do
+  // banco de botões completo pra retry.
+  const jaEnviadoSemErro = Boolean(p.enviado_em) && !p.enviado_erro;
+  if (jaEnviadoSemErro) {
     const quando = new Date(p.enviado_em);
     linha.appendChild(
       el("span", {
         class: "enviado-selo",
-        texto: `enviado às ${quando.toLocaleString()}${porNumero}`,
+        texto: p.enviado_manual
+          ? `marcado como já enviado (${quando.toLocaleString()})`
+          : `enviado às ${quando.toLocaleString()}${porNumero}`,
+      })
+    );
+    linha.appendChild(avisoEl);
+
+    const botaoImportar = el("button", { texto: "Importar conversa" });
+    botaoImportar.addEventListener("click", () => {
+      prefilhoImportacaoWhatsapp = {
+        telefone: telefoneDoLinkWhatsapp(p.link_whatsapp),
+        nome: p.nome,
+      };
+      window.location.hash = "#/importar-whatsapp";
+    });
+    linha.appendChild(botaoImportar);
+
+    if (p.enviado_manual) {
+      const desfazer = el("button", { class: "secundario", texto: "Desfazer 'já enviado'" });
+      desfazer.addEventListener("click", async () => {
+        const por = await garantirOperador();
+        if (!por) return;
+        try {
+          await chamarApiEscrever(`/prospeccao/${p.id}/enviada-manual`, { por, valor: false });
+          recarregar();
+        } catch (e) {
+          alert(e.message);
+        }
+      });
+      linha.appendChild(desfazer);
+    }
+    return linha;
+  }
+
+  if (p.enviado_erro) {
+    linha.appendChild(
+      el("span", {
+        class: "enviado-selo com-erro",
+        texto: `envio falhou${porNumero}: ${p.enviado_erro}`,
       })
     );
   }
@@ -2236,6 +2278,17 @@ async function renderizarImportarConversaWhatsapp(container) {
       campoNomeContato,
     ])
   );
+
+  // Veio do botão "Importar conversa" de uma linha de Prospecção já enviada
+  // — pré-preenche telefone/nome/tipo (B2B, é sempre prospecção) pra
+  // completar só o arquivo e o próprio nome. Consumido uma vez só: um
+  // refresh manual desta tela não deve reaplicar um preenchimento antigo.
+  if (prefilhoImportacaoWhatsapp) {
+    if (prefilhoImportacaoWhatsapp.telefone) campoTelefone.value = prefilhoImportacaoWhatsapp.telefone;
+    if (prefilhoImportacaoWhatsapp.nome) campoNomeContato.value = prefilhoImportacaoWhatsapp.nome;
+    campoTipo.value = "b2b";
+    prefilhoImportacaoWhatsapp = null;
+  }
 
   const campoOrigem = el("input", { type: "text", placeholder: "whatsapp-manual" });
   form.appendChild(
