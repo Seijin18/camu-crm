@@ -28,3 +28,15 @@
   - [x] 4.2 `tests/test_painel_api.py`/`tests/test_painel_views.py`: campo
         novo no JSON de `/api/prospeccao`, se coberto por fixture completa.
 - [x] 5. `make test` verde.
+- [x] 6. Backfill das linhas já importadas antes deste change (achado em
+      produção: painel mostrando "tier ?" para as 497 prospecções
+      existentes, porque a coluna nunca tinha sido preenchida antes do
+      cálculo existir — "sem migração retroativa" no proposal.md original
+      presumia que a coluna já vinha de algum lugar, não `NULL`).
+  - [x] 6.1 `Database.recalcular_tiers_prospeccoes()`: recalcula
+        `tier_origem`/`provavel_loja_racao` de toda linha, só regravando
+        (e só batendo `atualizado_em`) quem realmente muda — idempotente.
+  - [x] 6.2 CLI `camucrm recalcular-tiers-prospeccao`.
+  - [x] 6.3 Testes (`TesteRecalcularTiersProspeccoes`), fake espelhando.
+  - [x] 6.4 Rodado contra produção: 497 linhas corrigidas na primeira
+        execução, 0 na segunda (confirma idempotência).

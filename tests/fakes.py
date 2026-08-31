@@ -1530,6 +1530,21 @@ class FakeDatabase:
                 self._toques_prospeccao += 1
                 return
 
+    def recalcular_tiers_prospeccoes(self) -> int:
+        """Espelha `db.Database.recalcular_tiers_prospeccoes`: backfill
+        único do change `tier-calculado-na-importacao` — só regrava a
+        linha cujo valor calculado difere do já gravado."""
+        atualizadas = 0
+        for dados in self.prospeccoes.values():
+            novo_tier = calcular_tier(dados["nota"], dados["avaliacoes"])
+            nova_flag = eh_provavel_loja_de_racao(dados["nome"])
+            if novo_tier == dados["tier_origem"] and nova_flag == dados.get("provavel_loja_racao"):
+                continue
+            dados["tier_origem"] = novo_tier
+            dados["provavel_loja_racao"] = nova_flag
+            atualizadas += 1
+        return atualizadas
+
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
         dados = self.prospeccoes.get(telefone_hash)
         if dados is None:

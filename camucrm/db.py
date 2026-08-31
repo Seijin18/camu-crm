@@ -3448,6 +3448,49 @@ class Database:
                         (por, prospeccao_id),
                     )
 
+    def recalcular_tiers_prospeccoes(self) -> int:
+        """Backfill único (change `tier-calculado-na-importacao`): recalcula
+        `tier_origem`/`provavel_loja_racao` de TODA linha de `prospeccoes`
+        com `prospeccao.calcular_tier`/`eh_provavel_loja_de_racao`.
+
+        Existe porque o change original deixou isso fora de escopo de
+        propósito ("não há migração retroativa" — proposal.md) — mas as
+        linhas importadas ANTES do change ficaram com `tier_origem=NULL`
+        (a coluna nunca foi preenchida por importação nenhuma antes disso),
+        e reimportar a planilha inteira não é sempre prático. Rodar este
+        método uma vez corrige o `tier ?` que aparecia no painel para
+        prospecções antigas sem exigir uma nova importação.
+
+        Só grava (e só bate `atualizado_em`, que também acorda o SSE do
+        painel via `token_de_mudanca`) a linha cujo valor calculado
+        realmente difere do que já está no banco — uma linha corrigida por
+        uma reimportação recente, ou já recalculada numa chamada anterior
+        deste método, não é regravada à toa.
+        """
+        atualizadas = 0
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, nome, nota, avaliacoes, tier_origem, "
+                    "provavel_loja_racao FROM prospeccoes"
+                )
+                linhas = cur.fetchall()
+                for pid, nome, nota, avaliacoes, tier_atual, flag_atual in linhas:
+                    novo_tier = calcular_tier(
+                        float(nota) if nota is not None else None, avaliacoes
+                    )
+                    nova_flag = eh_provavel_loja_de_racao(nome)
+                    if novo_tier == tier_atual and nova_flag == flag_atual:
+                        continue
+                    cur.execute(
+                        "UPDATE prospeccoes SET tier_origem = %s, "
+                        "provavel_loja_racao = %s, atualizado_em = now() "
+                        "WHERE id = %s",
+                        (novo_tier, nova_flag, pid),
+                    )
+                    atualizadas += 1
+        return atualizadas
+
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
         """Usado por `ingest.ingerir` para decidir se um contato novo nasce
         `tipo=b2b` (requirement "Conversão usa tipo B2B da origem curada").

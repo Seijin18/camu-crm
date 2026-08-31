@@ -363,6 +363,52 @@ class TesteAberturaDeLink(unittest.TestCase):
         self.assertEqual(registro.aberto_por, "marcos")
 
 
+class TesteRecalcularTiersProspeccoes(unittest.TestCase):
+    """Change `tier-calculado-na-importacao`: backfill único para linhas
+    importadas antes do cálculo existir (`tier_origem=NULL` no painel)."""
+
+    def test_recalcula_linha_antiga_sem_tier(self):
+        db = FakeDatabase()
+        db.criar_prospeccao(
+            nome="Petshop Antigo", telefone="5512999990007",
+            nota=4.9, avaliacoes=300, tier_origem=None,
+        )
+        atualizadas = db.recalcular_tiers_prospeccoes()
+        self.assertEqual(atualizadas, 1)
+        registro = db.listar_prospeccoes()[0]
+        self.assertEqual(registro.tier_origem, "A")
+
+    def test_tambem_recalcula_a_flag_de_loja_de_racao(self):
+        db = FakeDatabase()
+        db.criar_prospeccao(
+            nome="Casa da Ração", telefone="5512999990008",
+            nota=4.9, avaliacoes=300, tier_origem=None,
+        )
+        db.recalcular_tiers_prospeccoes()
+        registro = db.listar_prospeccoes()[0]
+        self.assertTrue(registro.provavel_loja_racao)
+
+    def test_linha_ja_correta_nao_e_recontada(self):
+        db = FakeDatabase()
+        db.criar_prospeccao(
+            nome="Petshop Certo", telefone="5512999990009",
+            nota=4.9, avaliacoes=300, tier_origem="A", provavel_loja_racao=False,
+        )
+        atualizadas = db.recalcular_tiers_prospeccoes()
+        self.assertEqual(atualizadas, 0)
+
+    def test_rodar_duas_vezes_e_idempotente(self):
+        db = FakeDatabase()
+        db.criar_prospeccao(
+            nome="Petshop Antigo", telefone="5512999990010",
+            nota=3.0, avaliacoes=5, tier_origem=None,
+        )
+        primeira = db.recalcular_tiers_prospeccoes()
+        segunda = db.recalcular_tiers_prospeccoes()
+        self.assertEqual(primeira, 1)
+        self.assertEqual(segunda, 0)
+
+
 class TesteMarcasManuais(unittest.TestCase):
     """Change `prospeccao-marcar-enviada-e-nao-whatsapp`: as duas marcas
     manuais da aba de prospecção — "já enviado" (sem passar pela API) e "não

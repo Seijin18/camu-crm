@@ -67,7 +67,12 @@ comercial).
   nesta mudança.
 - **Rebaixar tier automaticamente por regex de nome** — decisão explícita
   do usuário: a flag fica separada, não interfere no cálculo de `A`/`B`/`C`.
-- **Recalcular linhas já importadas antes desta mudança** — não há
-  migração retroativa; `tier_origem`/`provavel_loja_racao` de linhas
-  antigas só atualizam na próxima reimportação daquela linha (mesmo upsert
-  por `telefone_hash` que já existia).
+- ~~**Recalcular linhas já importadas antes desta mudança**~~ — decisão
+  revertida depois de implementado: em produção, as 497 linhas já
+  existentes tinham `tier_origem=NULL` (a coluna nunca tinha sido
+  preenchida por nenhuma importação anterior a este change) e ficaram
+  mostrando "tier ?" no painel indefinidamente, porque reimportar a
+  planilha inteira não é algo que acontece automaticamente. Adicionado
+  `Database.recalcular_tiers_prospeccoes()` (idempotente, só regrava quem
+  muda) + CLI `camucrm recalcular-tiers-prospeccao`, rodado uma vez contra
+  produção (497 corrigidas). Ver tasks.md item 6.

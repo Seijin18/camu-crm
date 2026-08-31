@@ -148,6 +148,16 @@ def cmd_recalcular(args) -> int:
     return 0
 
 
+def cmd_recalcular_tiers_prospeccao(args) -> int:
+    """Backfill único (change `tier-calculado-na-importacao`): linhas de
+    `prospeccoes` importadas antes do cálculo por nota/avaliações
+    ficaram com `tier_origem=NULL` — o painel mostrava "tier ?"."""
+    banco = _db()
+    atualizadas = banco.recalcular_tiers_prospeccoes()
+    print(f"{atualizadas} prospecção(ões) com tier/flag recalculados.")
+    return 0
+
+
 def cmd_rascunho(args) -> int:
     banco = _db()
     conversa = banco.get_conversa(args.conversa)
@@ -687,6 +697,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("recalcular", help="reaplica as regras sem chamar LLM")
     p.set_defaults(func=cmd_recalcular)
+
+    p = sub.add_parser(
+        "recalcular-tiers-prospeccao",
+        help="backfill único: tier_origem/provavel_loja_racao de prospeccoes antigas (change tier-calculado-na-importacao)",
+    )
+    p.set_defaults(func=cmd_recalcular_tiers_prospeccao)
 
     p = sub.add_parser("rascunho", help="duas opções de resposta para uma conversa")
     p.add_argument("conversa", type=int)
