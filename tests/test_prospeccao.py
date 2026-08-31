@@ -223,6 +223,54 @@ class TesteAberturaDeLink(unittest.TestCase):
         self.assertEqual(registro.aberto_por, "marcos")
 
 
+class TesteMarcasManuais(unittest.TestCase):
+    """Change `prospeccao-marcar-enviada-e-nao-whatsapp`: as duas marcas
+    manuais da aba de prospecção — "já enviado" (sem passar pela API) e "não
+    é número de WhatsApp"."""
+
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.p = self.db.criar_prospeccao(nome="Petshop M", telefone="5512999990020")
+
+    def test_marcar_enviada_manual_grava_como_instancia_manual(self):
+        self.db.marcar_prospeccao_enviada_manual(self.p.id, por="marcos")
+        registro = self.db.listar_prospeccoes()[0]
+        self.assertIsNotNone(registro.enviado_em)
+        self.assertEqual(registro.enviado_por, "marcos")
+        self.assertEqual(registro.enviado_instancia, "manual")
+
+    def test_desfazer_enviada_manual_so_limpa_marca_manual(self):
+        self.db.marcar_prospeccao_enviada_manual(self.p.id, por="marcos")
+        self.db.marcar_prospeccao_enviada_manual(self.p.id, por="marcos", valor=False)
+        registro = self.db.listar_prospeccoes()[0]
+        self.assertIsNone(registro.enviado_em)
+        self.assertIsNone(registro.enviado_instancia)
+
+    def test_desfazer_nao_apaga_envio_real_pela_api(self):
+        self.db.registrar_envio_prospeccao(
+            self.p.id, por="marcos", sucesso=True, instancia="pessoal-felipe"
+        )
+        self.db.marcar_prospeccao_enviada_manual(self.p.id, por="marcos", valor=False)
+        registro = self.db.listar_prospeccoes()[0]
+        self.assertIsNotNone(registro.enviado_em)
+        self.assertEqual(registro.enviado_instancia, "pessoal-felipe")
+
+    def test_marcar_nao_whatsapp_e_desfazer(self):
+        self.db.marcar_prospeccao_nao_whatsapp(self.p.id, por="marcos")
+        registro = self.db.listar_prospeccoes()[0]
+        self.assertTrue(registro.nao_whatsapp)
+        self.assertIsNotNone(registro.nao_whatsapp_em)
+        self.assertEqual(registro.nao_whatsapp_por, "marcos")
+
+        self.db.marcar_prospeccao_nao_whatsapp(self.p.id, por="marcos", valor=False)
+        self.assertFalse(self.db.listar_prospeccoes()[0].nao_whatsapp)
+
+    def test_nao_whatsapp_sobrevive_a_reimportacao_da_planilha(self):
+        self.db.marcar_prospeccao_nao_whatsapp(self.p.id, por="marcos")
+        self.db.importar_prospeccoes([_linha(petshop="Petshop M", telefone="5512999990020")])
+        self.assertTrue(self.db.listar_prospeccoes()[0].nao_whatsapp)
+
+
 class TesteProspeccaoPorTelefoneHash(unittest.TestCase):
     def test_existe(self):
         db = FakeDatabase()

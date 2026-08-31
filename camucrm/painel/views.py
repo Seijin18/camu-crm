@@ -828,6 +828,15 @@ def prospeccao_para_json(
         # Change `escolher-instancia-no-envio-prospeccao`: por qual número a
         # última tentativa saiu (`None` = instância única do `.env`).
         "enviado_instancia": registro.enviado_instancia,
+        # Change `prospeccao-marcar-enviada-e-nao-whatsapp`: marcas manuais da
+        # aba. `enviado_manual` é derivado (envio marcado à mão, sem API);
+        # `nao_whatsapp` tira a linha da fila de disparo sem apagá-la.
+        "enviado_manual": registro.enviado_instancia == "manual",
+        "nao_whatsapp": registro.nao_whatsapp,
+        "nao_whatsapp_em": (
+            registro.nao_whatsapp_em.isoformat() if registro.nao_whatsapp_em else None
+        ),
+        "nao_whatsapp_por": registro.nao_whatsapp_por,
     }
 
 

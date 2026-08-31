@@ -1727,12 +1727,43 @@ function linhaProspeccao(p, recarregar) {
     return linha;
   }
 
+  // Change `prospeccao-marcar-enviada-e-nao-whatsapp`: telefone comercial que
+  // não atende no WhatsApp — a linha some da fila de disparo (nenhum botão de
+  // envio abaixo), mas continua na tabela. Só um "Desfazer" caso tenha sido
+  // marca errada.
+  if (p.nao_whatsapp) {
+    linha.appendChild(
+      el("span", { class: "enviado-selo com-erro", texto: "não é número de WhatsApp" })
+    );
+    const desfazer = el("button", { class: "secundario", texto: "Desfazer" });
+    desfazer.addEventListener("click", async () => {
+      try {
+        await chamarApiEscrever(`/prospeccao/${p.id}/nao-whatsapp`, {
+          por: obterOperador(),
+          valor: false,
+        });
+        recarregar();
+      } catch (e) {
+        alert(e.message);
+      }
+    });
+    linha.appendChild(desfazer);
+    return linha;
+  }
+
   // Resultado da última tentativa de envio pela API — distinto de "abriu o
   // link" (aquilo nunca teve confirmação; isto é o servidor dizendo que a
   // Evolution aceitou, ou não, o envio).
   // Change `escolher-instancia-no-envio-prospeccao`: por qual número saiu.
   const porNumero = p.enviado_instancia ? ` pelo ${p.enviado_instancia}` : "";
-  if (p.enviado_erro) {
+  if (p.enviado_manual && p.enviado_em) {
+    // Change `prospeccao-marcar-enviada-e-nao-whatsapp`: marcado à mão como já
+    // enviado (por outro canal), sem ter passado pela Evolution API.
+    const quando = new Date(p.enviado_em);
+    linha.appendChild(
+      el("span", { class: "enviado-selo", texto: `marcado como já enviado (${quando.toLocaleString()})` })
+    );
+  } else if (p.enviado_erro) {
     linha.appendChild(
       el("span", {
         class: "enviado-selo com-erro",
@@ -1748,6 +1779,44 @@ function linhaProspeccao(p, recarregar) {
       })
     );
   }
+
+  // Change `prospeccao-marcar-enviada-e-nao-whatsapp`: as duas marcas manuais
+  // — disponíveis mesmo sem template de mensagem, o operador ainda precisa
+  // conseguir triar a linha.
+  const botaoEnviadaManual = el("button", {
+    class: "secundario",
+    texto: p.enviado_manual ? "Desfazer 'já enviado'" : "Marcar como já enviado",
+  });
+  botaoEnviadaManual.addEventListener("click", async () => {
+    try {
+      await chamarApiEscrever(`/prospeccao/${p.id}/enviada-manual`, {
+        por: obterOperador(),
+        valor: !p.enviado_manual,
+      });
+      recarregar();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+  linha.appendChild(botaoEnviadaManual);
+
+  const botaoNaoWhatsapp = el("button", {
+    class: "secundario",
+    texto: "Não é número de WhatsApp",
+  });
+  botaoNaoWhatsapp.addEventListener("click", async () => {
+    if (!confirm(`Marcar "${p.nome}" como número que não atende no WhatsApp?`)) return;
+    try {
+      await chamarApiEscrever(`/prospeccao/${p.id}/nao-whatsapp`, {
+        por: obterOperador(),
+        valor: true,
+      });
+      recarregar();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+  linha.appendChild(botaoNaoWhatsapp);
 
   if (!p.mensagem || !p.link_whatsapp) {
     linha.appendChild(

@@ -1267,6 +1267,10 @@ class FakeDatabase:
             enviado_em=dados.get("enviado_em"), enviado_por=dados.get("enviado_por"),
             enviado_erro=dados.get("enviado_erro"),
             enviado_instancia=dados.get("enviado_instancia"),
+            # Change `prospeccao-marcar-enviada-e-nao-whatsapp`.
+            nao_whatsapp=dados.get("nao_whatsapp", False),
+            nao_whatsapp_em=dados.get("nao_whatsapp_em"),
+            nao_whatsapp_por=dados.get("nao_whatsapp_por"),
         )
 
     def criar_prospeccao(
@@ -1298,6 +1302,7 @@ class FakeDatabase:
             "aberto_em": None, "aberto_por": None, "criado_em": agora,
             "enviado_em": None, "enviado_por": None, "enviado_erro": None,
             "enviado_instancia": None,
+            "nao_whatsapp": False, "nao_whatsapp_em": None, "nao_whatsapp_por": None,
         }
         return self._prospeccao_registro(self.prospeccoes[telefone_hash])
 
@@ -1344,6 +1349,11 @@ class FakeDatabase:
                 "enviado_por": existente.get("enviado_por") if existente else None,
                 "enviado_erro": existente.get("enviado_erro") if existente else None,
                 "enviado_instancia": existente.get("enviado_instancia") if existente else None,
+                # Change `prospeccao-marcar-enviada-e-nao-whatsapp`: marcas
+                # manuais sobrevivem à reimportação da planilha.
+                "nao_whatsapp": existente.get("nao_whatsapp", False) if existente else False,
+                "nao_whatsapp_em": existente.get("nao_whatsapp_em") if existente else None,
+                "nao_whatsapp_por": existente.get("nao_whatsapp_por") if existente else None,
             }
             if existente:
                 atualizados += 1
@@ -1410,6 +1420,37 @@ class FakeDatabase:
                     dados["enviado_erro"] = erro
                 return
 
+    def marcar_prospeccao_enviada_manual(
+        self, prospeccao_id: int, *, por: str, valor: bool = True
+    ) -> None:
+        """Espelha `db.Database.marcar_prospeccao_enviada_manual` (change
+        `prospeccao-marcar-enviada-e-nao-whatsapp`)."""
+        for dados in self.prospeccoes.values():
+            if dados["id"] == prospeccao_id:
+                if valor:
+                    dados["enviado_em"] = datetime.now(timezone.utc)
+                    dados["enviado_por"] = por
+                    dados["enviado_erro"] = None
+                    dados["enviado_instancia"] = "manual"
+                elif dados.get("enviado_instancia") == "manual":
+                    dados["enviado_em"] = None
+                    dados["enviado_por"] = por
+                    dados["enviado_erro"] = None
+                    dados["enviado_instancia"] = None
+                return
+
+    def marcar_prospeccao_nao_whatsapp(
+        self, prospeccao_id: int, *, por: str, valor: bool = True
+    ) -> None:
+        """Espelha `db.Database.marcar_prospeccao_nao_whatsapp` (change
+        `prospeccao-marcar-enviada-e-nao-whatsapp`)."""
+        for dados in self.prospeccoes.values():
+            if dados["id"] == prospeccao_id:
+                dados["nao_whatsapp"] = valor
+                dados["nao_whatsapp_em"] = datetime.now(timezone.utc) if valor else None
+                dados["nao_whatsapp_por"] = por
+                return
+
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
         dados = self.prospeccoes.get(telefone_hash)
         if dados is None:
@@ -1424,4 +1465,8 @@ class FakeDatabase:
             enviado_em=dados.get("enviado_em"), enviado_por=dados.get("enviado_por"),
             enviado_erro=dados.get("enviado_erro"),
             enviado_instancia=dados.get("enviado_instancia"),
+            # Change `prospeccao-marcar-enviada-e-nao-whatsapp`.
+            nao_whatsapp=dados.get("nao_whatsapp", False),
+            nao_whatsapp_em=dados.get("nao_whatsapp_em"),
+            nao_whatsapp_por=dados.get("nao_whatsapp_por"),
         )

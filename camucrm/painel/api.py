@@ -790,6 +790,14 @@ class EnviarProspeccaoBody(BaseModel):
     instancia: str | None = None
 
 
+class MarcaProspeccaoBody(BaseModel):
+    # Change `prospeccao-marcar-enviada-e-nao-whatsapp`: `por` obrigatório
+    # (mesma disciplina de toda ação manual do painel — quem marcou fica
+    # rastreável); `valor=False` desfaz a marca.
+    por: str | None = None
+    valor: bool = True
+
+
 @router.post("/prospeccao/importar")
 def importar_prospeccao(arquivo: UploadFile, db: Database = Depends(_db)):
     """Upload de CSV (`petshop,bairro,zona,telefone,nota,avaliacoes,site,
@@ -836,6 +844,38 @@ def abrir_prospeccao(
     design.md). Nunca chama `transport.enviar`: o clique já abriu o link em
     outra aba antes desta chamada acontecer (front-end)."""
     db.marcar_prospeccao_aberta(prospeccao_id, por=corpo.por)
+    return {"ok": True}
+
+
+@router.post("/prospeccao/{prospeccao_id}/enviada-manual")
+def marcar_prospeccao_enviada_manual_rota(
+    prospeccao_id: int, corpo: MarcaProspeccaoBody, db: Database = Depends(_db)
+):
+    """Botão "Marcar como já enviado" da aba de prospecção (change
+    `prospeccao-marcar-enviada-e-nao-whatsapp`) — o operador já contatou o
+    petshop por outro caminho e quer o número fora da fila de disparo. NÃO
+    toca a Evolution API (por isso não passa por `envio.py`): só grava as
+    colunas `enviado_*` com `enviado_instancia = 'manual'`. 422 sem `por`.
+    """
+    if not (corpo.por or "").strip():
+        return JSONResponse(status_code=422, content=views.erro("`por` é obrigatório", None))
+    db.marcar_prospeccao_enviada_manual(prospeccao_id, por=corpo.por, valor=corpo.valor)
+    return {"ok": True}
+
+
+@router.post("/prospeccao/{prospeccao_id}/nao-whatsapp")
+def marcar_prospeccao_nao_whatsapp_rota(
+    prospeccao_id: int, corpo: MarcaProspeccaoBody, db: Database = Depends(_db)
+):
+    """Botão "Não é número de WhatsApp" da aba de prospecção (change
+    `prospeccao-marcar-enviada-e-nao-whatsapp`) — o telefone comercial não
+    atende no WhatsApp. A linha continua na tabela (a planilha reimportada
+    não deve ressuscitar o número), mas a tela some com o disparo. 422 sem
+    `por`.
+    """
+    if not (corpo.por or "").strip():
+        return JSONResponse(status_code=422, content=views.erro("`por` é obrigatório", None))
+    db.marcar_prospeccao_nao_whatsapp(prospeccao_id, por=corpo.por, valor=corpo.valor)
     return {"ok": True}
 
 

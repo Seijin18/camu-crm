@@ -160,6 +160,18 @@ Todas justificadas no ponto de uso; listadas aqui para não se perderem.
   `camucrm/painel/envio.py`, ainda o único módulo do painel que importa
   `camucrm.transport`. Se `fetchInstances` falhar, o seletor some e o envio
   segue pela instância do `.env` — nunca um bloqueio novo.
+- **Marcas manuais de triagem na aba de prospecção** (change
+  `prospeccao-marcar-enviada-e-nao-whatsapp`, 2026-08-31, pedido do
+  usuário). Dois botões por linha: "Marcar como já enviado" (o petshop foi
+  contatado por outro canal — reaproveita `enviado_*` com
+  `enviado_instancia = 'manual'`, sem coluna nova; o "desfazer" nunca apaga
+  um envio real da API) e "Não é número de WhatsApp" (coluna nova
+  `prospeccoes.nao_whatsapp` — a linha sai da fila de disparo mas continua
+  na tabela e sobrevive à reimportação da planilha). Ambas manuais, nunca
+  inferidas (mesmo princípio de `contatos.e_teste`). Rotas
+  `POST /api/prospeccao/{id}/enviada-manual` e `.../nao-whatsapp` — `por`
+  obrigatório, nenhuma toca `camucrm.transport`, nenhuma contém "enviar" no
+  path (teste-guarda de `test_painel_api.py` mantido).
 
 ## Correções pendentes — auditoria completa do pipeline (2026-08)
 

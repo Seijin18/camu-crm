@@ -449,6 +449,12 @@ class ProspeccaoRegistro:
     # Evolution API por onde saiu a última tentativa — mesma posição relativa
     # que os campos `enviado_*` acima (antes de contato_id/conversa_id).
     enviado_instancia: str | None = None
+    # ADIÇÃO (change `prospeccao-marcar-enviada-e-nao-whatsapp`): marca manual
+    # "não atende no WhatsApp" — mesma posição relativa dos campos `enviado_*`
+    # (antes de contato_id/conversa_id), pelo mesmo motivo posicional.
+    nao_whatsapp: bool = False
+    nao_whatsapp_em: datetime | None = None
+    nao_whatsapp_por: str | None = None
     contato_id: int | None = None
     conversa_id: int | None = None
 
@@ -821,6 +827,17 @@ ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_erro TEXT;
 -- quanto na falha (a tela mostra "falhou pelo número X"). `NULL` para as
 -- linhas enviadas antes deste change.
 ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS enviado_instancia VARCHAR(64);
+-- ADIÇÃO (change `prospeccao-marcar-enviada-e-nao-whatsapp`): dois estados
+-- MANUAIS que o operador marca na aba de prospecção, nenhum inferido (mesmo
+-- princípio de `marcos_manuais`/`contatos.e_teste`). `nao_whatsapp` é o
+-- petshop cujo telefone comercial não atende no WhatsApp — a linha sai da
+-- lista de disparo mas nunca é apagada (a planilha reimportada não deve
+-- ressuscitar o número). O envio manual reaproveita as colunas `enviado_*`
+-- acima com `enviado_instancia = 'manual'` — não é coluna nova, é o mesmo
+-- "foi enviado" gravado sem ter passado pela Evolution API.
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS nao_whatsapp BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS nao_whatsapp_em TIMESTAMP WITH TIME ZONE;
+ALTER TABLE prospeccoes ADD COLUMN IF NOT EXISTS nao_whatsapp_por VARCHAR(48);
 
 -- ADIÇÃO (change `backfill-cobertura-por-prompt`): até onde CADA versão de
 -- prompt de extração já leu uma conversa. Existe para `forcar=True`
@@ -3085,7 +3102,8 @@ class Database:
         SELECT p.id, p.nome, p.telefone, p.bairro, p.zona, p.nota,
                p.avaliacoes, p.site, p.tier_origem, p.status_origem,
                p.aberto_em, p.aberto_por, p.criado_em,
-               p.enviado_em, p.enviado_por, p.enviado_erro, p.enviado_instancia
+               p.enviado_em, p.enviado_por, p.enviado_erro, p.enviado_instancia,
+               p.nao_whatsapp, p.nao_whatsapp_em, p.nao_whatsapp_por
           FROM prospeccoes p
     """
 
@@ -3219,6 +3237,7 @@ class Database:
                            p.aberto_em, p.aberto_por, p.criado_em,
                            p.enviado_em, p.enviado_por, p.enviado_erro,
                            p.enviado_instancia,
+                           p.nao_whatsapp, p.nao_whatsapp_em, p.nao_whatsapp_por,
                            c.id AS contato_id, cv.id AS conversa_id
                       FROM prospeccoes p
                       LEFT JOIN contatos c ON c.telefone_hash = p.telefone_hash
@@ -3286,6 +3305,59 @@ class Database:
                         "UPDATE prospeccoes SET enviado_por = %s, enviado_erro = %s, "
                         "enviado_instancia = %s WHERE id = %s",
                         (por, erro, instancia, prospeccao_id),
+                    )
+
+    def marcar_prospeccao_enviada_manual(
+        self, prospeccao_id: int, *, por: str, valor: bool = True
+    ) -> None:
+        """Marca (ou desmarca) a linha como JÁ ENVIADA sem ter passado pela
+        Evolution API (change `prospeccao-marcar-enviada-e-nao-whatsapp`) — o
+        operador contatou o petshop por outro caminho e não quer o número na
+        fila de disparo.
+
+        Reaproveita as colunas `enviado_*` com `enviado_instancia = 'manual'`:
+        é o mesmo "foi enviado" que `registrar_envio_prospeccao` grava, só sem
+        confirmação da API. `valor=False` desfaz — limpa as quatro colunas,
+        mas SÓ quando a marca era manual (`enviado_instancia = 'manual'`), para
+        um "desfazer" nunca apagar o registro de um envio real pela API.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if valor:
+                    cur.execute(
+                        "UPDATE prospeccoes SET enviado_em = now(), enviado_por = %s, "
+                        "enviado_erro = NULL, enviado_instancia = 'manual' WHERE id = %s",
+                        (por, prospeccao_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE prospeccoes SET enviado_em = NULL, enviado_por = %s, "
+                        "enviado_erro = NULL, enviado_instancia = NULL "
+                        "WHERE id = %s AND enviado_instancia = 'manual'",
+                        (por, prospeccao_id),
+                    )
+
+    def marcar_prospeccao_nao_whatsapp(
+        self, prospeccao_id: int, *, por: str, valor: bool = True
+    ) -> None:
+        """Marca (ou desmarca) a linha como "o telefone não atende no
+        WhatsApp" (change `prospeccao-marcar-enviada-e-nao-whatsapp`). A linha
+        continua na tabela — a planilha reimportada não deve ressuscitar o
+        número — mas a tela some com o botão de disparo. Marca manual, nunca
+        inferida (mesmo princípio de `contatos.e_teste`)."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if valor:
+                    cur.execute(
+                        "UPDATE prospeccoes SET nao_whatsapp = TRUE, "
+                        "nao_whatsapp_em = now(), nao_whatsapp_por = %s WHERE id = %s",
+                        (por, prospeccao_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE prospeccoes SET nao_whatsapp = FALSE, "
+                        "nao_whatsapp_em = NULL, nao_whatsapp_por = %s WHERE id = %s",
+                        (por, prospeccao_id),
                     )
 
     def prospeccao_por_telefone_hash(self, telefone_hash: str) -> ProspeccaoRegistro | None:
