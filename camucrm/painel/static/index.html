@@ -21,7 +21,11 @@
       <a href="#/importar-whatsapp" data-rota="/importar-whatsapp">Importar conversa (WhatsApp)</a>
     </nav>
     <div class="token-config">
-      <input id="campo-operador" type="text" placeholder="Quem está operando" />
+      <select id="campo-operador">
+        <option value="">Quem está operando</option>
+        <option value="Marcos">Marcos</option>
+        <option value="Felipe">Felipe</option>
+      </select>
       <input id="campo-token" type="password" placeholder="X-Camu-Token" />
       <label class="modo-teste" title="Contato de teste (change contatos-de-teste-isolados): ligado mostra só teste, desligado só os reais — nunca os dois juntos">
         <input id="campo-modo-teste" type="checkbox" />

@@ -17,6 +17,24 @@
 
 const CHAVE_TOKEN = "camu_painel_token";
 const CHAVE_OPERADOR = "camu_painel_operador";
+// Change `dropdown-operador`: lista fixa dos dois operadores do projeto (ver
+// openspec/project.md — "dele e do Felipe"). Um dropdown evita o erro
+// `por é obrigatório` que o texto livre deixava passar em branco; se um
+// terceiro operador entrar, é só adicionar aqui.
+const OPERADORES = ["Marcos", "Felipe"];
+
+/** Monta um <select> de operador, com o valor salvo pré-selecionado quando
+ *  bate com a lista (senão fica no placeholder, forçando escolha explícita). */
+function criarSeletorOperador() {
+  const sel = el("select", {});
+  sel.appendChild(el("option", { value: "", texto: "Quem está operando" }));
+  OPERADORES.forEach((nome) => {
+    sel.appendChild(el("option", { value: nome, texto: nome }));
+  });
+  const salvo = obterOperador();
+  if (OPERADORES.includes(salvo)) sel.value = salvo;
+  return sel;
+}
 // Change `contatos-de-teste-isolados`: "Modo teste" é o toggle binário do
 // topo do painel — ligado mostra só contato de teste, desligado (padrão) só
 // os reais, nunca os dois juntos na mesma tela (mesmo padrão de persistência
@@ -1649,8 +1667,7 @@ function abrirPopupEnvioProspeccao(p, aoConcluir) {
     });
 
   const labelOperador = el("label", {}, [document.createTextNode("Aprovado por")]);
-  const campoOperador = el("input", { type: "text" });
-  campoOperador.value = obterOperador();
+  const campoOperador = criarSeletorOperador();
   labelOperador.appendChild(campoOperador);
 
   const areaErro = el("p", { class: "modal-erro" });
@@ -2344,7 +2361,10 @@ async function conectarStream() {
 
 function iniciar() {
   document.getElementById("campo-token").value = obterToken();
-  document.getElementById("campo-operador").value = obterOperador();
+  const salvoOperador = obterOperador();
+  if (OPERADORES.includes(salvoOperador)) {
+    document.getElementById("campo-operador").value = salvoOperador;
+  }
   const campoModoTeste = document.getElementById("campo-modo-teste");
   campoModoTeste.checked = modoTesteAtivo();
   document.body.classList.toggle("modo-teste-ativo", modoTesteAtivo());
