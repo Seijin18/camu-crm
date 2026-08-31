@@ -409,7 +409,7 @@ class FakeDatabase:
         else:
             conversa.ultimo_outbound = enviada_em
             conversa.bola_com = "cliente"
-        self._toques_conversa += 1
+        self._tocar_conversa(conversa_id)
         return identificador
 
     def listar_mensagens(self, conversa_id: int) -> list[Mensagem]:
@@ -480,7 +480,7 @@ class FakeDatabase:
              "origem": origem, "motivo": motivo, "causada_por": causada_por,
              "em": em or datetime.now(timezone.utc)}
         )
-        self._toques_conversa += 1
+        self._tocar_conversa(conversa_id)
 
     def eventos_da_conversa(self, conversa_id: int) -> list[EventoRegistro]:
         eventos = [e for e in self.eventos if e["conversa_id"] == conversa_id]
@@ -621,7 +621,7 @@ class FakeDatabase:
                 atual = conversa.ultima_mensagem_processada_id
                 valor = valor if atual is None else max(atual, valor)
             setattr(conversa, nome, valor)
-        self._toques_conversa += 1
+        self._tocar_conversa(conversa_id)
 
     def cobertura_extracao(self, conversa_id: int, prompt_versao: str) -> int | None:
         """Espelha `db.Database.cobertura_extracao` (change
@@ -640,6 +640,18 @@ class FakeDatabase:
             ultima_mensagem_id if atual is None else max(atual, ultima_mensagem_id)
         )
 
+    def _tocar_conversa(self, conversa_id: int) -> None:
+        """Incrementa `_toques_conversa` só quando a conversa NÃO é de
+        contato de teste — espelha o `WHERE ct.e_teste = FALSE` que a
+        terceira subconsulta de `Database.token_de_mudanca` aplica sobre
+        `conversas.atualizado_em` (change
+        `painel-refresh-ignora-contato-de-teste`). Chamado de todo ponto do
+        fake que "tocaria" `atualizado_em` no banco real: `registrar_
+        mensagem`, `gravar_evento_estagio`, `atualizar_estado_conversa`.
+        """
+        if not self._e_teste_da_conversa(conversa_id):
+            self._toques_conversa += 1
+
     def token_de_mudanca(self) -> str:
         """Espelho pobre de `Database.token_de_mudanca` — três números que só
         crescem, um por motivo de mudança (mensagem, evento de estágio,
@@ -647,12 +659,25 @@ class FakeDatabase:
         `atualizado_em` guardado no fake), só a mesma propriedade que os
         testes de `stream.py` precisam: muda sempre que um dos três motivos
         acontece, nunca de outro jeito.
+
+        Change `painel-refresh-ignora-contato-de-teste`: mensagens e eventos
+        de conversa de contato de teste (`_e_teste_da_conversa`) não contam
+        para as duas primeiras partes, espelhando o `JOIN`/`WHERE ct.e_teste
+        = FALSE` da `Database` real. A terceira parte (`_toques_conversa`) já
+        nasce filtrada em `_tocar_conversa`, chamado por todo escritor que
+        conta como "toque" — nenhuma das três partes do token deste fake
+        reage a conversa de teste, igual à consulta real.
         """
         max_mensagem = 0
-        for linhas in self.mensagens.values():
+        for conversa_id, linhas in self.mensagens.items():
+            if self._e_teste_da_conversa(conversa_id):
+                continue
             for identificador, *_ in linhas:
                 max_mensagem = max(max_mensagem, identificador)
-        return f"{max_mensagem}:{len(self.eventos)}:{self._toques_conversa}"
+        eventos_reais = sum(
+            1 for e in self.eventos if not self._e_teste_da_conversa(e["conversa_id"])
+        )
+        return f"{max_mensagem}:{eventos_reais}:{self._toques_conversa}"
 
     def registrar_followup(self, conversa_id, texto=None) -> int:
         enviados = self.followups.setdefault(conversa_id, [])

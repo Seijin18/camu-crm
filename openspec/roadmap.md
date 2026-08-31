@@ -80,6 +80,20 @@ numa sessão.
    tela) é o tipo de coisa que corrói confiança no painel sem deixar rastro
    nos logs.
 
+5b. **[FEITO 2026-08-31] `painel-refresh-ignora-contato-de-teste`** (ver
+    `openspec/changes/painel-refresh-ignora-contato-de-teste/`). Achado ao
+    validar o item 5 em uso real: o usuário reportou que o painel ainda
+    dava refresh completo ao mandar mensagem para o Felipe, contato de
+    teste. Causa raiz diferente da que o item 5 resolveu —
+    `Database.token_de_mudanca` nunca filtrava `contatos.e_teste`, então
+    qualquer mensagem para um contato já invisível em kanban/fila/conversas
+    (por padrão) ainda disparava o cursor de "algo mudou" e derrubava a
+    aba. Corrigido com `JOIN`/`WHERE ct.e_teste = FALSE` nas três
+    subconsultas do token, sem tocar rota nem contrato de API. Não é
+    granularidade por conversa (isso continua fora de escopo, registrado em
+    ambos os `proposal.md`) — é só parar de contar como "mudança relevante"
+    o que já é invisível por padrão em todo o resto do painel.
+
 ---
 
 ## Onda 3 — `prospeccao-filtro-e-ordenacao`
@@ -164,6 +178,7 @@ registrados na ordem de risco/custo, para puxar quando fizer sentido.
 | 1.3 | Agendar `camucrm purgar` | nada |
 | 1.4 | Arquivar `painel-leitura` | nada |
 | 2 | `painel-preserva-estado-em-refresh` | nada |
+| 2b | `painel-refresh-ignora-contato-de-teste` | nada |
 | 3 | `prospeccao-filtro-e-ordenacao` | Onda 2 (recomendado, não obrigatório) |
 | 4 | `midia-foto-pet` | Onda 0.1 (recomendado, não obrigatório) |
 | 5.8 | Reconciliação LID↔PN | nada |

@@ -385,3 +385,17 @@ sem confirmação explícita. `prospeccao-filtro-e-ordenacao` está completo
 onda 1 do roadmap — `camucrm purgar` agendado via timer `systemd --user`
 (`deploy/systemd/`, alvo `make purgar` novo) e `painel-leitura` marcado
 completo (já estava implementado, faltava o bookkeeping).
+
+**Bug encontrado ao verificar `painel-preserva-estado-em-refresh` em uso
+real (2026-08-31):** usuário reportou que o painel continuava dando refresh
+completo ao mandar mensagem para o Felipe. Causa raiz diferente da que o
+change acima resolveu: `Database.token_de_mudanca` nunca filtrava
+`contatos.e_teste` — Felipe é contato de teste (`contatos-de-teste-
+isolados`), já invisível em kanban/fila/conversas por padrão, mas o cursor
+de "algo mudou" contava a mensagem dele mesmo assim. Corrigido no change
+**`painel-refresh-ignora-contato-de-teste`** — `JOIN`/`WHERE ct.e_teste =
+FALSE` nas três subconsultas do token, sem tocar rota nem contrato de API.
+742 testes (era 740), incluindo os dois cenários novos (mensagem em
+conversa de teste não move o token; conversa real ao lado de uma de teste
+continua movendo normalmente). Verificação manual contra o painel real
+segue pendente, mesmo motivo do change anterior.

@@ -71,6 +71,33 @@ class TesteTokenComparacaoPura(unittest.TestCase):
         depois = db.token_de_mudanca()
         self.assertNotEqual(antes, depois)
 
+    def test_token_nao_muda_com_mensagem_em_conversa_de_teste(self):
+        """Change `painel-refresh-ignora-contato-de-teste`: mandar mensagem
+        para um contato marcado de teste (ex.: número pessoal usado para
+        testar o sistema) não pode disparar o refresh de tempo real do
+        painel — essa conversa já é invisível em kanban/fila/conversas por
+        padrão (`contatos-de-teste-isolados`), e o cursor de "algo mudou"
+        precisa concordar com isso."""
+        db = FakeDatabase()
+        conversa_teste = db.criar_conversa(e_teste=True)
+        antes = db.token_de_mudanca()
+        db.registrar_mensagem(conversa_teste.id, "in", "mensagem de teste")
+        db.gravar_evento_estagio(conversa_teste.id, "S0", "S1")
+        depois = db.token_de_mudanca()
+        self.assertEqual(antes, depois)
+
+    def test_token_muda_com_mensagem_em_conversa_real_apesar_de_conversa_de_teste_existir(self):
+        """Mesmo cenário acima, mas confirma que uma conversa real ao lado
+        de uma de teste continua disparando o refresh normalmente — o
+        filtro exclui só a conversa de teste, não o token inteiro."""
+        db = FakeDatabase()
+        db.criar_conversa(e_teste=True)
+        conversa_real = db.criar_conversa(e_teste=False)
+        antes = db.token_de_mudanca()
+        db.registrar_mensagem(conversa_real.id, "in", "mensagem real")
+        depois = db.token_de_mudanca()
+        self.assertNotEqual(antes, depois)
+
 
 class TestePollerUnico(unittest.TestCase):
     """Requirement "Poller único por processo": um `PollerMudanca`, quantos

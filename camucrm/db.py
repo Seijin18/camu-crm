@@ -1387,14 +1387,36 @@ class Database:
         comparar strings anteriores/posteriores é suficiente para o poller de
         `painel/stream.py` decidir se dispara o evento — nenhuma parte deste
         método interpreta o conteúdo do token além de igualdade.
+
+        Change `painel-refresh-ignora-contato-de-teste`: as três subconsultas
+        passam a excluir conversas de contato de teste (`contatos.e_teste`),
+        via `JOIN` até `contatos` — mesmo filtro padrão (`incluir_teste=False,
+        apenas_teste=False`) que `listar_conversas_abertas`/`montar_fila` já
+        aplicam em toda leitura "real" do painel. Sem isso, mandar mensagem
+        para um contato marcado de teste (ex.: número pessoal usado para
+        testar o sistema) disparava o refresh de tempo real em qualquer aba
+        aberta, mesmo essa conversa nunca aparecendo na tela — encontrado ao
+        investigar reclamação do usuário sobre refresh ao mandar mensagem
+        para o Felipe (contato de teste). Sem parâmetro: o painel nunca
+        mistura as duas visões na mesma tela (`_condicao_teste`), e o modo
+        teste do painel fica sem notificação ao vivo como consequência aceita
+        — ver `proposal.md` do change, "Fora de escopo".
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT "
-                    "(SELECT MAX(id) FROM mensagens), "
-                    "(SELECT MAX(id) FROM eventos_estagio), "
-                    "(SELECT extract(epoch FROM MAX(atualizado_em)) FROM conversas)"
+                    "(SELECT MAX(m.id) FROM mensagens m "
+                    "   JOIN conversas c ON c.id = m.conversa_id "
+                    "   JOIN contatos ct ON ct.id = c.contato_id "
+                    "  WHERE ct.e_teste = FALSE), "
+                    "(SELECT MAX(e.id) FROM eventos_estagio e "
+                    "   JOIN conversas c ON c.id = e.conversa_id "
+                    "   JOIN contatos ct ON ct.id = c.contato_id "
+                    "  WHERE ct.e_teste = FALSE), "
+                    "(SELECT extract(epoch FROM MAX(c.atualizado_em)) FROM conversas c "
+                    "   JOIN contatos ct ON ct.id = c.contato_id "
+                    "  WHERE ct.e_teste = FALSE)"
                 )
                 max_mensagem, max_evento, max_atualizado = cur.fetchone()
         return f"{max_mensagem or 0}:{max_evento or 0}:{max_atualizado or 0}"
