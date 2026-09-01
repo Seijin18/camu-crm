@@ -1,4 +1,4 @@
-.PHONY: help up down restart status db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint painel servir acompanhar purgar
+.PHONY: help up down restart status db-up db-down db-logs init test test-db fila extrair recalcular eval metricas backfill lint painel servir acompanhar purgar win-dev
 
 PY = ./.venv/bin/python
 COMPOSE = docker compose
@@ -17,6 +17,9 @@ restart:  ## para e sobe de novo — use depois de editar código (`up` sozinho 
 
 status:  ## mostra o que está no ar
 	./status.sh
+
+win-dev:  ## Windows: sobe tudo (venv + deps + Postgres na imagem mais nova + schema + servicos). SEM_PAINEL=1 pula o painel
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/win-dev.ps1
 
 db-up:  ## sobe o Postgres
 	$(COMPOSE) up -d db
